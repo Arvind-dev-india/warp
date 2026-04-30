@@ -40,6 +40,9 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(handlers::healthz))
         .route("/graphql/v2", post(handlers::graphql::handle))
         .route("/ai/generate_code_review_content", post(handlers::ai_rest::handle))
+        // OAuth2 device-flow stubs so headless CLI login completes locally.
+        .route("/api/v1/oauth/device/auth", post(handlers::oauth::device_auth))
+        .route("/api/v1/oauth/device/token", post(handlers::oauth::device_token))
         // Cloud-only REST: agent runs, attachments, conversation snapshots.
         // Return 503 with structured error so the client knows it's unsupported.
         .route("/api/v1/agent/{*rest}", any(handlers::unsupported))
