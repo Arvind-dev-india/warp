@@ -51,11 +51,11 @@ pub async fn handle(
     let data: Option<Value> = match op {
         // ---- canned identity / settings / models / experiments ----
         "CreateAnonymousUser" => Some(canned::create_anonymous_user()),
-        "GetUser" => Some(canned::get_user()),
+        "GetUser" => Some(canned::get_user(&state)),
         "GetUserSettings" => Some(canned::get_user_settings()),
-        "GetWorkspacesMetadataForUser" => Some(canned::get_workspaces_metadata_for_user()),
-        "GetFeatureModelChoices" => Some(canned::get_feature_model_choices()),
-        "FreeAvailableModels" | "free_available_models" => Some(canned::free_available_models()),
+        "GetWorkspacesMetadataForUser" => Some(canned::get_workspaces_metadata_for_user(&state)),
+        "GetFeatureModelChoices" => Some(canned::get_feature_model_choices(&state)),
+        "FreeAvailableModels" | "free_available_models" => Some(canned::free_available_models(&state)),
         "GetRequestLimitInfo" | "get_request_limit_info" => Some(canned::get_request_limit_info()),
         "GetExperiments" => Some(canned::get_experiments()),
 

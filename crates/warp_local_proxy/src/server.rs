@@ -8,18 +8,25 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 
-use crate::{config::Config, handlers};
+use crate::{config::Config, handlers, upstream::openai};
 
-/// Shared state passed to every handler. Holds the runtime config and a single
-/// `reqwest::Client` reused across upstream backend calls.
+/// Default fallback model id used when the proxy can't reach the backend's
+/// `/v1/models` endpoint at startup. Keeps the model picker non-empty.
+pub const LOCAL_FALLBACK_MODEL_ID: &str = "local-model";
+
+/// Shared state passed to every handler. Holds the runtime config, a single
+/// `reqwest::Client` reused across upstream backend calls, and the list of
+/// model ids fetched from the backend at startup (used to populate
+/// FeatureModelChoice in the canned GraphQL responses).
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub http: reqwest::Client,
+    pub models: Arc<Vec<String>>,
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, models: Vec<String>) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(concat!("warp_local_proxy/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -27,6 +34,33 @@ impl AppState {
         Self {
             config: Arc::new(config),
             http,
+            models: Arc::new(models),
+        }
+    }
+
+    /// Returns the model ids the proxy advertises to the Warp client. Always
+    /// non-empty: when the backend's `/v1/models` returned nothing or
+    /// errored, we fall back to a single `LOCAL_FALLBACK_MODEL_ID` entry so
+    /// the client's model picker still works.
+    pub fn advertised_models(&self) -> Vec<String> {
+        if self.models.is_empty() {
+            vec![LOCAL_FALLBACK_MODEL_ID.to_string()]
+        } else {
+            self.models.as_ref().clone()
+        }
+    }
+
+    /// Returns the id the proxy uses by default when an op didn't pick one.
+    /// Prefers the user's --default-model when it appears in the backend's
+    /// list (or when no list is available), otherwise falls back to the
+    /// first model the backend advertised.
+    pub fn default_model_id(&self) -> String {
+        if self.models.is_empty()
+            || self.models.iter().any(|m| m == &self.config.default_model)
+        {
+            self.config.default_model.clone()
+        } else {
+            self.models[0].clone()
         }
     }
 }
@@ -61,21 +95,37 @@ pub fn router(state: AppState) -> Router {
         .with_state(shared)
 }
 
-/// Binds to `state.config.bind` and serves until shutdown.
-pub async fn serve(state: AppState) -> anyhow::Result<()> {
-    let addr = state.config.bind;
-    tracing::info!(%addr, "warp_local_proxy listening");
+/// Builds an [`AppState`] by fetching the backend's model list (best-effort)
+/// and binds the HTTP server until shutdown.
+pub async fn serve(config: Config) -> anyhow::Result<()> {
+    let bind = config.bind;
+    let probe_http = reqwest::Client::builder()
+        .user_agent(concat!("warp_local_proxy/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("reqwest client should build");
+
+    tracing::info!(url = %config.models_url(), "fetching backend model list");
+    let models = openai::fetch_models(&probe_http, &config).await;
+    if models.is_empty() {
+        tracing::warn!(
+            "backend returned no usable model list; falling back to single \"{LOCAL_FALLBACK_MODEL_ID}\" entry"
+        );
+    } else {
+        tracing::info!(count = models.len(), first = %models[0], "backend models available");
+    }
+
+    let state = AppState::new(config, models);
+    tracing::info!(%bind, "warp_local_proxy listening");
     tracing::info!(
         backend = %state.config.backend_base_url,
         auth_style = ?state.config.backend_auth_style,
-        model = %state.config.default_model,
+        default_model = %state.config.default_model,
         chat_url = %state.config.chat_completions_url(),
         "ai backend configured"
     );
 
     let app = router(state);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
