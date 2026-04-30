@@ -23,7 +23,13 @@ pub fn list_ambient_agent_tasks() -> Value {
 }
 
 pub fn list_ai_conversation_metadata() -> Value {
-    json!({ "listAiConversations": { "__typename": "ListAiConversationsOutput", "conversations": [] } })
+    json!({
+        "listAIConversations": {
+            "__typename": "ListAIConversationsOutput",
+            "conversations": [],
+            "responseContext": { "serverVersion": "warp_local_proxy/0.1.0" }
+        }
+    })
 }
 
 pub fn update_event_sequence_on_server() -> Value {
