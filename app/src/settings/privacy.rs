@@ -200,6 +200,11 @@ impl PrivacySettingsSnapshot {
     }
 
     pub fn should_disable_telemetry(&self) -> bool {
+        // [FORK] WARP_DISABLE_TELEMETRY overrides every other gate, including
+        // enterprise `is_telemetry_force_enabled` and the AgentModeAnalytics flag.
+        if warp_core::channel::ChannelState::telemetry_disabled_via_env() {
+            return true;
+        }
         // If a user has opted in to the agent mode analytics experiment, telemetry must be enabled.
         !self.is_telemetry_enabled
             && !self.is_telemetry_force_enabled
