@@ -58,6 +58,9 @@ pub async fn handle(
         "FreeAvailableModels" | "free_available_models" => Some(canned::free_available_models(&state)),
         "GetRequestLimitInfo" | "get_request_limit_info" => Some(canned::get_request_limit_info()),
         "GetExperiments" => Some(canned::get_experiments()),
+        "GetReferralInfo" | "get_referral_info" => Some(canned::get_referral_info()),
+        "UserGithubInfo" | "user_github_info" => Some(canned::user_github_info()),
+        "GetConversationUsage" | "get_conversation_usage" => Some(canned::get_conversation_usage()),
 
         // ---- real AI handlers ----
         "GenerateCommands" | "generate_commands" => {

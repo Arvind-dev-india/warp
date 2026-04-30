@@ -180,7 +180,8 @@ fn workspace_obj(state: &AppState) -> Value {
             }
         ],
         "billingMetadata": billing_metadata(),
-        "bonusGrantsInfo": { "totalGrants": 0, "remainingGrants": 0 },
+        // Real shape: BonusGrantsInfo { grants: [BonusGrant], spendingInfo: BonusGrantSpendingInfo? }
+        "bonusGrantsInfo": { "grants": [], "spendingInfo": null },
         "settings": workspace_settings(),
         "hasBillingHistory": false,
         "inviteCode": null,
@@ -281,7 +282,9 @@ pub fn get_workspaces_metadata_for_user(state: &AppState) -> Value {
             "__typename": "PricingInfoOutput",
             "pricingInfo": {
                 "plans": [],
-                "overages": { "pricePerRequestUsdCents": 0 }
+                "overages": { "pricePerRequestUsdCents": 0 },
+                // Required by cynic PricingInfo fragment.
+                "addonCreditsOptions": []
             }
         }
     })
@@ -311,16 +314,76 @@ pub fn free_available_models(state: &AppState) -> Value {
 }
 
 pub fn get_request_limit_info() -> Value {
+    // Real shape (from crates/graphql/src/api/queries/get_request_limit_info.rs):
+    //   user(requestContext) {
+    //     ... on UserOutput {
+    //       user {
+    //         workspaces { uid bonusGrantsInfo { grants { ... } spendingInfo { ... } } }
+    //         requestLimitInfo { isUnlimited requestsUsedSinceLastRefresh
+    //                            requestLimit nextRefreshTime requestLimitRefreshDuration }
+    //         bonusGrants { ... }
+    //       }
+    //     }
+    //   }
     json!({
-        "requestLimitInfo": {
-            "__typename": "RequestLimitInfoOutput",
-            "info": {
-                "isUnlimited": true,
-                "requestLimit": 0,
-                "requestsUsedSinceLastRefresh": 0,
-                "nextRefreshTime": null
-            },
-            "responseContext": response_context()
+        "user": {
+            "__typename": "UserOutput",
+            "user": {
+                "workspaces": [{
+                    "uid": LOCAL_WORKSPACE_UID,
+                    "bonusGrantsInfo": { "grants": [], "spendingInfo": null }
+                }],
+                "requestLimitInfo": {
+                    "isUnlimited": true,
+                    "requestsUsedSinceLastRefresh": 0,
+                    "requestLimit": 0,
+                    "nextRefreshTime": null,
+                    "requestLimitRefreshDuration": null
+                },
+                "bonusGrants": []
+            }
+        }
+    })
+}
+
+pub fn get_referral_info() -> Value {
+    // user { referrals { referralCode numberClaimed isReferred } }
+    json!({
+        "user": {
+            "__typename": "UserOutput",
+            "user": {
+                "referrals": {
+                    "referralCode": "",
+                    "numberClaimed": 0,
+                    "isReferred": false
+                }
+            }
+        }
+    })
+}
+
+pub fn user_github_info() -> Value {
+    // Inline-fragment union: GithubConnectedOutput | GithubAuthRequiredOutput.
+    // We claim "auth required" with empty install link so the UI shows the
+    // connect-GitHub action without trying to render an integrated repo list.
+    json!({
+        "userGithubInfo": {
+            "__typename": "GithubAuthRequiredOutput",
+            "authUrl": "",
+            "txId": "local-mode",
+            "appInstallLink": ""
+        }
+    })
+}
+
+pub fn get_conversation_usage() -> Value {
+    // user { conversationUsage: [...] } — empty list is fine for local mode.
+    json!({
+        "user": {
+            "__typename": "UserOutput",
+            "user": {
+                "conversationUsage": []
+            }
         }
     })
 }

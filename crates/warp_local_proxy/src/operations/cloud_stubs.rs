@@ -39,14 +39,31 @@ pub fn update_user_settings() -> Value {
 }
 
 /// Confirmed observed during launch: the cloud-objects subscription fetches
-/// updates since a cursor. Returning an empty delta keeps the client happy.
+/// updates since a cursor. Real cynic shape (see
+/// crates/graphql/src/api/queries/get_updated_cloud_objects.rs::UpdatedCloudObjectsOutput):
+///   { actionHistories?, deletedObjectUids, folders?, genericStringObjects?,
+///     mcpGallery?, notebooks?, responseContext, userProfiles?, workflows? }
+/// All `Option<Vec<...>>` fields can be null; only deletedObjectUids and
+/// responseContext are required to be present (and themselves have all-Option
+/// inner fields).
 pub fn get_updated_cloud_objects() -> Value {
     json!({
         "updatedCloudObjects": {
             "__typename": "UpdatedCloudObjectsOutput",
-            "objects": [],
-            "deletedUids": [],
-            "cursor": null
+            "actionHistories": [],
+            "deletedObjectUids": {
+                "folderUids": [],
+                "genericStringObjectUids": [],
+                "notebookUids": [],
+                "workflowUids": []
+            },
+            "folders": [],
+            "genericStringObjects": [],
+            "mcpGallery": [],
+            "notebooks": [],
+            "responseContext": { "serverVersion": "warp_local_proxy/0.1.0" },
+            "userProfiles": [],
+            "workflows": []
         }
     })
 }
