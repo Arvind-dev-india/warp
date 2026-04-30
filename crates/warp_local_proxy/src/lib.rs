@@ -16,4 +16,6 @@
 
 pub mod config;
 pub mod handlers;
+pub mod operations;
 pub mod server;
+pub mod upstream;
