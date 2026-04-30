@@ -19,6 +19,7 @@ path = "src/lib.rs"
 anyhow.workspace = true
 axum.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
+reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
@@ -28,5 +29,4 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

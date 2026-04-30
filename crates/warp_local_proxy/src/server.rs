@@ -2,22 +2,31 @@
 
 use std::sync::Arc;
 
-use axum::{routing::{get, post}, Router};
+use axum::{
+    routing::{any, get, post},
+    Router,
+};
 use tower_http::trace::TraceLayer;
 
 use crate::{config::Config, handlers};
 
-/// Shared state passed to every handler. Right now just holds the config.
-/// Subsequent commits will add an HTTP client to talk to the AI backend.
+/// Shared state passed to every handler. Holds the runtime config and a single
+/// `reqwest::Client` reused across upstream backend calls.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub http: reqwest::Client,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("warp_local_proxy/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("reqwest client should build");
         Self {
             config: Arc::new(config),
+            http,
         }
     }
 }
@@ -25,18 +34,22 @@ impl AppState {
 /// Builds the route table. Exposed as a free function so tests can drive it
 /// without binding a real socket.
 pub fn router(state: AppState) -> Router {
+    let shared = Arc::new(state);
+
     Router::new()
         .route("/healthz", get(handlers::healthz))
         .route("/graphql/v2", post(handlers::graphql::handle))
+        .route("/ai/generate_code_review_content", post(handlers::ai_rest::handle))
+        // Cloud-only REST: agent runs, attachments, conversation snapshots.
+        // Return 503 with structured error so the client knows it's unsupported.
+        .route("/api/v1/agent/{*rest}", any(handlers::unsupported))
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(shared)
 }
 
 /// Binds to `state.config.bind` and serves until shutdown.
 pub async fn serve(state: AppState) -> anyhow::Result<()> {
     let addr = state.config.bind;
-    let app = router(state.clone());
-
     tracing::info!(%addr, "warp_local_proxy listening");
     tracing::info!(
         backend = %state.config.backend_base_url,
@@ -45,6 +58,8 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         chat_url = %state.config.chat_completions_url(),
         "ai backend configured"
     );
+
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
