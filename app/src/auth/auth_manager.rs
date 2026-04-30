@@ -16,7 +16,7 @@ use warpui::{clipboard::ClipboardContent, Entity, ModelContext, SingletonEntity,
 
 use super::auth_state::{AuthState, PersistAction};
 use super::auth_view_modal::{AuthRedirectPayload, AuthViewVariant};
-use super::credentials::{Credentials, FirebaseToken, LoginToken};
+use super::credentials::{Credentials, FirebaseToken, LoginToken, RefreshToken};
 use super::user::User;
 use super::AuthStateProvider;
 use super::UserUid;
@@ -691,6 +691,31 @@ impl AuthManager {
                             } else {
                                 update_browser_url(Url::parse(&login_options_url).ok(), true);
                             }
+                        } else if matches!(
+                            ChannelState::channel(),
+                            warp_core::channel::Channel::Oss
+                        ) {
+                            // [FORK] On Channel::Oss there is no remote auth
+                            // backend and typically no registered warposs://
+                            // URL-scheme handler on the user's OS, so opening
+                            // the browser dance just hangs Firefox. Skip
+                            // ctx.open_url and simulate the deep-link callback
+                            // locally. login_options_url(...) above already
+                            // called generate_auth_state(), so pending_auth_state
+                            // is set; we reuse it here so consume_auth_state
+                            // accepts the synthesized payload.
+                            log::info!(
+                                "[FORK] Channel::Oss: bypassing browser sign-up redirect, \
+                                 synthesizing auth payload locally"
+                            );
+                            let synthesized_state = me.pending_auth_state.clone();
+                            let payload = AuthRedirectPayload {
+                                refresh_token: RefreshToken::new("local-refresh-token".to_string()),
+                                user_uid: None,
+                                deleted_anonymous_user: None,
+                                state: synthesized_state,
+                            };
+                            me.initialize_user_from_auth_payload(payload, true, ctx);
                         } else {
                             ctx.open_url(&login_options_url);
                         }
