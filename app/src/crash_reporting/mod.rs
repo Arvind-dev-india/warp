@@ -114,6 +114,10 @@ fn set_windowing_system(windowing_system: Option<windowing::System>) {
 
 /// Checks if crash reporting is currently enabled.
 fn is_crash_reporting_enabled(ctx: &mut AppContext) -> bool {
+    // [FORK] WARP_DISABLE_TELEMETRY hard-disables crash reporting.
+    if ChannelState::telemetry_disabled_via_env() {
+        return false;
+    }
     PrivacySettings::handle(ctx)
         .as_ref(ctx)
         .is_crash_reporting_enabled
