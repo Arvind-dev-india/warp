@@ -97,7 +97,9 @@ fn object_permissions() -> Value {
 
 /// Echoes one input GenericStringObjectInput back as a
 /// CreateGenericStringObjectOutput so the client thinks the object was
-/// created in the cloud and stops retrying.
+/// created in the cloud and stops retrying. The `clientId` MUST be the same
+/// `client_id` the input sent (the client uses it to match request→response);
+/// otherwise the client logs "invalid client id" and retries forever.
 fn echo_create_output(input: &Value, fallback_uid: &str) -> Value {
     let format = input
         .get("format")
@@ -108,16 +110,19 @@ fn echo_create_output(input: &Value, fallback_uid: &str) -> Value {
         .or_else(|| input.get("serialized_model"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let input_uid = input
-        .get("uid")
+    // Echo the client_id (camelCase from cynic InputObject `client_id`).
+    let client_id = input
+        .get("clientId")
+        .or_else(|| input.get("client_id"))
         .and_then(|v| v.as_str())
-        .unwrap_or(fallback_uid);
+        .unwrap_or(fallback_uid)
+        .to_string();
     json!({
         "__typename": "CreateGenericStringObjectOutput",
-        "clientId": input_uid,
+        "clientId": client_id,
         "genericStringObject": {
             "format": format,
-            "metadata": object_metadata(input_uid),
+            "metadata": object_metadata(&client_id),
             "permissions": object_permissions(),
             "serializedModel": serialized
         },

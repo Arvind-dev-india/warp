@@ -96,7 +96,13 @@ fn workspace_settings() -> Value {
     json!({
         "isDiscoverable": false,
         "isInviteLinkEnabled": false,
-        "llmSettings": { "enabled": true },
+        "llmSettings": {
+            "enabled": true,
+            // Cynic LlmSettings has a second field — Vec<LlmHostSettingsEntry> —
+            // listing which host backends are allowed and their per-host
+            // settings. Empty list = use defaults for everything.
+            "hostConfigs": []
+        },
         "telemetrySettings": { "forceEnabled": false },
         "ugcCollectionSettings": { "setting": "DISABLE" },
         "cloudConversationStorageSettings": { "setting": "DISABLE" },
