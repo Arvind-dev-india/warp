@@ -89,10 +89,17 @@ pub fn router(state: AppState) -> Router {
         .route("/proxy/customToken", post(handlers::oauth::proxy_custom_token))
         .route("/proxy/token", post(handlers::oauth::proxy_refresh_token))
         // Browser-targeted login / signup pages. The GUI opens these in the
-        // user's browser; we serve a tiny HTML page that auto-redirects via
-        // the warposs:// custom URL scheme back into the warp app.
-        .route("/login/remote", get(handlers::browser_auth::handle))
-        .route("/signup/remote", get(handlers::browser_auth::handle))
+        // user's browser; we serve a static landing page (NOT auto-redirect)
+        // explaining the user is already signed in locally, with a manual
+        // deep-link button as fallback. Auto-redirect was removed because
+        // browsers without a warposs:// scheme handler hang on it.
+        .route("/login/remote", get(handlers::browser_auth::handle_remote))
+        .route("/signup/remote", get(handlers::browser_auth::handle_remote))
+        // Fired after MintCustomToken — see app/src/auth/auth_manager.rs:680.
+        .route(
+            "/login_options/{custom_token}",
+            get(handlers::browser_auth::handle_login_options),
+        )
         // Cloud-only REST: agent runs, attachments, conversation snapshots.
         // Return 503 with structured error so the client knows it's unsupported.
         .route("/api/v1/agent/{*rest}", any(handlers::unsupported))
