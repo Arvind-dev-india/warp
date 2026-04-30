@@ -120,8 +120,12 @@ fn workspace_settings() -> Value {
             "writeToPtySetting": "RESPECT_USER_SETTING",
             "computerUseSetting": "RESPECT_USER_SETTING"
         },
-        "usageBasedPricingSettings": { "enabled": false },
-        "addonCreditsSettings": { "enabled": false },
+        "usageBasedPricingSettings": { "enabled": false, "maxMonthlySpendCents": null },
+        "addonCreditsSettings": {
+            "autoReloadEnabled": false,
+            "maxMonthlySpendCents": null,
+            "selectedAutoReloadCreditDenomination": null
+        },
         "codebaseContextSettings": {
             "enabled": false,
             "setting": "DISABLE"
