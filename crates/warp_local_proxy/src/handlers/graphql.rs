@@ -77,6 +77,11 @@ pub async fn handle(
         "UpdateEventSequence" | "update_event_sequence_on_server" => {
             Some(cloud_stubs::update_event_sequence_on_server())
         }
+        // Observed during real `warp-oss login` integration runs.
+        "UpdateUserSettings" | "update_user_settings" => Some(cloud_stubs::update_user_settings()),
+        "GetUpdatedCloudObjects" | "get_updated_cloud_objects" => {
+            Some(cloud_stubs::get_updated_cloud_objects())
+        }
 
         // Anything we haven't taught the proxy yet → structured error.
         _ => None,

@@ -41,8 +41,19 @@ pub fn router(state: AppState) -> Router {
         .route("/graphql/v2", post(handlers::graphql::handle))
         .route("/ai/generate_code_review_content", post(handlers::ai_rest::handle))
         // OAuth2 device-flow stubs so headless CLI login completes locally.
+        // Note: the upstream `oauth2` crate sends the token request to a
+        // separate token URL (`/api/v1/oauth/token`) per `set_token_uri()` in
+        // `app/src/server/server_api.rs::create_oauth_client`; the device
+        // authorization URL is at `/api/v1/oauth/device/auth`.
         .route("/api/v1/oauth/device/auth", post(handlers::oauth::device_auth))
-        .route("/api/v1/oauth/device/token", post(handlers::oauth::device_token))
+        .route("/api/v1/oauth/token", post(handlers::oauth::device_token))
+        // Firebase-fallback proxy endpoints. The Warp client first calls
+        // identitytoolkit / securetoken Firebase endpoints; when those fail
+        // (our firebase_auth_api_key is bogus) it retries against these
+        // proxy URLs. Response shape comes from
+        // `crates/firebase/src/lib.rs::FetchAccessTokenResponse`.
+        .route("/proxy/customToken", post(handlers::oauth::proxy_custom_token))
+        .route("/proxy/token", post(handlers::oauth::proxy_refresh_token))
         // Cloud-only REST: agent runs, attachments, conversation snapshots.
         // Return 503 with structured error so the client knows it's unsupported.
         .route("/api/v1/agent/{*rest}", any(handlers::unsupported))
