@@ -86,7 +86,12 @@ pub async fn handle(
             Some(cloud_stubs::get_updated_cloud_objects())
         }
         // Observed when the GUI launched.
-        "BulkCreateObjects" | "bulk_create_objects" => Some(cloud_stubs::bulk_create_objects()),
+        "BulkCreateObjects" | "bulk_create_objects" => {
+            Some(cloud_stubs::bulk_create_objects(&req.variables))
+        }
+        "CreateGenericStringObject" | "create_generic_string_object" => {
+            Some(cloud_stubs::create_generic_string_object(&req.variables))
+        }
         "GetCloudEnvironmentsQuery" | "get_cloud_environments_query" => {
             Some(cloud_stubs::get_cloud_environments())
         }

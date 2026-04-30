@@ -136,6 +136,9 @@ fn workspace_settings() -> Value {
 /// non-Optional fields, so we hand it a real string.
 const FAR_FUTURE_TIME: &str = "2099-12-31T23:59:59Z";
 
+/// Public alias of [`FAR_FUTURE_TIME`] for use by the cloud_stubs module.
+pub const FAR_FUTURE_TIME_PUBLIC: &str = FAR_FUTURE_TIME;
+
 fn billing_tier() -> Value {
     // Real cynic Tier struct (crates/graphql/src/api/billing.rs:Tier) has
     // 18 fields. The pricing / anyoneWithLinkSharing / directLinkSharing
@@ -174,7 +177,9 @@ fn billing_metadata() -> Value {
         "customerType": "INDIVIDUAL",
         "delinquencyStatus": "NONE",
         "tier": billing_tier(),
-        "serviceAgreements": []
+        "serviceAgreements": [],
+        // Optional<AiOverages> on BillingMetadata; null = no overages.
+        "aiOverages": null
     })
 }
 
