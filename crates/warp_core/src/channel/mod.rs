@@ -1,4 +1,6 @@
 mod config;
+// [FORK] Env-var overrides for telemetry endpoints. See env_overrides.rs.
+mod env_overrides;
 mod state;
 
 use std::fmt;
