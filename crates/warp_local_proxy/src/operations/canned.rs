@@ -10,12 +10,13 @@
 
 use serde_json::{json, Value};
 
+use crate::server::AppState;
+
 const LOCAL_USER_UID: &str = "local-user-uid";
 const LOCAL_WORKSPACE_UID: &str = "local-workspace-uid";
 const LOCAL_TEAM_UID: &str = "local-team-uid";
-const LOCAL_MODEL_ID: &str = "local-model";
 
-/// Wraps a single LLM into the cynic-expected `LlmInfo` shape.
+/// Wraps a single model id into the cynic-expected `LlmInfo` shape.
 fn llm_info(id: &str, display_name: &str) -> Value {
     json!({
         "displayName": display_name,
@@ -52,17 +53,28 @@ fn available_llms(default_id: &str, choices: Vec<Value>) -> Value {
     })
 }
 
-/// The `FeatureModelChoice` shape used by GetUser, GetFeatureModelChoices,
+/// Builds the `FeatureModelChoice` shape used by GetUser, GetFeatureModelChoices,
 /// FreeAvailableModels, and the Workspace embedded in
 /// GetWorkspacesMetadataForUser.
-fn feature_model_choice() -> Value {
-    let model = || vec![llm_info(LOCAL_MODEL_ID, "Local model (proxy)")];
+///
+/// Populates each "feature" (agentMode / planning / coding / cliAgent /
+/// computerUseAgent) with one LlmInfo per id the proxy fetched from the
+/// backend's `/v1/models` endpoint at startup. Falls back to a single
+/// `LOCAL_FALLBACK_MODEL_ID` entry when the backend list was empty.
+fn feature_model_choice(state: &AppState) -> Value {
+    let ids = state.advertised_models();
+    let default_id = state.default_model_id();
+    let choices: Vec<Value> = ids
+        .iter()
+        .map(|id| llm_info(id, id))
+        .collect();
+    let entries = || -> Value { available_llms(&default_id, choices.clone()) };
     json!({
-        "agentMode": available_llms(LOCAL_MODEL_ID, model()),
-        "planning": available_llms(LOCAL_MODEL_ID, model()),
-        "coding": available_llms(LOCAL_MODEL_ID, model()),
-        "cliAgent": available_llms(LOCAL_MODEL_ID, model()),
-        "computerUseAgent": available_llms(LOCAL_MODEL_ID, model())
+        "agentMode": entries(),
+        "planning": entries(),
+        "coding": entries(),
+        "cliAgent": entries(),
+        "computerUseAgent": entries()
     })
 }
 
@@ -150,7 +162,7 @@ fn billing_metadata() -> Value {
     })
 }
 
-fn workspace_obj() -> Value {
+fn workspace_obj(state: &AppState) -> Value {
     json!({
         "uid": LOCAL_WORKSPACE_UID,
         "name": "Local",
@@ -175,7 +187,7 @@ fn workspace_obj() -> Value {
         "pendingEmailInvites": [],
         "inviteLinkDomainRestrictions": [],
         "isEligibleForDiscovery": false,
-        "featureModelChoice": feature_model_choice(),
+        "featureModelChoice": feature_model_choice(state),
         "totalRequestsUsedSinceLastRefresh": 0
     })
 }
@@ -222,7 +234,7 @@ pub fn create_anonymous_user() -> Value {
     })
 }
 
-pub fn get_user() -> Value {
+pub fn get_user(state: &AppState) -> Value {
     json!({
         "user": {
             "__typename": "UserOutput",
@@ -234,7 +246,7 @@ pub fn get_user() -> Value {
                 "isOnboarded": true,
                 "isOnWorkDomain": false,
                 "profile": user_profile(),
-                "llms": feature_model_choice()
+                "llms": feature_model_choice(state)
             }
         }
     })
@@ -255,12 +267,12 @@ pub fn get_user_settings() -> Value {
     })
 }
 
-pub fn get_workspaces_metadata_for_user() -> Value {
+pub fn get_workspaces_metadata_for_user(state: &AppState) -> Value {
     json!({
         "user": {
             "__typename": "UserOutput",
             "user": {
-                "workspaces": [workspace_obj()],
+                "workspaces": [workspace_obj(state)],
                 "experiments": [],
                 "discoverableTeams": []
             }
@@ -275,24 +287,24 @@ pub fn get_workspaces_metadata_for_user() -> Value {
     })
 }
 
-pub fn get_feature_model_choices() -> Value {
+pub fn get_feature_model_choices(state: &AppState) -> Value {
     json!({
         "user": {
             "__typename": "UserOutput",
             "user": {
                 "workspaces": [{
-                    "featureModelChoice": feature_model_choice()
+                    "featureModelChoice": feature_model_choice(state)
                 }]
             }
         }
     })
 }
 
-pub fn free_available_models() -> Value {
+pub fn free_available_models(state: &AppState) -> Value {
     json!({
         "freeAvailableModels": {
             "__typename": "FreeAvailableModelsOutput",
-            "featureModelChoice": feature_model_choice(),
+            "featureModelChoice": feature_model_choice(state),
             "responseContext": response_context()
         }
     })
@@ -314,6 +326,5 @@ pub fn get_request_limit_info() -> Value {
 }
 
 pub fn get_experiments() -> Value {
-    // Some clients also fire a top-level GetExperiments query; return empty.
     json!({ "experiments": [] })
 }

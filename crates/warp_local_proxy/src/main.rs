@@ -10,6 +10,5 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_cli();
-    let state = server::AppState::new(config);
-    server::serve(state).await
+    server::serve(config).await
 }

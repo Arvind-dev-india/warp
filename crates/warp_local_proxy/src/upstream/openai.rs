@@ -43,6 +43,61 @@ pub struct ChatChoiceMessage {
     pub content: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelsListResponse {
+    #[serde(default)]
+    pub data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    pub id: String,
+}
+
+/// Fetches the list of model ids the configured backend exposes via
+/// `GET {base}/models`. Used at proxy startup to populate the local-mode
+/// `FeatureModelChoice` so the Warp client's model picker shows real model
+/// names instead of a single hardcoded entry.
+///
+/// Returns an empty Vec on any failure (network, auth, malformed body) — the
+/// caller falls back to the single `LOCAL_FALLBACK_MODEL_ID` entry so the
+/// client still gets a non-empty list.
+pub async fn fetch_models(http: &reqwest::Client, config: &Config) -> Vec<String> {
+    let url = config.models_url();
+    let mut req = http.get(&url);
+    match config.backend_auth_style {
+        AuthStyle::Bearer => {
+            if let Some(key) = config.backend_api_key.as_deref().filter(|s| !s.is_empty()) {
+                req = req.bearer_auth(key);
+            }
+        }
+        AuthStyle::AzureApiKey => {
+            if let Some(key) = config.backend_api_key.as_deref().filter(|s| !s.is_empty()) {
+                req = req.header("api-key", key);
+            }
+        }
+        AuthStyle::None => {}
+    }
+
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<ModelsListResponse>().await {
+            Ok(body) => body.data.into_iter().map(|m| m.id).collect(),
+            Err(err) => {
+                tracing::warn!(?err, "backend /models response did not parse");
+                Vec::new()
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(status = %resp.status(), "backend /models returned non-2xx");
+            Vec::new()
+        }
+        Err(err) => {
+            tracing::warn!(?err, "backend /models request failed");
+            Vec::new()
+        }
+    }
+}
+
 /// Issues a chat completion against the configured backend and returns the
 /// assistant's first message content. JSON-mode is requested via
 /// `response_format` when `json_mode` is true; backends that don't support it
