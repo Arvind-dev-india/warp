@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+#
+# warp-local — single-command wrapper that runs warp_local_proxy and warp-oss
+# together. The user runs this and gets a fully local Warp client backed by
+# whatever OpenAI-compatible model endpoint they configure (default:
+# http://localhost:3113/v1 with model gpt-5-mini).
+#
+# Examples:
+#
+#     # default — start proxy + warp-oss with gpt-5-mini at localhost:3113/v1
+#     ./scripts/warp-local
+#
+#     # point at Ollama
+#     ./scripts/warp-local --backend http://localhost:11434/v1 \
+#         --auth-style none --model llama3.1
+#
+#     # any warp-oss subcommand: pass after `--`
+#     ./scripts/warp-local -- whoami
+#     ./scripts/warp-local -- model list
+#     ./scripts/warp-local -- login
+#
+#     # leave the proxy running after warp-oss exits
+#     ./scripts/warp-local --keep-proxy -- whoami
+#
+#     # bring down a proxy started by --keep-proxy
+#     ./scripts/warp-local --stop-proxy
+#
+
+set -euo pipefail
+
+# ---- defaults --------------------------------------------------------------
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROXY_BIND_DEFAULT="127.0.0.1:8765"
+BACKEND_DEFAULT="http://localhost:3113/v1"
+AUTH_STYLE_DEFAULT="bearer"
+MODEL_DEFAULT="gpt-5-mini"
+PROFILE_DEFAULT="release"
+PROXY_LOG="${WARP_LOCAL_PROXY_LOG:-/tmp/warp-local-proxy.log}"
+PROXY_PIDFILE="${WARP_LOCAL_PROXY_PIDFILE:-/tmp/warp-local-proxy.pid}"
+
+# Honor env-var equivalents.
+PROXY_BIND="${WARP_LOCAL_PROXY_BIND:-$PROXY_BIND_DEFAULT}"
+BACKEND="${WARP_LOCAL_PROXY_BACKEND:-$BACKEND_DEFAULT}"
+AUTH_STYLE="${WARP_LOCAL_PROXY_AUTH_STYLE:-$AUTH_STYLE_DEFAULT}"
+API_KEY="${WARP_LOCAL_PROXY_BACKEND_API_KEY:-}"
+AZURE_API_VERSION="${WARP_LOCAL_PROXY_AZURE_API_VERSION:-}"
+MODEL="${WARP_LOCAL_PROXY_DEFAULT_MODEL:-$MODEL_DEFAULT}"
+
+KEEP_PROXY=0
+STOP_PROXY_ONLY=0
+PROFILE="$PROFILE_DEFAULT"
+WARP_ARGS=()
+
+# ---- arg parsing -----------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+warp-local — single-command wrapper that runs warp_local_proxy and warp-oss
+together. The user runs this and gets a fully local Warp client backed by
+whatever OpenAI-compatible model endpoint they configure (default:
+http://localhost:3113/v1 with model gpt-5-mini).
+
+Examples:
+
+    # default — start proxy + warp-oss with gpt-5-mini at localhost:3113/v1
+    ./scripts/warp-local
+
+    # point at Ollama
+    ./scripts/warp-local --backend http://localhost:11434/v1 \
+        --auth-style none --model llama3.1
+
+    # any warp-oss subcommand: pass after `--`
+    ./scripts/warp-local -- whoami
+    ./scripts/warp-local -- model list
+    ./scripts/warp-local -- login
+
+    # leave the proxy running after warp-oss exits
+    ./scripts/warp-local --keep-proxy -- whoami
+
+    # bring down a proxy started by --keep-proxy
+    ./scripts/warp-local --stop-proxy
+
+EOF
+    cat <<EOF
+Options:
+  --bind ADDR             Address the proxy listens on (default: $PROXY_BIND_DEFAULT)
+  --backend URL           OpenAI-compatible base URL (default: $BACKEND_DEFAULT)
+  --auth-style STYLE      bearer | azure-api-key | none (default: $AUTH_STYLE_DEFAULT)
+  --api-key KEY           API key for the backend (optional)
+  --azure-api-version V   Azure-only api-version query param
+  --model ID              Default model id (default: $MODEL_DEFAULT)
+  --profile {release|debug}  Build profile for warp-oss (default: $PROFILE_DEFAULT)
+  --keep-proxy            Don't stop the proxy when warp-oss exits
+  --stop-proxy            Just stop a previously-launched proxy and exit
+  -h, --help              Show this help
+  --                      End of script options; remaining args go to warp-oss
+
+Env vars are also honored (all prefixed WARP_LOCAL_PROXY_*; see source).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --bind)            PROXY_BIND="$2"; shift 2 ;;
+        --backend)         BACKEND="$2"; shift 2 ;;
+        --auth-style)      AUTH_STYLE="$2"; shift 2 ;;
+        --api-key)         API_KEY="$2"; shift 2 ;;
+        --azure-api-version) AZURE_API_VERSION="$2"; shift 2 ;;
+        --model)           MODEL="$2"; shift 2 ;;
+        --profile)         PROFILE="$2"; shift 2 ;;
+        --keep-proxy)      KEEP_PROXY=1; shift ;;
+        --stop-proxy)      STOP_PROXY_ONLY=1; shift ;;
+        -h|--help)         usage; exit 0 ;;
+        --)                shift; WARP_ARGS=("$@"); break ;;
+        *)                 WARP_ARGS+=("$1"); shift ;;
+    esac
+done
+
+# ---- helpers ---------------------------------------------------------------
+
+PROXY_HOST="${PROXY_BIND%:*}"
+PROXY_PORT="${PROXY_BIND##*:}"
+PROXY_HEALTH_URL="http://${PROXY_HOST}:${PROXY_PORT}/healthz"
+
+proxy_is_alive() {
+    curl -sSf --max-time 1 "$PROXY_HEALTH_URL" >/dev/null 2>&1
+}
+
+stop_proxy_pid() {
+    if [[ -f "$PROXY_PIDFILE" ]]; then
+        local pid
+        pid="$(cat "$PROXY_PIDFILE")"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            # Wait briefly for graceful shutdown.
+            for _ in 1 2 3 4 5; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.2
+            done
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+            echo "warp-local: stopped proxy (pid $pid)"
+        fi
+        rm -f "$PROXY_PIDFILE"
+    fi
+}
+
+build_proxy() {
+    if [[ -x "$REPO_ROOT/target/debug/warp-local-proxy" ]]; then
+        return
+    fi
+    echo "warp-local: building warp_local_proxy..."
+    (cd "$REPO_ROOT" && cargo build --quiet -p warp_local_proxy)
+}
+
+ensure_warp_built() {
+    local bin="$REPO_ROOT/target/$PROFILE/warp-oss"
+    if [[ -x "$bin" ]]; then
+        echo "$bin"
+        return
+    fi
+    echo "warp-local: warp-oss not found at $bin, building (profile=$PROFILE)..." >&2
+    if [[ "$PROFILE" == "release" ]]; then
+        (cd "$REPO_ROOT" && cargo build --release --bin warp-oss)
+    else
+        (cd "$REPO_ROOT" && cargo build --bin warp-oss)
+    fi
+    echo "$bin"
+}
+
+start_proxy() {
+    if proxy_is_alive; then
+        echo "warp-local: proxy already running on $PROXY_BIND"
+        return
+    fi
+    build_proxy
+
+    local proxy_bin="$REPO_ROOT/target/debug/warp-local-proxy"
+    local proxy_args=(
+        --bind "$PROXY_BIND"
+        --backend-base-url "$BACKEND"
+        --backend-auth-style "$AUTH_STYLE"
+        --default-model "$MODEL"
+    )
+    if [[ -n "$API_KEY" ]]; then
+        proxy_args+=(--backend-api-key "$API_KEY")
+    fi
+    if [[ -n "$AZURE_API_VERSION" ]]; then
+        proxy_args+=(--azure-api-version "$AZURE_API_VERSION")
+    fi
+
+    echo "warp-local: starting proxy → $PROXY_BIND (backend $BACKEND, model $MODEL)"
+    echo "warp-local: log → $PROXY_LOG"
+    : > "$PROXY_LOG"
+    nohup "$proxy_bin" "${proxy_args[@]}" >> "$PROXY_LOG" 2>&1 &
+    echo $! > "$PROXY_PIDFILE"
+
+    # Wait for healthz.
+    for _ in $(seq 1 50); do
+        if proxy_is_alive; then
+            echo "warp-local: proxy healthy"
+            return
+        fi
+        sleep 0.2
+    done
+    echo "warp-local: proxy failed to start; tail of log:" >&2
+    tail -20 "$PROXY_LOG" >&2 || true
+    exit 1
+}
+
+# ---- main flow -------------------------------------------------------------
+
+if [[ "$STOP_PROXY_ONLY" -eq 1 ]]; then
+    stop_proxy_pid
+    exit 0
+fi
+
+start_proxy
+
+WARP_BIN="$(ensure_warp_built)"
+
+cleanup() {
+    if [[ "$KEEP_PROXY" -eq 0 ]]; then
+        stop_proxy_pid
+    else
+        echo "warp-local: leaving proxy running (use --stop-proxy to stop it later)"
+    fi
+}
+trap cleanup EXIT
+
+echo "warp-local: launching $WARP_BIN ${WARP_ARGS[*]:-}"
+# Channel::Oss already defaults to localhost:8765, but if the user picked a
+# different bind address, propagate it via env so the override path catches it.
+if [[ "$PROXY_BIND" != "$PROXY_BIND_DEFAULT" ]]; then
+    export WARP_SERVER_ROOT_URL="http://$PROXY_BIND"
+fi
+
+# Don't `exec` — that would replace the bash process and skip the cleanup
+# trap. Run as a subprocess and forward its exit code.
+"$WARP_BIN" "${WARP_ARGS[@]}"
+exit $?
