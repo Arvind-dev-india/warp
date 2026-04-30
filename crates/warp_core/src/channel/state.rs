@@ -206,9 +206,11 @@ impl ChannelState {
         CHANNEL_STATE.lock().config.crash_reporting_config.is_some()
     }
 
-    /// [FORK] Whether `WARP_DISABLE_TELEMETRY` is set to a truthy value. Exposed
-    /// for crates outside `warp_core` so the kill-switch can short-circuit
-    /// per-event gating (e.g. `PrivacySettingsSnapshot::should_disable_telemetry`)
+    /// [FORK] Whether telemetry is currently disabled by env-var policy in this
+    /// fork. Default is **off**; the user opts in via `WARP_ENABLE_TELEMETRY`
+    /// (and can force off again via `WARP_DISABLE_TELEMETRY`). Exposed for
+    /// crates outside `warp_core` so the policy can short-circuit per-event
+    /// gating (e.g. `PrivacySettingsSnapshot::should_disable_telemetry`)
     /// without those crates needing to depend on `env_overrides` directly.
     pub fn telemetry_disabled_via_env() -> bool {
         env_overrides::telemetry_disabled()
