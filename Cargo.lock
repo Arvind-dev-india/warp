@@ -14719,6 +14719,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "warp_local_proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "warp_logging"
 version = "0.0.0"
 dependencies = [
