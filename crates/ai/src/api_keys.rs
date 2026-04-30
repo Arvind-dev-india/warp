@@ -16,12 +16,29 @@ pub enum ApiKeyManagerEvent {
 ///
 /// These are used for "Bring Your Own API Key" functionality, allowing
 /// users to use their own API keys instead of Warp's.
+///
+/// **[FORK]** The optional `*_base_url` fields let a `LocalAiClient` (gated
+/// by `FeatureFlag::LocalModels`) target an OpenAI-compatible endpoint such
+/// as Ollama, LM Studio, vLLM, Azure OpenAI, or a self-hosted proxy. When the
+/// URL is `None`, requests go to the canonical provider host.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ApiKeys {
     pub google: Option<String>,
     pub anthropic: Option<String>,
     pub openai: Option<String>,
     pub open_router: Option<String>,
+
+    /// [FORK] Optional override for the OpenAI base URL (e.g.
+    /// `http://localhost:11434/v1` for Ollama, `http://localhost:1234/v1`
+    /// for LM Studio, or an Azure OpenAI deployment URL). `None` means use
+    /// `https://api.openai.com/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_base_url: Option<String>,
+
+    /// [FORK] Optional override for the Anthropic base URL (proxies, internal
+    /// gateways). `None` means use `https://api.anthropic.com`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_base_url: Option<String>,
 }
 
 impl ApiKeys {
@@ -30,6 +47,23 @@ impl ApiKeys {
             || self.anthropic.is_some()
             || self.google.is_some()
             || self.open_router.is_some()
+    }
+
+    /// [FORK] Effective OpenAI base URL — user override if set, otherwise the
+    /// canonical OpenAI host. Always includes the `/v1` path segment so
+    /// callers can append `/chat/completions` etc. directly.
+    pub fn effective_openai_base_url(&self) -> &str {
+        self.openai_base_url
+            .as_deref()
+            .unwrap_or("https://api.openai.com/v1")
+    }
+
+    /// [FORK] Effective Anthropic base URL — user override if set, otherwise
+    /// the canonical Anthropic host (no path suffix; callers append `/v1/...`).
+    pub fn effective_anthropic_base_url(&self) -> &str {
+        self.anthropic_base_url
+            .as_deref()
+            .unwrap_or("https://api.anthropic.com")
     }
 }
 
@@ -89,6 +123,22 @@ impl ApiKeyManager {
 
     pub fn set_open_router_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
         self.keys.open_router = key;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    /// [FORK] Sets the OpenAI base URL override (e.g. for Ollama / LM Studio /
+    /// Azure OpenAI). Pass `None` to revert to the canonical host.
+    pub fn set_openai_base_url(&mut self, url: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.openai_base_url = url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    /// [FORK] Sets the Anthropic base URL override. Pass `None` to revert to
+    /// the canonical host.
+    pub fn set_anthropic_base_url(&mut self, url: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.anthropic_base_url = url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
@@ -217,3 +267,90 @@ impl Entity for ApiKeyManager {
 }
 
 impl SingletonEntity for ApiKeyManager {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_none() {
+        let keys = ApiKeys::default();
+        assert!(keys.openai_base_url.is_none());
+        assert!(keys.anthropic_base_url.is_none());
+        assert!(!keys.has_any_key());
+    }
+
+    #[test]
+    fn effective_openai_base_url_falls_back_to_canonical() {
+        let keys = ApiKeys::default();
+        assert_eq!(keys.effective_openai_base_url(), "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn effective_openai_base_url_uses_override() {
+        let keys = ApiKeys {
+            openai_base_url: Some("http://localhost:11434/v1".into()),
+            ..Default::default()
+        };
+        assert_eq!(keys.effective_openai_base_url(), "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn effective_anthropic_base_url_falls_back_to_canonical() {
+        let keys = ApiKeys::default();
+        assert_eq!(
+            keys.effective_anthropic_base_url(),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn effective_anthropic_base_url_uses_override() {
+        let keys = ApiKeys {
+            anthropic_base_url: Some("https://my-proxy.example.com".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            keys.effective_anthropic_base_url(),
+            "https://my-proxy.example.com"
+        );
+    }
+
+    /// Old persisted ApiKeys JSON (pre-fork shape) must still deserialize so
+    /// upgrades don't lose user keys from secure storage.
+    #[test]
+    fn deserializes_legacy_json_without_url_fields() {
+        let legacy = r#"{
+            "google": null,
+            "anthropic": "ant-key",
+            "openai": "oai-key",
+            "open_router": null
+        }"#;
+        let keys: ApiKeys = serde_json::from_str(legacy).expect("legacy json must deserialize");
+        assert_eq!(keys.openai.as_deref(), Some("oai-key"));
+        assert_eq!(keys.anthropic.as_deref(), Some("ant-key"));
+        assert!(keys.openai_base_url.is_none());
+        assert!(keys.anthropic_base_url.is_none());
+    }
+
+    /// When neither URL is set, the new fields are omitted from JSON so we
+    /// don't pollute persisted blobs with `null`s.
+    #[test]
+    fn serialization_omits_unset_url_fields() {
+        let keys = ApiKeys::default();
+        let json = serde_json::to_string(&keys).unwrap();
+        assert!(!json.contains("openai_base_url"), "got {json}");
+        assert!(!json.contains("anthropic_base_url"), "got {json}");
+    }
+
+    #[test]
+    fn serialization_includes_set_url_fields() {
+        let keys = ApiKeys {
+            openai_base_url: Some("http://localhost:11434/v1".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&keys).unwrap();
+        assert!(json.contains("openai_base_url"));
+        assert!(json.contains("11434"));
+    }
+}
