@@ -85,6 +85,11 @@ pub async fn handle(
         "GetUpdatedCloudObjects" | "get_updated_cloud_objects" => {
             Some(cloud_stubs::get_updated_cloud_objects())
         }
+        // Observed when the GUI launched.
+        "BulkCreateObjects" | "bulk_create_objects" => Some(cloud_stubs::bulk_create_objects()),
+        "GetCloudEnvironmentsQuery" | "get_cloud_environments_query" => {
+            Some(cloud_stubs::get_cloud_environments())
+        }
 
         // Anything we haven't taught the proxy yet → structured error.
         _ => None,

@@ -68,6 +68,27 @@ pub fn get_updated_cloud_objects() -> Value {
     })
 }
 
-pub fn empty_ok(operation_name: &str) -> Value {
-    json!({ operation_name: { "__typename": "Output" } })
+/// `BulkCreateObjects` mutation — observed during launch as part of cloud
+/// preferences sync. Returns an empty BulkCreateObjectsOutput (the result
+/// enum's success variant).
+pub fn bulk_create_objects() -> Value {
+    json!({
+        "bulkCreateObjects": {
+            "__typename": "BulkCreateObjectsOutput",
+            "genericStringObjects": null,
+            "responseContext": { "serverVersion": "warp_local_proxy/0.1.0" }
+        }
+    })
+}
+
+/// `GetCloudEnvironmentsQuery` — cloud-only feature, return empty list so
+/// the UI doesn't error.
+pub fn get_cloud_environments() -> Value {
+    json!({
+        "getCloudEnvironments": {
+            "__typename": "GetCloudEnvironmentsOutput",
+            "cloudEnvironments": [],
+            "responseContext": { "serverVersion": "warp_local_proxy/0.1.0" }
+        }
+    })
 }

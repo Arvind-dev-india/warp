@@ -131,33 +131,49 @@ fn workspace_settings() -> Value {
     })
 }
 
+/// Far-future RFC 3339 timestamp the proxy uses for "never expires" /
+/// "next refresh" type fields. cynic's `Time` deserializer rejects null for
+/// non-Optional fields, so we hand it a real string.
+const FAR_FUTURE_TIME: &str = "2099-12-31T23:59:59Z";
+
+fn billing_tier() -> Value {
+    // Real cynic Tier struct (crates/graphql/src/api/billing.rs:Tier) has
+    // 18 fields. The pricing / anyoneWithLinkSharing / directLinkSharing
+    // fields visible in the legacy .graphql comment are NOT in the current
+    // cynic struct, so we omit them. All Option<...> policies are null.
+    json!({
+        "name": "Local",
+        "description": "warp_local_proxy local-mode tier",
+        "warpAiPolicy": {
+            "limit": -1,
+            "isCodeSuggestionsToggleable": true,
+            "isPromptSuggestionsToggleable": true,
+            "isNextCommandEnabled": true,
+            "isVoiceEnabled": false
+        },
+        "teamSizePolicy": { "isUnlimited": true, "limit": 0 },
+        "sharedNotebooksPolicy": { "isUnlimited": true, "limit": 0 },
+        "sharedWorkflowsPolicy": { "isUnlimited": true, "limit": 0 },
+        "sessionSharingPolicy": { "enabled": false, "maxSessionBytesSize": 0 },
+        "aiAutonomyPolicy": { "enabled": true, "toggleable": true },
+        "telemetryDataCollectionPolicy": null,
+        "ugcDataCollectionPolicy": null,
+        "usageBasedPricingPolicy": null,
+        "codebaseContextPolicy": null,
+        "byoApiKeyPolicy": { "enabled": true },
+        "purchaseAddOnCreditsPolicy": null,
+        "enterprisePayAsYouGoPolicy": null,
+        "enterpriseCreditsAutoReloadPolicy": null,
+        "multiAdminPolicy": null,
+        "ambientAgentsPolicy": null
+    })
+}
+
 fn billing_metadata() -> Value {
     json!({
         "customerType": "INDIVIDUAL",
         "delinquencyStatus": "NONE",
-        "tier": {
-            "name": "Local",
-            "description": "warp_local_proxy local-mode tier",
-            "warpAiPolicy": {
-                "limit": -1,
-                "isCodeSuggestionsToggleable": true,
-                "isPromptSuggestionsToggleable": true,
-                "isNextCommandEnabled": true,
-                "isVoiceEnabled": false
-            },
-            "teamSizePolicy": { "isUnlimited": true, "limit": 0 },
-            "sharedNotebooksPolicy": { "isUnlimited": true, "limit": 0 },
-            "sharedWorkflowsPolicy": { "isUnlimited": true, "limit": 0 },
-            "sessionSharingPolicy": { "enabled": false, "maxSessionBytesSize": 0 },
-            "anyoneWithLinkSharingPolicy": { "toggleable": false },
-            "directLinkSharingPolicy": { "toggleable": false },
-            "byoApiKeyPolicy": { "enabled": true },
-            "pricing": {
-                "enablePayAsYouGo": false,
-                "autoReloadCreditDenomination": 0,
-                "autoReloadCostCents": 0
-            }
-        },
+        "tier": billing_tier(),
         "serviceAgreements": []
     })
 }
@@ -314,17 +330,9 @@ pub fn free_available_models(state: &AppState) -> Value {
 }
 
 pub fn get_request_limit_info() -> Value {
-    // Real shape (from crates/graphql/src/api/queries/get_request_limit_info.rs):
-    //   user(requestContext) {
-    //     ... on UserOutput {
-    //       user {
-    //         workspaces { uid bonusGrantsInfo { grants { ... } spendingInfo { ... } } }
-    //         requestLimitInfo { isUnlimited requestsUsedSinceLastRefresh
-    //                            requestLimit nextRefreshTime requestLimitRefreshDuration }
-    //         bonusGrants { ... }
-    //       }
-    //     }
-    //   }
+    // Real cynic shape from crates/graphql/src/api/ai.rs::RequestLimitInfo
+    // has 12 required fields (none Optional). cynic's Time deserializer
+    // rejects null, so nextRefreshTime needs a real RFC 3339 string.
     json!({
         "user": {
             "__typename": "UserOutput",
@@ -335,10 +343,17 @@ pub fn get_request_limit_info() -> Value {
                 }],
                 "requestLimitInfo": {
                     "isUnlimited": true,
+                    "nextRefreshTime": FAR_FUTURE_TIME,
+                    "requestLimit": 999999,
                     "requestsUsedSinceLastRefresh": 0,
-                    "requestLimit": 0,
-                    "nextRefreshTime": null,
-                    "requestLimitRefreshDuration": null
+                    "requestLimitRefreshDuration": "MONTHLY",
+                    "isUnlimitedVoice": true,
+                    "voiceRequestLimit": 0,
+                    "voiceRequestsUsedSinceLastRefresh": 0,
+                    "isUnlimitedCodebaseIndices": true,
+                    "maxCodebaseIndices": 0,
+                    "maxFilesPerRepo": 999999,
+                    "embeddingGenerationBatchSize": 100
                 },
                 "bonusGrants": []
             }
