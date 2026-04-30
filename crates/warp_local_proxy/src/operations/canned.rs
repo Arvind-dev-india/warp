@@ -273,7 +273,15 @@ pub fn get_user(state: &AppState) -> Value {
             "apiKeyOwnerType": null,
             "principalType": "USER",
             "user": {
-                "anonymousUserInfo": anonymous_user_info(),
+                // [FORK] Set anonymousUserInfo to null so is_user_anonymous()
+                // returns false. With it set to NATIVE_CLIENT_ANONYMOUS_USER +
+                // linkedAt=null (the natural shape after CreateAnonymousUser),
+                // the GUI permanently shows "Sign up to use AI" and refuses
+                // to enable AI features. In local-proxy mode there's no real
+                // anonymous-vs-full-user distinction; we always claim "fully
+                // signed-in local user" regardless of how the auth flow got
+                // here.
+                "anonymousUserInfo": null,
                 "experiments": [],
                 "isOnboarded": true,
                 "isOnWorkDomain": false,
