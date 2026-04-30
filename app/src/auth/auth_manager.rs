@@ -704,6 +704,14 @@ impl AuthManager {
                             // called generate_auth_state(), so pending_auth_state
                             // is set; we reuse it here so consume_auth_state
                             // accepts the synthesized payload.
+                            //
+                            // `deleted_anonymous_user: Some(true)` short-circuits
+                            // the LoginOverrideDetected check downstream — without
+                            // it, the synthesized payload (no matching user_uid)
+                            // looks like "a different user is trying to sign in",
+                            // and the AuthOverrideWarningModal pops up asking the
+                            // user to confirm twice. We're not really replacing
+                            // the user; we just want the auth state to settle.
                             log::info!(
                                 "[FORK] Channel::Oss: bypassing browser sign-up redirect, \
                                  synthesizing auth payload locally"
@@ -712,7 +720,7 @@ impl AuthManager {
                             let payload = AuthRedirectPayload {
                                 refresh_token: RefreshToken::new("local-refresh-token".to_string()),
                                 user_uid: None,
-                                deleted_anonymous_user: None,
+                                deleted_anonymous_user: Some(true),
                                 state: synthesized_state,
                             };
                             me.initialize_user_from_auth_payload(payload, true, ctx);
