@@ -184,11 +184,18 @@ fn billing_tier() -> Value {
 
 fn billing_metadata() -> Value {
     json!({
-        "customerType": "INDIVIDUAL",
+        // [FORK] Must be a paid CustomerType (BUILD / TURBO / BUSINESS / etc.)
+        // so is_user_on_paid_plan() returns true. Otherwise the AI prompt-alert
+        // shows "to use AI, enable analytics or upgrade" because telemetry is
+        // disabled in this fork. "INDIVIDUAL" was an invalid value that the
+        // cynic deserializer mapped to CustomerType::Unknown (the #[cynic(fallback)]
+        // variant), which the upstream is_user_on_paid_plan check treats as
+        // not-on-paid. See app/src/workspaces/workspace.rs:502 and
+        // app/src/ai/blocklist/prompt/prompt_alert.rs:142.
+        "customerType": "BUILD",
         "delinquencyStatus": "NONE",
         "tier": billing_tier(),
         "serviceAgreements": [],
-        // Optional<AiOverages> on BillingMetadata; null = no overages.
         "aiOverages": null
     })
 }
