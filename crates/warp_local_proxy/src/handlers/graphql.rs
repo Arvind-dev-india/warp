@@ -76,9 +76,9 @@ pub async fn handle(
         "ListAmbientAgentTasks" | "list_ambient_agent_tasks" => {
             Some(cloud_stubs::list_ambient_agent_tasks())
         }
-        "ListAiConversations" | "list_ai_conversation_metadata" => {
-            Some(cloud_stubs::list_ai_conversation_metadata())
-        }
+        "ListAiConversations"
+        | "list_ai_conversation_metadata"
+        | "ListAIConversationMetadata" => Some(cloud_stubs::list_ai_conversation_metadata()),
         "UpdateEventSequence" | "update_event_sequence_on_server" => {
             Some(cloud_stubs::update_event_sequence_on_server())
         }
