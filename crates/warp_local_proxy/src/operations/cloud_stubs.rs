@@ -26,6 +26,31 @@ pub fn update_event_sequence_on_server() -> Value {
     json!({ "updateEventSequence": { "__typename": "UpdateEventSequenceOutput" } })
 }
 
+/// Confirmed observed in real `warp-oss login` integration test: the client
+/// fires this several times during login to push privacy / settings deltas to
+/// the server. We accept and discard.
+pub fn update_user_settings() -> Value {
+    json!({
+        "updateUserSettings": {
+            "__typename": "UpdateUserSettingsOutput",
+            "responseContext": { "serverVersion": "warp_local_proxy/0.1.0" }
+        }
+    })
+}
+
+/// Confirmed observed during launch: the cloud-objects subscription fetches
+/// updates since a cursor. Returning an empty delta keeps the client happy.
+pub fn get_updated_cloud_objects() -> Value {
+    json!({
+        "updatedCloudObjects": {
+            "__typename": "UpdatedCloudObjectsOutput",
+            "objects": [],
+            "deletedUids": [],
+            "cursor": null
+        }
+    })
+}
+
 pub fn empty_ok(operation_name: &str) -> Value {
     json!({ operation_name: { "__typename": "Output" } })
 }
