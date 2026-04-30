@@ -9,8 +9,12 @@
 //! * [`oauth::device_auth`] / [`oauth::device_token`] — RFC 8628 device-flow
 //!   stubs so headless `warp-oss login` completes against the proxy and the
 //!   binary caches a fake auth state.
+//! * [`browser_auth::handle`] — `GET /login/remote` and `/signup/remote`,
+//!   served as HTML pages that immediately deep-link the user back into the
+//!   warp client with a fake refresh token.
 
 pub mod ai_rest;
+pub mod browser_auth;
 pub mod graphql;
 pub mod oauth;
 

@@ -88,6 +88,11 @@ pub fn router(state: AppState) -> Router {
         // `crates/firebase/src/lib.rs::FetchAccessTokenResponse`.
         .route("/proxy/customToken", post(handlers::oauth::proxy_custom_token))
         .route("/proxy/token", post(handlers::oauth::proxy_refresh_token))
+        // Browser-targeted login / signup pages. The GUI opens these in the
+        // user's browser; we serve a tiny HTML page that auto-redirects via
+        // the warposs:// custom URL scheme back into the warp app.
+        .route("/login/remote", get(handlers::browser_auth::handle))
+        .route("/signup/remote", get(handlers::browser_auth::handle))
         // Cloud-only REST: agent runs, attachments, conversation snapshots.
         // Return 503 with structured error so the client knows it's unsupported.
         .route("/api/v1/agent/{*rest}", any(handlers::unsupported))
