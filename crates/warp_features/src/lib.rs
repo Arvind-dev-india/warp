@@ -419,6 +419,13 @@ pub enum FeatureFlag {
     /// Enables vim keybindings in the code editor.
     VimCodeEditor,
 
+    /// [FORK] Routes AI inference (command generation, dialogue, code review)
+    /// to a user-configured OpenAI-compatible endpoint instead of Warp's
+    /// `app.warp.dev` gateway. Off by default in every channel; enable via the
+    /// settings UI or runtime override. When disabled, behavior is identical
+    /// to upstream.
+    LocalModels,
+
     /// Allows opening file links using the $EDITOR environment variable.
     AllowOpeningFileLinksUsingEditorEnv,
 
