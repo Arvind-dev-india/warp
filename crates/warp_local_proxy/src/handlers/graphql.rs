@@ -61,6 +61,8 @@ pub async fn handle(
         "GetReferralInfo" | "get_referral_info" => Some(canned::get_referral_info()),
         "UserGithubInfo" | "user_github_info" => Some(canned::user_github_info()),
         "GetConversationUsage" | "get_conversation_usage" => Some(canned::get_conversation_usage()),
+        // Triggered by the "Sign in to use AI" button in Settings.
+        "MintCustomToken" | "mint_custom_token" => Some(canned::mint_custom_token()),
 
         // ---- real AI handlers ----
         "GenerateCommands" | "generate_commands" => {

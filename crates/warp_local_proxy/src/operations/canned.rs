@@ -421,3 +421,20 @@ pub fn get_conversation_usage() -> Value {
 pub fn get_experiments() -> Value {
     json!({ "experiments": [] })
 }
+
+/// `MintCustomToken` mutation — the "Sign in to use AI" button in Settings
+/// dispatches `MainPageAction::SignupAnonymousUser`, which calls this mutation
+/// to mint a fresh Firebase custom token. We hand back the same fake JWT shape
+/// the OAuth device-flow stub returns; the warp client will turn it into a
+/// FirebaseToken::Custom and exchange it via /proxy/customToken.
+pub fn mint_custom_token() -> Value {
+    json!({
+        "mintCustomToken": {
+            "__typename": "MintCustomTokenOutput",
+            // Same alg=none JWT shape we use elsewhere — keeps the signature
+            // verification path consistent (the warp client never verifies).
+            "customToken": "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJpc3MiOiJ3YXJwX2xvY2FsX3Byb3h5Iiwic3ViIjoibG9jYWwtdXNlci11aWQiLCJhdWQiOiJ3YXJwLWNsaSIsImVtYWlsIjoibG9jYWxAbG9jYWwifQ.",
+            "responseContext": response_context()
+        }
+    })
+}
