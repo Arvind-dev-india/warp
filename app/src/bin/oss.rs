@@ -15,7 +15,18 @@ fn main() -> Result<()> {
         ChannelConfig {
             app_id: AppId::new("dev", "warp", "WarpOss"),
             logfile_name: "warp-oss.log".into(),
-            server_config: WarpServerConfig::production(),
+            // [FORK] Default server_root_url to the local proxy so users don't
+            // have to set WARP_SERVER_ROOT_URL by hand. Anything pointing at
+            // app.warp.dev would be useless in this fork anyway: telemetry is
+            // disabled, autoupdate is disabled, and AI / identity ops are
+            // handled by warp_local_proxy. The env var still wins when set
+            // (allows_server_url_overrides() includes Channel::Oss).
+            server_config: WarpServerConfig {
+                server_root_url: "http://127.0.0.1:8765".into(),
+                rtc_server_url: "ws://127.0.0.1:8765/graphql/v2".into(),
+                session_sharing_server_url: None,
+                firebase_auth_api_key: "local-mode-no-firebase".into(),
+            },
             oz_config: OzConfig::production(),
             telemetry_config: None,
             crash_reporting_config: None,
