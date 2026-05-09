@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! `warp_local_proxy` — a fork-owned HTTP server that the Warp client points at
 //! (via `WARP_SERVER_ROOT_URL`) instead of `https://app.warp.dev`.
 //!
