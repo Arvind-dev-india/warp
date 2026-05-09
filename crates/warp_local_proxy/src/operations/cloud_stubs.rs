@@ -203,3 +203,19 @@ pub fn get_cloud_environments() -> Value {
         }
     })
 }
+
+/// `GetAvailableHarnesses` — returns an empty harness list.
+/// The client uses this to populate the agent harness selector (Oz, ClaudeCode, Gemini).
+/// In local mode we return an empty list so no cloud harnesses appear.
+pub fn get_available_harnesses() -> Value {
+    json!({
+        "user": {
+            "__typename": "UserOutput",
+            "user": {
+                "availableHarnesses": {
+                    "harnesses": []
+                }
+            }
+        }
+    })
+}

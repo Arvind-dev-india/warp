@@ -162,6 +162,7 @@ fn billing_tier() -> Value {
             "isCodeSuggestionsToggleable": true,
             "isPromptSuggestionsToggleable": true,
             "isNextCommandEnabled": true,
+            "isGitOperationsAiEnabled": true,
             "isVoiceEnabled": false
         },
         "teamSizePolicy": { "isUnlimited": true, "limit": 0 },

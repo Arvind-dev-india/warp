@@ -97,6 +97,9 @@ pub async fn handle(
         "GetCloudEnvironmentsQuery" | "get_cloud_environments_query" => {
             Some(cloud_stubs::get_cloud_environments())
         }
+        "GetAvailableHarnesses" | "get_available_harnesses" => {
+            Some(cloud_stubs::get_available_harnesses())
+        }
 
         // Anything we haven't taught the proxy yet → structured error.
         _ => None,
