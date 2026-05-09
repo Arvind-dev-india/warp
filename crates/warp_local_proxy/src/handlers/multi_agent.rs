@@ -2242,23 +2242,26 @@ pub async fn handle(
             emit_agent_output(&mut sse_body, &task_id, &request_id, text);
         }
         Ok(LlmResult { response: LlmResponse::ToolCalls(ref tool_calls), .. }) => {
-            // Save the assistant tool_calls message to cache (one message per call
-            // to match OpenAI's expectation)
-            for tc in tool_calls {
-                let fn_name = tc["function"]["name"].as_str().unwrap_or("unknown");
-                let fn_args = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                let tc_id = tc["id"].as_str().unwrap_or("");
-                openai_messages.push(json!({
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": tc_id,
-                        "type": "function",
-                        "function": { "name": fn_name, "arguments": fn_args }
-                    }]
-                }));
+            // Save ALL tool_calls in a SINGLE assistant message.
+            // OpenAI requires all tool_calls from one response to be in one message.
+            let tc_entries: Vec<serde_json::Value> = tool_calls.iter().map(|tc| {
+                json!({
+                    "id": tc["id"].as_str().unwrap_or(""),
+                    "type": "function",
+                    "function": {
+                        "name": tc["function"]["name"].as_str().unwrap_or("unknown"),
+                        "arguments": tc["function"]["arguments"].as_str().unwrap_or("{}")
+                    }
+                })
+            }).collect();
+            openai_messages.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": tc_entries
+            }));
 
-                if let Some(proto_tc) = openai_tool_call_to_proto(tc) {
+            // Emit each tool call as a separate protobuf event for the client
+            for tc in tool_calls {                if let Some(proto_tc) = openai_tool_call_to_proto(tc) {
                     let tc_msg_id = uuid::Uuid::new_v4().to_string();
                     sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
                         r#type: Some(warp_multi_agent_api::response_event::Type::ClientActions(
