@@ -2149,9 +2149,44 @@ pub async fn handle(
         }
     }
 
+    // Patch orphaned tool_calls for the LLM call only (not persisted).
+    // If a user typed a message before a tool result arrived, the cache has
+    // [assistant(tool_call), user(msg)] with no tool result. OpenAI rejects
+    // this. We create a patched copy with placeholders for the LLM, but keep
+    // the real cache clean so the actual tool result can arrive later.
+    let llm_messages = {
+        let mut patched = openai_messages.clone();
+        let mut i = 0;
+        while i < patched.len() {
+            if let Some(tcs) = patched[i].get("tool_calls").and_then(|v| v.as_array()) {
+                let needed: std::collections::HashSet<String> = tcs.iter()
+                    .filter_map(|t| t["id"].as_str().map(String::from))
+                    .collect();
+                let mut found = std::collections::HashSet::new();
+                let mut j = i + 1;
+                while j < patched.len() && patched[j]["role"] == "tool" {
+                    if let Some(id) = patched[j]["tool_call_id"].as_str() {
+                        found.insert(id.to_string());
+                    }
+                    j += 1;
+                }
+                let missing: Vec<String> = needed.difference(&found).cloned().collect();
+                for (offset, id) in missing.iter().enumerate() {
+                    patched.insert(j + offset, json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": "(cancelled by user)"
+                    }));
+                }
+            }
+            i += 1;
+        }
+        patched
+    };
+
     // Count tool call rounds for the max-rounds limit
     const MAX_TOOL_ROUNDS: u32 = 15;
-    let prior_tool_rounds = openai_messages
+    let prior_tool_rounds = llm_messages
         .iter()
         .filter(|m| m.get("tool_calls").is_some())
         .count() as u32;
@@ -2165,7 +2200,7 @@ pub async fn handle(
         );
     }
 
-    let llm_result = call_backend_with_tools(&state, &openai_messages, send_tools).await;
+    let llm_result = call_backend_with_tools(&state, &llm_messages, send_tools).await;
     let context_usage = llm_result.as_ref().map(|r| r.context_usage).unwrap_or(0.0);
 
     let mut sse_body = String::new();
