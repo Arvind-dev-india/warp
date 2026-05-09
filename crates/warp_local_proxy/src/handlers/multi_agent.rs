@@ -949,12 +949,31 @@ fn build_openai_messages(
     // assistant tool_call to be followed by a matching tool result).
     if let Some(ref tc) = request.task_context {
         let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut tool_call_count = 0u32;
+        let mut tool_result_count = 0u32;
+        let mut user_query_count = 0u32;
+        let mut agent_output_count = 0u32;
+        let mut other_count = 0u32;
+
         for task in &tc.tasks {
             for msg in &task.messages {
-                if let Some(warp_multi_agent_api::message::Message::ToolCallResult(tcr)) =
-                    msg.message.as_ref()
-                {
-                    result_ids.insert(tcr.tool_call_id.clone());
+                match msg.message.as_ref() {
+                    Some(warp_multi_agent_api::message::Message::ToolCallResult(tcr)) => {
+                        result_ids.insert(tcr.tool_call_id.clone());
+                        tool_result_count += 1;
+                    }
+                    Some(warp_multi_agent_api::message::Message::ToolCall(_)) => {
+                        tool_call_count += 1;
+                    }
+                    Some(warp_multi_agent_api::message::Message::UserQuery(_)) => {
+                        user_query_count += 1;
+                    }
+                    Some(warp_multi_agent_api::message::Message::AgentOutput(_)) => {
+                        agent_output_count += 1;
+                    }
+                    _ => {
+                        other_count += 1;
+                    }
                 }
             }
         }
@@ -962,6 +981,18 @@ fn build_openai_messages(
         for (id, _) in tool_results {
             result_ids.insert(id.clone());
         }
+
+        tracing::info!(
+            tasks = tc.tasks.len(),
+            tool_calls = tool_call_count,
+            tool_results_in_history = tool_result_count,
+            tool_results_in_input = tool_results.len(),
+            matched_result_ids = result_ids.len(),
+            user_queries = user_query_count,
+            agent_outputs = agent_output_count,
+            other = other_count,
+            "conversation history summary"
+        );
 
         for task in &tc.tasks {
             for msg in &task.messages {
@@ -976,17 +1007,24 @@ fn build_openai_messages(
                             messages.push(json!({ "role": "assistant", "content": a.text }));
                         }
                         warp_multi_agent_api::message::Message::ToolCall(tc) => {
-                            // Only include tool calls that have a matching result
-                            if result_ids.contains(&tc.tool_call_id) {
-                                let (fn_name, fn_args) = tool_call_to_openai(tc);
+                            let (fn_name, fn_args) = tool_call_to_openai(tc);
+                            messages.push(json!({
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": tc.tool_call_id,
+                                    "type": "function",
+                                    "function": { "name": fn_name, "arguments": fn_args }
+                                }]
+                            }));
+                            // If this tool call has no matching result in history
+                            // or current input, synthesize a placeholder so
+                            // OpenAI's API doesn't reject the orphaned tool_call.
+                            if !result_ids.contains(&tc.tool_call_id) {
                                 messages.push(json!({
-                                    "role": "assistant",
-                                    "content": null,
-                                    "tool_calls": [{
-                                        "id": tc.tool_call_id,
-                                        "type": "function",
-                                        "function": { "name": fn_name, "arguments": fn_args }
-                                    }]
+                                    "role": "tool",
+                                    "tool_call_id": tc.tool_call_id,
+                                    "content": "(result not available)"
                                 }));
                             }
                         }
@@ -1916,7 +1954,32 @@ pub async fn handle(
     let task_id = existing_task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let openai_messages = build_openai_messages(&request, user_query.as_deref(), &tool_results);
-    let llm_response = call_backend_with_tools(&state, &openai_messages).await;
+
+    // Count how many tool call rounds have happened in this conversation.
+    // After MAX_TOOL_ROUNDS, omit tools to force the LLM to give a text answer.
+    const MAX_TOOL_ROUNDS: u32 = 15;
+    let prior_tool_rounds = request
+        .task_context
+        .as_ref()
+        .map(|tc| {
+            tc.tasks
+                .iter()
+                .flat_map(|t| t.messages.iter())
+                .filter(|m| matches!(m.message, Some(warp_multi_agent_api::message::Message::ToolCall(_))))
+                .count() as u32
+        })
+        .unwrap_or(0);
+
+    let send_tools = prior_tool_rounds < MAX_TOOL_ROUNDS;
+    if !send_tools {
+        tracing::warn!(
+            prior_rounds = prior_tool_rounds,
+            max = MAX_TOOL_ROUNDS,
+            "max tool rounds reached, forcing text response"
+        );
+    }
+
+    let llm_response = call_backend_with_tools(&state, &openai_messages, send_tools).await;
 
     let mut sse_body = String::new();
 
@@ -2127,17 +2190,21 @@ enum LlmResponse {
 async fn call_backend_with_tools(
     state: &AppState,
     messages: &[serde_json::Value],
+    send_tools: bool,
 ) -> Result<LlmResponse, anyhow::Error> {
     let url = state.config.chat_completions_url();
     let model = &state.config.default_model;
 
-    let payload = json!({
+    let mut payload = json!({
         "model": model,
         "messages": messages,
-        "tools": openai_tools(),
         "max_tokens": 4096,
         "stream": false
     });
+
+    if send_tools {
+        payload["tools"] = openai_tools();
+    }
 
     let resp = state
         .http
