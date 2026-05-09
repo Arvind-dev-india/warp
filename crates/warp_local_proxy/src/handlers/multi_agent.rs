@@ -2007,7 +2007,8 @@ pub async fn handle(
         );
     }
 
-    let llm_response = call_backend_with_tools(&state, &openai_messages, send_tools).await;
+    let llm_result = call_backend_with_tools(&state, &openai_messages, send_tools).await;
+    let context_usage = llm_result.as_ref().map(|r| r.context_usage).unwrap_or(0.0);
 
     let mut sse_body = String::new();
 
@@ -2076,13 +2077,13 @@ pub async fn handle(
     }
 
     // Handle LLM response
-    match llm_response {
-        Ok(LlmResponse::Text(ref text)) => {
+    match llm_result {
+        Ok(LlmResult { response: LlmResponse::Text(ref text), .. }) => {
             // Save assistant text to cache
             openai_messages.push(json!({ "role": "assistant", "content": text }));
             emit_agent_output(&mut sse_body, &task_id, &request_id, text);
         }
-        Ok(LlmResponse::ToolCalls(ref tool_calls)) => {
+        Ok(LlmResult { response: LlmResponse::ToolCalls(ref tool_calls), .. }) => {
             // Save the assistant tool_calls message to cache (one message per call
             // to match OpenAI's expectation)
             for tc in tool_calls {
@@ -2146,6 +2147,12 @@ pub async fn handle(
                     warp_multi_agent_api::response_event::stream_finished::Reason::Done(
                         warp_multi_agent_api::response_event::stream_finished::Done {},
                     ),
+                ),
+                conversation_usage_metadata: Some(
+                    warp_multi_agent_api::response_event::stream_finished::ConversationUsageMetadata {
+                        context_window_usage: context_usage,
+                        ..Default::default()
+                    },
                 ),
                 ..Default::default()
             },
@@ -2236,11 +2243,17 @@ enum LlmResponse {
     ToolCalls(Vec<serde_json::Value>),
 }
 
+struct LlmResult {
+    response: LlmResponse,
+    /// Fraction of context window used (0.0–1.0), from usage data.
+    context_usage: f32,
+}
+
 async fn call_backend_with_tools(
     state: &AppState,
     messages: &[serde_json::Value],
     send_tools: bool,
-) -> Result<LlmResponse, anyhow::Error> {
+) -> Result<LlmResult, anyhow::Error> {
     let url = state.config.chat_completions_url();
     let model = &state.config.default_model;
 
@@ -2273,10 +2286,20 @@ async fn call_backend_with_tools(
     let choice = &response_json["choices"][0];
     let message = &choice["message"];
 
+    // Estimate context window usage from token counts
+    let prompt_tokens = response_json["usage"]["prompt_tokens"].as_f64().unwrap_or(0.0);
+    let total_tokens = response_json["usage"]["total_tokens"].as_f64().unwrap_or(0.0);
+    // Common context windows: 128k for most models, use prompt_tokens/128000 as estimate
+    let context_limit = 128_000.0_f64;
+    let context_usage = (total_tokens / context_limit).min(1.0) as f32;
+
     if let Some(tool_calls) = message["tool_calls"].as_array() {
         if !tool_calls.is_empty() {
-            tracing::info!(count = tool_calls.len(), "LLM requested tool calls");
-            return Ok(LlmResponse::ToolCalls(tool_calls.clone()));
+            tracing::info!(count = tool_calls.len(), prompt_tokens, "LLM requested tool calls");
+            return Ok(LlmResult {
+                response: LlmResponse::ToolCalls(tool_calls.clone()),
+                context_usage,
+            });
         }
     }
 
@@ -2284,5 +2307,8 @@ async fn call_backend_with_tools(
         .as_str()
         .unwrap_or("(no response)")
         .to_string();
-    Ok(LlmResponse::Text(text))
+    Ok(LlmResult {
+        response: LlmResponse::Text(text),
+        context_usage,
+    })
 }
