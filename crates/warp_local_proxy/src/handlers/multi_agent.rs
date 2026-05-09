@@ -2069,6 +2069,70 @@ pub async fn handle(
         }));
     }
 
+    // Handle other input types as user messages
+    if user_query.is_none() && tool_results.is_empty() && !is_summarize_request(&request) {
+        if let Some(input) = request.input.as_ref().and_then(|i| i.r#type.as_ref()) {
+            let extra_input = match input {
+                warp_multi_agent_api::request::input::Type::ResumeConversation(_) => {
+                    Some("(Conversation resumed)".to_string())
+                }
+                warp_multi_agent_api::request::input::Type::CodeReview(_cr) => {
+                    Some("Please review the code changes.".to_string())
+                }
+                warp_multi_agent_api::request::input::Type::AutoCodeDiffQuery(q) => {
+                    Some(format!("Auto code diff: {}", q.query))
+                }
+                warp_multi_agent_api::request::input::Type::InvokeSkill(_s) => {
+                    Some("Invoke skill.".to_string())
+                }
+                warp_multi_agent_api::request::input::Type::CreateNewProject(p) => {
+                    Some(format!("Create new project: {}", p.query))
+                }
+                warp_multi_agent_api::request::input::Type::InitProjectRules(_) => {
+                    Some("Initialize project rules.".to_string())
+                }
+                warp_multi_agent_api::request::input::Type::FetchReviewComments(fr) => {
+                    Some(format!("Fetch review comments for: {}", fr.repo_path))
+                }
+                _ => None,
+            };
+            if let Some(msg) = extra_input {
+                openai_messages.push(json!({ "role": "user", "content": msg }));
+            }
+        }
+    }
+
+    // Auto-summarize if context is getting large (>75% of estimated window)
+    let estimated_tokens: usize = openai_messages.iter()
+        .map(|m| m.to_string().len() / 4) // rough estimate: 4 chars per token
+        .sum();
+    const AUTO_SUMMARIZE_THRESHOLD: usize = 96_000; // 75% of 128k
+    if estimated_tokens > AUTO_SUMMARIZE_THRESHOLD {
+        tracing::info!(estimated_tokens, "auto-summarizing conversation (>75% context)");
+        let summary_text = openai_messages.iter()
+            .filter(|m| m["role"] != "system")
+            .map(|m| {
+                let role = m["role"].as_str().unwrap_or("?");
+                let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                format!("[{role}] {}", &content[..content.len().min(500)])
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary_msgs = vec![
+            json!({ "role": "system", "content": "Summarize this conversation concisely. Keep key facts, file paths, decisions, and tool results." }),
+            json!({ "role": "user", "content": summary_text }),
+        ];
+        if let Ok(LlmResult { response: LlmResponse::Text(ref summary), .. }) =
+            call_backend_with_tools(&state, &summary_msgs, false).await
+        {
+            openai_messages = vec![
+                openai_messages[0].clone(),
+                json!({ "role": "assistant", "content": format!("[Auto-compacted summary]\n{summary}") }),
+            ];
+            state.save_conversation(&task_id, &openai_messages);
+        }
+    }
+
     // Count tool call rounds for the max-rounds limit
     const MAX_TOOL_ROUNDS: u32 = 15;
     let prior_tool_rounds = openai_messages
