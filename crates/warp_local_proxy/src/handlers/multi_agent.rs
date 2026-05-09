@@ -663,6 +663,16 @@ fn extract_user_query(request: &warp_multi_agent_api::Request) -> Option<String>
     }
 }
 
+/// Check if the request is a SummarizeConversation request.
+fn is_summarize_request(request: &warp_multi_agent_api::Request) -> bool {
+    request
+        .input
+        .as_ref()
+        .and_then(|i| i.r#type.as_ref())
+        .map(|t| matches!(t, warp_multi_agent_api::request::input::Type::SummarizeConversation(_)))
+        .unwrap_or(false)
+}
+
 fn extract_tool_results(request: &warp_multi_agent_api::Request) -> Vec<(String, String)> {
     let mut results = Vec::new();
     let Some(input) = request.input.as_ref() else {
@@ -1973,6 +1983,74 @@ pub async fn handle(
                         When you need to understand existing code, use read_files or grep. \
                         Be concise but thorough."
         }));
+    }
+
+    // Handle SummarizeConversation: ask the LLM to summarize, replace cache
+    if is_summarize_request(&request) {
+        tracing::info!("summarize request — compacting conversation");
+        let summary_prompt = json!([
+            { "role": "system", "content": "Summarize the following conversation into a concise recap. Preserve key facts, decisions, file paths, and tool results. Output only the summary." },
+            { "role": "user", "content": openai_messages.iter()
+                .filter(|m| m["role"] != "system")
+                .map(|m| {
+                    let role = m["role"].as_str().unwrap_or("?");
+                    let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let tc = m.get("tool_calls").map(|t| format!("[tool_calls: {}]", t));
+                    format!("[{role}] {}{}", content, tc.unwrap_or_default())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+            }
+        ]);
+        let summary_messages: Vec<serde_json::Value> = serde_json::from_value(summary_prompt).unwrap_or_default();
+        let summary_result = call_backend_with_tools(&state, &summary_messages, false).await;
+        if let Ok(LlmResult { response: LlmResponse::Text(ref summary), .. }) = summary_result {
+            // Replace conversation with system + summary
+            openai_messages = vec![
+                openai_messages[0].clone(), // keep system prompt
+                json!({ "role": "assistant", "content": format!("[Conversation summary]\n{summary}") }),
+            ];
+            state.save_conversation(&task_id, &openai_messages);
+
+            // Emit a Summarization message so the UI shows it
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let mut sse_body = String::new();
+            sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
+                r#type: Some(warp_multi_agent_api::response_event::Type::Init(
+                    warp_multi_agent_api::response_event::StreamInit {
+                        conversation_id: conversation_id.clone(),
+                        request_id: request_id.clone(),
+                        run_id: run_id.clone(),
+                    },
+                )),
+            }));
+            emit_agent_output(&mut sse_body, &task_id, &request_id, &format!("Conversation compacted. Summary:\n{summary}"));
+            sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
+                r#type: Some(warp_multi_agent_api::response_event::Type::Finished(
+                    warp_multi_agent_api::response_event::StreamFinished {
+                        reason: Some(
+                            warp_multi_agent_api::response_event::stream_finished::Reason::Done(
+                                warp_multi_agent_api::response_event::stream_finished::Done {},
+                            ),
+                        ),
+                        conversation_usage_metadata: Some(
+                            warp_multi_agent_api::response_event::stream_finished::ConversationUsageMetadata {
+                                context_window_usage: 0.05, // minimal after compaction
+                                summarized: true,
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    },
+                )),
+            }));
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from(sse_body))
+                .unwrap();
+        }
     }
 
     // Add new user query (if present)
