@@ -2076,8 +2076,24 @@ pub async fn handle(
                 warp_multi_agent_api::request::input::Type::ResumeConversation(_) => {
                     Some("(Conversation resumed)".to_string())
                 }
-                warp_multi_agent_api::request::input::Type::CodeReview(_cr) => {
-                    Some("Please review the code changes.".to_string())
+                warp_multi_agent_api::request::input::Type::CodeReview(cr) => {
+                    // Extract diff hunks from the CodeReview input
+                    let mut review_text = String::from("Please review the following code changes:\n\n");
+                    if let Some(warp_multi_agent_api::request::input::code_review::Operation::InitialReviewComments(irc)) = &cr.operation {
+                        if let Some(diff_set) = &irc.diff_set {
+                            for hunk in &diff_set.hunks {
+                                review_text.push_str(&format!("=== {} (lines +{} -{}) ===\n{}\n\n",
+                                    hunk.file_path, hunk.lines_added, hunk.lines_removed, hunk.diff_content));
+                            }
+                        }
+                        if !irc.review_comments.is_empty() {
+                            review_text.push_str("Existing review comments:\n");
+                            for c in &irc.review_comments {
+                                review_text.push_str(&format!("- {}\n", c.comment));
+                            }
+                        }
+                    }
+                    Some(review_text)
                 }
                 warp_multi_agent_api::request::input::Type::AutoCodeDiffQuery(q) => {
                     Some(format!("Auto code diff: {}", q.query))
