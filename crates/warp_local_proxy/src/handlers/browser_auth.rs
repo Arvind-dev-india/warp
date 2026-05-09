@@ -62,11 +62,14 @@ fn render_page(scheme: Option<&str>, state: Option<&str>) -> impl IntoResponse {
     let state = state.unwrap_or("");
     let refresh_token = "local-refresh-token";
 
-    let deep_link = format!(
-        "{scheme}://auth/desktop_redirect?refresh_token={refresh_token}&state={state}"
-    );
+    let deep_link =
+        format!("{scheme}://auth/desktop_redirect?refresh_token={refresh_token}&state={state}");
 
-    tracing::info!(scheme = scheme, state = state, "browser auth landing page served");
+    tracing::info!(
+        scheme = scheme,
+        state = state,
+        "browser auth landing page served"
+    );
 
     let html = format!(
         r#"<!doctype html>

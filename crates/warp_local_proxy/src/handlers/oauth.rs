@@ -49,9 +49,7 @@ pub struct DeviceAuthResponse {
 /// `POST /api/v1/oauth/device/auth` — returns a canned device authorization
 /// response. The user_code is shown to the human in real OAuth2 device flows;
 /// here it's purely cosmetic since the proxy auto-approves the next /token call.
-pub async fn device_auth(
-    Form(req): Form<DeviceAuthRequest>,
-) -> impl IntoResponse {
+pub async fn device_auth(Form(req): Form<DeviceAuthRequest>) -> impl IntoResponse {
     tracing::info!(
         client_id = req.client_id.as_deref().unwrap_or(""),
         scope = req.scope.as_deref().unwrap_or(""),
@@ -89,9 +87,7 @@ pub struct DeviceTokenRequest {
 /// token as a `FirebaseToken::Custom` and then exchanges it against
 /// Firebase / our /proxy/customToken endpoint to get an `id_token` it can
 /// use as Bearer auth for GraphQL.
-pub async fn device_token(
-    Form(req): Form<DeviceTokenRequest>,
-) -> impl IntoResponse {
+pub async fn device_token(Form(req): Form<DeviceTokenRequest>) -> impl IntoResponse {
     tracing::info!(
         grant_type = req.grant_type.as_deref().unwrap_or(""),
         device_code = req.device_code.as_deref().unwrap_or(""),
@@ -129,9 +125,7 @@ pub struct CustomTokenProxyRequest {
 /// Response shape comes from `crates/firebase/src/lib.rs::FetchAccessTokenResponse`:
 /// `{id_token, refresh_token, expires_in}` (snake_case or camelCase aliases),
 /// all strings.
-pub async fn proxy_custom_token(
-    Form(req): Form<CustomTokenProxyRequest>,
-) -> impl IntoResponse {
+pub async fn proxy_custom_token(Form(req): Form<CustomTokenProxyRequest>) -> impl IntoResponse {
     tracing::info!(
         has_token = req.token.is_some(),
         "proxy custom token exchange"
@@ -150,9 +144,7 @@ pub struct RefreshTokenProxyRequest {
 /// `POST /proxy/token` — Firebase refresh fallback. Same response shape as
 /// `/proxy/customToken`. Called when an id_token expires and the client
 /// wants a fresh one.
-pub async fn proxy_refresh_token(
-    Form(req): Form<RefreshTokenProxyRequest>,
-) -> impl IntoResponse {
+pub async fn proxy_refresh_token(Form(req): Form<RefreshTokenProxyRequest>) -> impl IntoResponse {
     tracing::info!(
         grant_type = req.grant_type.as_deref().unwrap_or(""),
         "proxy refresh token exchange"

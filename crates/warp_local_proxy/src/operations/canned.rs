@@ -64,10 +64,7 @@ fn available_llms(default_id: &str, choices: Vec<Value>) -> Value {
 fn feature_model_choice(state: &AppState) -> Value {
     let ids = state.advertised_models();
     let default_id = state.default_model_id();
-    let choices: Vec<Value> = ids
-        .iter()
-        .map(|id| llm_info(id, id))
-        .collect();
+    let choices: Vec<Value> = ids.iter().map(|id| llm_info(id, id)).collect();
     let entries = || -> Value { available_llms(&default_id, choices.clone()) };
     json!({
         "agentMode": entries(),

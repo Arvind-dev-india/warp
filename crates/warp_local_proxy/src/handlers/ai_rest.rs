@@ -25,7 +25,10 @@ pub struct CodeReviewRequest {
     pub other: serde_json::Map<String, Value>,
 }
 
-pub async fn handle(State(state): State<Arc<AppState>>, Json(req): Json<Value>) -> impl IntoResponse {
+pub async fn handle(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<Value>,
+) -> impl IntoResponse {
     let prompt = req
         .get("prompt")
         .and_then(|s| s.as_str())
@@ -45,8 +48,14 @@ pub async fn handle(State(state): State<Arc<AppState>>, Json(req): Json<Value>) 
     );
 
     let messages = vec![
-        ChatMessage { role: "system", content: system },
-        ChatMessage { role: "user", content: prompt },
+        ChatMessage {
+            role: "system",
+            content: system,
+        },
+        ChatMessage {
+            role: "user",
+            content: prompt,
+        },
     ];
 
     match chat_completion(&state.http, &state.config, messages, false, Some(1024)).await {

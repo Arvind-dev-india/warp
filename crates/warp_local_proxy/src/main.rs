@@ -5,7 +5,10 @@ use warp_local_proxy::{config::Config, server};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,warp_local_proxy=debug")))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,warp_local_proxy=debug")),
+        )
         .with(fmt::layer().with_target(false))
         .init();
 

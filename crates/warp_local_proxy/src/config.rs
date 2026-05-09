@@ -23,7 +23,11 @@ pub enum AuthStyle {
 }
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "warp-local-proxy", version, about = "Local proxy for the Warp client")]
+#[command(
+    name = "warp-local-proxy",
+    version,
+    about = "Local proxy for the Warp client"
+)]
 pub struct Config {
     /// Address to bind the HTTP server to. Defaults to localhost-only.
     #[arg(long, env = "WARP_LOCAL_PROXY_BIND", default_value = "127.0.0.1:8765")]
@@ -132,13 +136,19 @@ mod tests {
     #[test]
     fn bearer_chat_url_simple() {
         let c = cfg("http://localhost:3113/v1", AuthStyle::Bearer, None);
-        assert_eq!(c.chat_completions_url(), "http://localhost:3113/v1/chat/completions");
+        assert_eq!(
+            c.chat_completions_url(),
+            "http://localhost:3113/v1/chat/completions"
+        );
     }
 
     #[test]
     fn trailing_slash_is_normalised() {
         let c = cfg("http://localhost:3113/v1/", AuthStyle::Bearer, None);
-        assert_eq!(c.chat_completions_url(), "http://localhost:3113/v1/chat/completions");
+        assert_eq!(
+            c.chat_completions_url(),
+            "http://localhost:3113/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -183,8 +193,15 @@ mod tests {
 
     #[test]
     fn none_auth_no_query() {
-        let c = cfg("http://localhost:11434/v1", AuthStyle::None, Some("ignored"));
-        assert_eq!(c.chat_completions_url(), "http://localhost:11434/v1/chat/completions");
+        let c = cfg(
+            "http://localhost:11434/v1",
+            AuthStyle::None,
+            Some("ignored"),
+        );
+        assert_eq!(
+            c.chat_completions_url(),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 
     #[test]
