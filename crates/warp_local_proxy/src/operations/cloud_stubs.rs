@@ -219,3 +219,14 @@ pub fn get_available_harnesses() -> Value {
         }
     })
 }
+
+/// `UpdateAgentTask` — echoes success so the client's TaskStatusSyncModel
+/// doesn't log errors on every agent turn.
+pub fn update_agent_task() -> Value {
+    json!({
+        "updateAgentTask": {
+            "__typename": "UpdateAgentTaskOutput",
+            "responseContext": { "serverVersion": "warp_local_proxy/0.1.0" }
+        }
+    })
+}

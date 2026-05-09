@@ -55,7 +55,9 @@ pub async fn handle(
         "GetUserSettings" => Some(canned::get_user_settings()),
         "GetWorkspacesMetadataForUser" => Some(canned::get_workspaces_metadata_for_user(&state)),
         "GetFeatureModelChoices" => Some(canned::get_feature_model_choices(&state)),
-        "FreeAvailableModels" | "free_available_models" => Some(canned::free_available_models(&state)),
+        "FreeAvailableModels" | "free_available_models" => {
+            Some(canned::free_available_models(&state))
+        }
         "GetRequestLimitInfo" | "get_request_limit_info" => Some(canned::get_request_limit_info()),
         "GetExperiments" => Some(canned::get_experiments()),
         "GetReferralInfo" | "get_referral_info" => Some(canned::get_referral_info()),
@@ -76,9 +78,9 @@ pub async fn handle(
         "ListAmbientAgentTasks" | "list_ambient_agent_tasks" => {
             Some(cloud_stubs::list_ambient_agent_tasks())
         }
-        "ListAiConversations"
-        | "list_ai_conversation_metadata"
-        | "ListAIConversationMetadata" => Some(cloud_stubs::list_ai_conversation_metadata()),
+        "ListAiConversations" | "list_ai_conversation_metadata" | "ListAIConversationMetadata" => {
+            Some(cloud_stubs::list_ai_conversation_metadata())
+        }
         "UpdateEventSequence" | "update_event_sequence_on_server" => {
             Some(cloud_stubs::update_event_sequence_on_server())
         }
@@ -99,6 +101,9 @@ pub async fn handle(
         }
         "GetAvailableHarnesses" | "get_available_harnesses" => {
             Some(cloud_stubs::get_available_harnesses())
+        }
+        "UpdateAgentTask" | "update_agent_task" => {
+            Some(cloud_stubs::update_agent_task())
         }
 
         // Anything we haven't taught the proxy yet → structured error.
