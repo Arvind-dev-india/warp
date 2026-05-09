@@ -146,11 +146,19 @@ stop_proxy_pid() {
 }
 
 build_proxy() {
-    if [[ -x "$REPO_ROOT/target/debug/warp-local-proxy" ]]; then
-        return
+    if [[ "$PROFILE" == "release" ]]; then
+        if [[ -x "$REPO_ROOT/target/release/warp-local-proxy" ]]; then
+            return
+        fi
+        echo "warp-local: building warp_local_proxy (release)..."
+        (cd "$REPO_ROOT" && cargo build --quiet --release -p warp_local_proxy)
+    else
+        if [[ -x "$REPO_ROOT/target/debug/warp-local-proxy" ]]; then
+            return
+        fi
+        echo "warp-local: building warp_local_proxy..."
+        (cd "$REPO_ROOT" && cargo build --quiet -p warp_local_proxy)
     fi
-    echo "warp-local: building warp_local_proxy..."
-    (cd "$REPO_ROOT" && cargo build --quiet -p warp_local_proxy)
 }
 
 ensure_warp_built() {
@@ -175,7 +183,7 @@ start_proxy() {
     fi
     build_proxy
 
-    local proxy_bin="$REPO_ROOT/target/debug/warp-local-proxy"
+    local proxy_bin="$REPO_ROOT/target/$PROFILE/warp-local-proxy"
     local proxy_args=(
         --bind "$PROXY_BIND"
         --backend-base-url "$BACKEND"
