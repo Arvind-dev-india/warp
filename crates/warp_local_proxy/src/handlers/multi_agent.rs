@@ -943,8 +943,26 @@ fn build_openai_messages(
                     Be concise but thorough."
     })];
 
-    // Replay conversation history from task_context
+    // Replay conversation history from task_context.
+    // First, collect all tool_call_ids that have matching results so we
+    // can skip orphaned ToolCall messages (OpenAI requires every
+    // assistant tool_call to be followed by a matching tool result).
     if let Some(ref tc) = request.task_context {
+        let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for task in &tc.tasks {
+            for msg in &task.messages {
+                if let Some(warp_multi_agent_api::message::Message::ToolCallResult(tcr)) =
+                    msg.message.as_ref()
+                {
+                    result_ids.insert(tcr.tool_call_id.clone());
+                }
+            }
+        }
+        // Also count tool results from the current request input
+        for (id, _) in tool_results {
+            result_ids.insert(id.clone());
+        }
+
         for task in &tc.tasks {
             for msg in &task.messages {
                 if let Some(ref m) = msg.message {
@@ -958,16 +976,19 @@ fn build_openai_messages(
                             messages.push(json!({ "role": "assistant", "content": a.text }));
                         }
                         warp_multi_agent_api::message::Message::ToolCall(tc) => {
-                            let (fn_name, fn_args) = tool_call_to_openai(tc);
-                            messages.push(json!({
-                                "role": "assistant",
-                                "content": null,
-                                "tool_calls": [{
-                                    "id": tc.tool_call_id,
-                                    "type": "function",
-                                    "function": { "name": fn_name, "arguments": fn_args }
-                                }]
-                            }));
+                            // Only include tool calls that have a matching result
+                            if result_ids.contains(&tc.tool_call_id) {
+                                let (fn_name, fn_args) = tool_call_to_openai(tc);
+                                messages.push(json!({
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": tc.tool_call_id,
+                                        "type": "function",
+                                        "function": { "name": fn_name, "arguments": fn_args }
+                                    }]
+                                }));
+                            }
                         }
                         warp_multi_agent_api::message::Message::ToolCallResult(tcr) => {
                             let text = message_tool_call_result_to_text(tcr);
