@@ -1871,19 +1871,28 @@ pub async fn handle(
 
     let user_query = extract_user_query(&request);
     let tool_results = extract_tool_results(&request);
-    let is_continuation = !tool_results.is_empty();
+
+    // Detect if this is a continuation by checking for existing tasks or tool results
+    let existing_task_id = request
+        .task_context
+        .as_ref()
+        .and_then(|tc| tc.tasks.first())
+        .map(|t| t.id.clone());
+    let is_continuation = existing_task_id.is_some();
 
     tracing::info!(
         query = user_query.as_deref().unwrap_or("(none)"),
         tool_results = tool_results.len(),
         is_continuation,
+        existing_task = existing_task_id.as_deref().unwrap_or("(none)"),
         "multi-agent request"
     );
 
+    // Reuse existing IDs when continuing a conversation, generate new ones otherwise
     let conversation_id = uuid::Uuid::new_v4().to_string();
     let request_id = uuid::Uuid::new_v4().to_string();
     let run_id = uuid::Uuid::new_v4().to_string();
-    let task_id = uuid::Uuid::new_v4().to_string();
+    let task_id = existing_task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let openai_messages = build_openai_messages(&request, user_query.as_deref(), &tool_results);
     let llm_response = call_backend_with_tools(&state, &openai_messages).await;
