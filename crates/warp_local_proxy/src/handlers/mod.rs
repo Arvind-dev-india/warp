@@ -16,6 +16,7 @@
 pub mod ai_rest;
 pub mod browser_auth;
 pub mod graphql;
+pub mod multi_agent;
 pub mod oauth;
 
 use axum::{http::StatusCode, response::IntoResponse, Json};

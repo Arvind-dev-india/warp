@@ -103,6 +103,9 @@ pub fn router(state: AppState) -> Router {
         // Cloud-only REST: agent runs, attachments, conversation snapshots.
         // Return 503 with structured error so the client knows it's unsupported.
         .route("/api/v1/agent/{*rest}", any(handlers::unsupported))
+        // Multi-agent protobuf+SSE — the modern Agent Mode (Cmd+Enter).
+        .route("/ai/multi-agent", post(handlers::multi_agent::handle))
+        .route("/ai/passive-suggestions", post(handlers::multi_agent::handle))
         .layer(TraceLayer::new_for_http())
         .with_state(shared)
 }
