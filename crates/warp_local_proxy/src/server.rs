@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::ws::{WebSocket, WebSocketUpgrade},
+    response::IntoResponse,
     routing::{any, get, post},
     Router,
 };
@@ -94,6 +96,16 @@ impl AppState {
     }
 }
 
+/// Accept WebSocket upgrades on `/graphql/v2` and idle silently.
+/// The Warp client opens a WS for real-time cloud object sync; we accept
+/// the connection so it stops retrying with 405 errors every 30s.
+async fn ws_idle(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(|mut socket: WebSocket| async move {
+        // Just wait until the client closes the connection
+        while socket.recv().await.is_some() {}
+    })
+}
+
 /// Builds the route table. Exposed as a free function so tests can drive it
 /// without binding a real socket.
 pub fn router(state: AppState) -> Router {
@@ -101,7 +113,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(handlers::healthz))
-        .route("/graphql/v2", post(handlers::graphql::handle))
+        .route("/graphql/v2", post(handlers::graphql::handle).get(ws_idle))
         .route(
             "/ai/generate_code_review_content",
             post(handlers::ai_rest::handle),
