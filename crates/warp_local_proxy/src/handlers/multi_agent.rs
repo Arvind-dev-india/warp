@@ -1953,22 +1953,50 @@ pub async fn handle(
     let run_id = uuid::Uuid::new_v4().to_string();
     let task_id = existing_task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let openai_messages = build_openai_messages(&request, user_query.as_deref(), &tool_results);
+    // ── Server-side conversation cache ──
+    // The Warp client does NOT persist ToolCallResults or follow-up user
+    // queries back into task_context messages. Without caching, the LLM
+    // loses memory of what it already did and loops endlessly.
+    //
+    // We maintain a per-task Vec<serde_json::Value> of OpenAI messages
+    // and only APPEND new inputs each turn.
+    let mut openai_messages = state.load_conversation(&task_id);
 
-    // Count how many tool call rounds have happened in this conversation.
-    // After MAX_TOOL_ROUNDS, omit tools to force the LLM to give a text answer.
+    // If this is a brand new conversation, add the system prompt
+    if openai_messages.is_empty() {
+        openai_messages.push(json!({
+            "role": "system",
+            "content": "You are a helpful AI assistant integrated into the Warp terminal. You have \
+                        access to tools that let you run shell commands, read files, edit files, \
+                        search code, and more. Use tools when needed to help the user. \
+                        When providing code changes, use the apply_file_diffs tool. \
+                        When you need to understand existing code, use read_files or grep. \
+                        Be concise but thorough."
+        }));
+    }
+
+    // Add new user query (if present)
+    if let Some(ref q) = user_query {
+        if !q.is_empty() {
+            openai_messages.push(json!({ "role": "user", "content": q }));
+        }
+    }
+
+    // Add tool results from current request input
+    for (tool_call_id, result_text) in &tool_results {
+        openai_messages.push(json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": result_text
+        }));
+    }
+
+    // Count tool call rounds for the max-rounds limit
     const MAX_TOOL_ROUNDS: u32 = 15;
-    let prior_tool_rounds = request
-        .task_context
-        .as_ref()
-        .map(|tc| {
-            tc.tasks
-                .iter()
-                .flat_map(|t| t.messages.iter())
-                .filter(|m| matches!(m.message, Some(warp_multi_agent_api::message::Message::ToolCall(_))))
-                .count() as u32
-        })
-        .unwrap_or(0);
+    let prior_tool_rounds = openai_messages
+        .iter()
+        .filter(|m| m.get("tool_calls").is_some())
+        .count() as u32;
 
     let send_tools = prior_tool_rounds < MAX_TOOL_ROUNDS;
     if !send_tools {
@@ -2049,11 +2077,28 @@ pub async fn handle(
 
     // Handle LLM response
     match llm_response {
-        Ok(LlmResponse::Text(text)) => {
-            emit_agent_output(&mut sse_body, &task_id, &request_id, &text);
+        Ok(LlmResponse::Text(ref text)) => {
+            // Save assistant text to cache
+            openai_messages.push(json!({ "role": "assistant", "content": text }));
+            emit_agent_output(&mut sse_body, &task_id, &request_id, text);
         }
-        Ok(LlmResponse::ToolCalls(tool_calls)) => {
-            for tc in &tool_calls {
+        Ok(LlmResponse::ToolCalls(ref tool_calls)) => {
+            // Save the assistant tool_calls message to cache (one message per call
+            // to match OpenAI's expectation)
+            for tc in tool_calls {
+                let fn_name = tc["function"]["name"].as_str().unwrap_or("unknown");
+                let fn_args = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                let tc_id = tc["id"].as_str().unwrap_or("");
+                openai_messages.push(json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": tc_id,
+                        "type": "function",
+                        "function": { "name": fn_name, "arguments": fn_args }
+                    }]
+                }));
+
                 if let Some(proto_tc) = openai_tool_call_to_proto(tc) {
                     let tc_msg_id = uuid::Uuid::new_v4().to_string();
                     sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
@@ -2085,9 +2130,13 @@ pub async fn handle(
         }
         Err(e) => {
             tracing::error!("Backend call failed: {e}");
+            openai_messages.push(json!({ "role": "assistant", "content": format!("Error: {e}") }));
             emit_agent_output(&mut sse_body, &task_id, &request_id, &format!("Error: {e}"));
         }
     }
+
+    // Persist conversation to disk
+    state.save_conversation(&task_id, &openai_messages);
 
     // StreamFinished
     sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {

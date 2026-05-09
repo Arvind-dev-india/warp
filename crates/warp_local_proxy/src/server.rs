@@ -23,6 +23,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub http: reqwest::Client,
     pub models: Arc<Vec<String>>,
+    /// Directory for persisted conversation cache (one JSON file per task_id).
+    pub conversation_cache_dir: std::path::PathBuf,
 }
 
 impl AppState {
@@ -35,6 +37,18 @@ impl AppState {
             config: Arc::new(config),
             http,
             models: Arc::new(models),
+            conversation_cache_dir: {
+                let base = std::env::var("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+                let dir = base
+                    .join(".local")
+                    .join("state")
+                    .join("warp-local-proxy")
+                    .join("conversations");
+                std::fs::create_dir_all(&dir).ok();
+                dir
+            },
         }
     }
 
@@ -55,12 +69,27 @@ impl AppState {
     /// list (or when no list is available), otherwise falls back to the
     /// first model the backend advertised.
     pub fn default_model_id(&self) -> String {
-        if self.models.is_empty()
-            || self.models.iter().any(|m| m == &self.config.default_model)
-        {
+        if self.models.is_empty() || self.models.iter().any(|m| m == &self.config.default_model) {
             self.config.default_model.clone()
         } else {
             self.models[0].clone()
+        }
+    }
+
+    /// Load persisted conversation history for a task.
+    pub fn load_conversation(&self, task_id: &str) -> Vec<serde_json::Value> {
+        let path = self.conversation_cache_dir.join(format!("{task_id}.json"));
+        match std::fs::read_to_string(&path) {
+            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Save conversation history for a task to disk.
+    pub fn save_conversation(&self, task_id: &str, messages: &[serde_json::Value]) {
+        let path = self.conversation_cache_dir.join(format!("{task_id}.json"));
+        if let Ok(data) = serde_json::to_string(messages) {
+            std::fs::write(&path, data).ok();
         }
     }
 }
@@ -73,20 +102,29 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::healthz))
         .route("/graphql/v2", post(handlers::graphql::handle))
-        .route("/ai/generate_code_review_content", post(handlers::ai_rest::handle))
+        .route(
+            "/ai/generate_code_review_content",
+            post(handlers::ai_rest::handle),
+        )
         // OAuth2 device-flow stubs so headless CLI login completes locally.
         // Note: the upstream `oauth2` crate sends the token request to a
         // separate token URL (`/api/v1/oauth/token`) per `set_token_uri()` in
         // `app/src/server/server_api.rs::create_oauth_client`; the device
         // authorization URL is at `/api/v1/oauth/device/auth`.
-        .route("/api/v1/oauth/device/auth", post(handlers::oauth::device_auth))
+        .route(
+            "/api/v1/oauth/device/auth",
+            post(handlers::oauth::device_auth),
+        )
         .route("/api/v1/oauth/token", post(handlers::oauth::device_token))
         // Firebase-fallback proxy endpoints. The Warp client first calls
         // identitytoolkit / securetoken Firebase endpoints; when those fail
         // (our firebase_auth_api_key is bogus) it retries against these
         // proxy URLs. Response shape comes from
         // `crates/firebase/src/lib.rs::FetchAccessTokenResponse`.
-        .route("/proxy/customToken", post(handlers::oauth::proxy_custom_token))
+        .route(
+            "/proxy/customToken",
+            post(handlers::oauth::proxy_custom_token),
+        )
         .route("/proxy/token", post(handlers::oauth::proxy_refresh_token))
         // Browser-targeted login / signup pages. The GUI opens these in the
         // user's browser; we serve a static landing page (NOT auto-redirect)
@@ -105,7 +143,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/agent/{*rest}", any(handlers::unsupported))
         // Multi-agent protobuf+SSE — the modern Agent Mode (Cmd+Enter).
         .route("/ai/multi-agent", post(handlers::multi_agent::handle))
-        .route("/ai/passive-suggestions", post(handlers::multi_agent::handle))
+        .route(
+            "/ai/passive-suggestions",
+            post(handlers::multi_agent::handle),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(shared)
 }
