@@ -52,6 +52,16 @@ struct ModelsListResponse {
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
     pub id: String,
+    #[serde(default)]
+    pub capabilities: ModelCapabilities,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ModelCapabilities {
+    #[serde(default)]
+    pub chat_completion: bool,
+    #[serde(default)]
+    pub inference: bool,
 }
 
 /// Fetches the list of model ids the configured backend exposes via
@@ -81,7 +91,20 @@ pub async fn fetch_models(http: &reqwest::Client, config: &Config) -> Vec<String
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<ModelsListResponse>().await {
-            Ok(body) => body.data.into_iter().map(|m| m.id).collect(),
+            Ok(body) => {
+                let models: Vec<String> = if matches!(config.backend_auth_style, AuthStyle::AzureApiKey) {
+                    // Azure returns the full catalog (300+ models). Filter to
+                    // chat-capable ones only so the model picker stays usable.
+                    body.data
+                        .into_iter()
+                        .filter(|m| m.capabilities.chat_completion)
+                        .map(|m| m.id)
+                        .collect()
+                } else {
+                    body.data.into_iter().map(|m| m.id).collect()
+                };
+                models
+            }
             Err(err) => {
                 tracing::warn!(?err, "backend /models response did not parse");
                 Vec::new()
