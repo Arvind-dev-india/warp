@@ -73,7 +73,15 @@ struct ModelCapabilities {
 /// caller falls back to the single `LOCAL_FALLBACK_MODEL_ID` entry so the
 /// client still gets a non-empty list.
 pub async fn fetch_models(http: &reqwest::Client, config: &Config) -> Vec<String> {
-    let url = config.models_url();
+    let url = match config.models_url() {
+        Some(url) => url,
+        None => {
+            // Azure OpenAI — no usable models endpoint with api-key auth.
+            // Return the configured default model as the only entry.
+            tracing::info!("Azure OpenAI: using configured default model only");
+            return vec![config.default_model.clone()];
+        }
+    };
     let mut req = http.get(&url);
     match config.backend_auth_style {
         AuthStyle::Bearer => {

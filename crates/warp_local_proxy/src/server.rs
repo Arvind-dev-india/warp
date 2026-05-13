@@ -173,7 +173,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .build()
         .expect("reqwest client should build");
 
-    tracing::info!(url = %config.models_url(), "fetching backend model list");
+    let models_url_display = config.models_url().unwrap_or_else(|| "(azure: default model only)".into());
+    tracing::info!(url = %models_url_display, "fetching backend model list");
     let models = openai::fetch_models(&probe_http, &config).await;
     if models.is_empty() {
         tracing::warn!(
