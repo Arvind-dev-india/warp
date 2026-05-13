@@ -26,6 +26,7 @@ reqwest = { workspace = true, default-features = false, features = ["json", "rus
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio-stream = "0.1"
 tower.workspace = true
 tower-http = { workspace = true, features = ["trace"] }
 tracing.workspace = true

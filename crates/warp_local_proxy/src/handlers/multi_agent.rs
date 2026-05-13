@@ -14,10 +14,10 @@
 //! 5. Client sends NEW Request with ToolCallResults → goto 2
 //! 6. If LLM returns text → proxy emits AgentOutput → Finished
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::State,
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -25,6 +25,8 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use prost::Message;
 use serde_json::json;
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::server::AppState;
 
@@ -1925,7 +1927,7 @@ fn openai_tool_call_to_proto(
 
 pub async fn handle(
     State(state): State<Arc<AppState>>,
-    body: axum::body::Bytes,
+    body: Bytes,
 ) -> impl IntoResponse {
     let request = match warp_multi_agent_api::Request::decode(body.as_ref()) {
         Ok(r) => r,
@@ -2013,7 +2015,6 @@ pub async fn handle(
             state.save_conversation(&task_id, &openai_messages);
 
             // Emit a Summarization message so the UI shows it
-            let msg_id = uuid::Uuid::new_v4().to_string();
             let mut sse_body = String::new();
             sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
                 r#type: Some(warp_multi_agent_api::response_event::Type::Init(
@@ -2200,8 +2201,7 @@ pub async fn handle(
         );
     }
 
-    let llm_result = call_backend_with_tools(&state, &llm_messages, send_tools).await;
-    let context_usage = llm_result.as_ref().map(|r| r.context_usage).unwrap_or(0.0);
+    let llm_result = call_backend_streaming(&state, &llm_messages, send_tools).await;
 
     let mut sse_body = String::new();
 
@@ -2269,26 +2269,92 @@ pub async fn handle(
         }
     }
 
-    // Handle LLM response
-    match llm_result {
-        Ok(LlmResult { response: LlmResponse::Text(ref text), .. }) => {
-            // Save assistant text to cache
-            openai_messages.push(json!({ "role": "assistant", "content": text }));
-            emit_agent_output(&mut sse_body, &task_id, &request_id, text);
+    let context_usage = match llm_result {
+        Ok(StreamingLlmResult::TextStream(text_rx)) => {
+            let (output_tx, output_rx) = mpsc::channel(32);
+            let _ = output_tx.send(Ok(Bytes::from(sse_body))).await;
+
+            let agent_msg_id = uuid::Uuid::new_v4().to_string();
+            let _ = send_sse_event(
+                &output_tx,
+                agent_output_placeholder_event(&task_id, &request_id, &agent_msg_id),
+            )
+            .await;
+
+            let state = state.clone();
+            let task_id = task_id.clone();
+            let request_id = request_id.clone();
+            tokio::spawn(async move {
+                let mut text_rx = text_rx;
+                let mut openai_messages = openai_messages;
+                let mut accumulated = String::new();
+                let mut client_closed = false;
+
+                while let Some(chunk) = text_rx.recv().await {
+                    accumulated.push_str(&chunk);
+                    if !client_closed
+                        && send_sse_event(
+                            &output_tx,
+                            agent_output_append_event(&task_id, &request_id, &agent_msg_id, &chunk),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        client_closed = true;
+                    }
+                }
+
+                if accumulated.is_empty() {
+                    accumulated.push_str("(no response)");
+                    if !client_closed
+                        && send_sse_event(
+                            &output_tx,
+                            agent_output_append_event(
+                                &task_id,
+                                &request_id,
+                                &agent_msg_id,
+                                "(no response)",
+                            ),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        client_closed = true;
+                    }
+                }
+
+                openai_messages.push(json!({ "role": "assistant", "content": accumulated }));
+                state.save_conversation(&task_id, &openai_messages);
+
+                if !client_closed {
+                    let context_usage = estimate_context_usage_from_messages(&openai_messages);
+                    let _ = send_sse_event(&output_tx, finished_event(context_usage)).await;
+                }
+            });
+
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from_stream(ReceiverStream::new(output_rx)))
+                .unwrap();
         }
-        Ok(LlmResult { response: LlmResponse::ToolCalls(ref tool_calls), .. }) => {
+        Ok(StreamingLlmResult::ToolCalls(tool_calls, context_usage)) => {
             // Save ALL tool_calls in a SINGLE assistant message.
             // OpenAI requires all tool_calls from one response to be in one message.
-            let tc_entries: Vec<serde_json::Value> = tool_calls.iter().map(|tc| {
-                json!({
-                    "id": tc["id"].as_str().unwrap_or(""),
-                    "type": "function",
-                    "function": {
-                        "name": tc["function"]["name"].as_str().unwrap_or("unknown"),
-                        "arguments": tc["function"]["arguments"].as_str().unwrap_or("{}")
-                    }
+            let tc_entries: Vec<serde_json::Value> = tool_calls
+                .iter()
+                .map(|tc| {
+                    json!({
+                        "id": tc["id"].as_str().unwrap_or(""),
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"].as_str().unwrap_or("unknown"),
+                            "arguments": tc["function"]["arguments"].as_str().unwrap_or("{}")
+                        }
+                    })
                 })
-            }).collect();
+                .collect();
             openai_messages.push(json!({
                 "role": "assistant",
                 "content": null,
@@ -2296,7 +2362,8 @@ pub async fn handle(
             }));
 
             // Emit each tool call as a separate protobuf event for the client
-            for tc in tool_calls {                if let Some(proto_tc) = openai_tool_call_to_proto(tc) {
+            for tc in &tool_calls {
+                if let Some(proto_tc) = openai_tool_call_to_proto(tc) {
                     let tc_msg_id = uuid::Uuid::new_v4().to_string();
                     sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
                         r#type: Some(warp_multi_agent_api::response_event::Type::ClientActions(
@@ -2324,19 +2391,107 @@ pub async fn handle(
                     }));
                 }
             }
+            context_usage
         }
         Err(e) => {
             tracing::error!("Backend call failed: {e}");
             openai_messages.push(json!({ "role": "assistant", "content": format!("Error: {e}") }));
             emit_agent_output(&mut sse_body, &task_id, &request_id, &format!("Error: {e}"));
+            estimate_context_usage_from_messages(&openai_messages)
         }
-    }
+    };
 
     // Persist conversation to disk
     state.save_conversation(&task_id, &openai_messages);
 
-    // StreamFinished
-    sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
+    sse_body.push_str(&sse_line(&finished_event(context_usage)));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(sse_body))
+        .unwrap()
+}
+
+// ── Emit agent text output ───────────────────────────────────────────
+
+fn agent_output_placeholder_event(
+    task_id: &str,
+    request_id: &str,
+    msg_id: &str,
+) -> warp_multi_agent_api::ResponseEvent {
+    warp_multi_agent_api::ResponseEvent {
+        r#type: Some(warp_multi_agent_api::response_event::Type::ClientActions(
+            warp_multi_agent_api::response_event::ClientActions {
+                actions: vec![warp_multi_agent_api::ClientAction {
+                    action: Some(
+                        warp_multi_agent_api::client_action::Action::AddMessagesToTask(
+                            warp_multi_agent_api::client_action::AddMessagesToTask {
+                                task_id: task_id.to_string(),
+                                messages: vec![warp_multi_agent_api::Message {
+                                    id: msg_id.to_string(),
+                                    task_id: task_id.to_string(),
+                                    request_id: request_id.to_string(),
+                                    message: Some(
+                                        warp_multi_agent_api::message::Message::AgentOutput(
+                                            warp_multi_agent_api::message::AgentOutput {
+                                                text: String::new(),
+                                            },
+                                        ),
+                                    ),
+                                    ..Default::default()
+                                }],
+                            },
+                        ),
+                    ),
+                }],
+            },
+        )),
+    }
+}
+
+fn agent_output_append_event(
+    task_id: &str,
+    request_id: &str,
+    msg_id: &str,
+    text: &str,
+) -> warp_multi_agent_api::ResponseEvent {
+    warp_multi_agent_api::ResponseEvent {
+        r#type: Some(warp_multi_agent_api::response_event::Type::ClientActions(
+            warp_multi_agent_api::response_event::ClientActions {
+                actions: vec![warp_multi_agent_api::ClientAction {
+                    action: Some(
+                        warp_multi_agent_api::client_action::Action::AppendToMessageContent(
+                            warp_multi_agent_api::client_action::AppendToMessageContent {
+                                task_id: task_id.to_string(),
+                                message: Some(warp_multi_agent_api::Message {
+                                    id: msg_id.to_string(),
+                                    task_id: task_id.to_string(),
+                                    request_id: request_id.to_string(),
+                                    message: Some(
+                                        warp_multi_agent_api::message::Message::AgentOutput(
+                                            warp_multi_agent_api::message::AgentOutput {
+                                                text: text.to_string(),
+                                            },
+                                        ),
+                                    ),
+                                    ..Default::default()
+                                }),
+                                mask: Some(prost_types::FieldMask {
+                                    paths: vec!["agent_output.text".into()],
+                                }),
+                            },
+                        ),
+                    ),
+                }],
+            },
+        )),
+    }
+}
+
+fn finished_event(context_usage: f32) -> warp_multi_agent_api::ResponseEvent {
+    warp_multi_agent_api::ResponseEvent {
         r#type: Some(warp_multi_agent_api::response_event::Type::Finished(
             warp_multi_agent_api::response_event::StreamFinished {
                 reason: Some(
@@ -2353,83 +2508,18 @@ pub async fn handle(
                 ..Default::default()
             },
         )),
-    }));
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from(sse_body))
-        .unwrap()
+    }
 }
-
-// ── Emit agent text output ───────────────────────────────────────────
 
 fn emit_agent_output(sse_body: &mut String, task_id: &str, request_id: &str, text: &str) {
     let msg_id = uuid::Uuid::new_v4().to_string();
-
-    // Add empty message placeholder
-    sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
-        r#type: Some(warp_multi_agent_api::response_event::Type::ClientActions(
-            warp_multi_agent_api::response_event::ClientActions {
-                actions: vec![warp_multi_agent_api::ClientAction {
-                    action: Some(
-                        warp_multi_agent_api::client_action::Action::AddMessagesToTask(
-                            warp_multi_agent_api::client_action::AddMessagesToTask {
-                                task_id: task_id.into(),
-                                messages: vec![warp_multi_agent_api::Message {
-                                    id: msg_id.clone(),
-                                    task_id: task_id.into(),
-                                    request_id: request_id.into(),
-                                    message: Some(
-                                        warp_multi_agent_api::message::Message::AgentOutput(
-                                            warp_multi_agent_api::message::AgentOutput {
-                                                text: String::new(),
-                                            },
-                                        ),
-                                    ),
-                                    ..Default::default()
-                                }],
-                            },
-                        ),
-                    ),
-                }],
-            },
-        )),
-    }));
-
-    // Append text content
-    sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
-        r#type: Some(warp_multi_agent_api::response_event::Type::ClientActions(
-            warp_multi_agent_api::response_event::ClientActions {
-                actions: vec![warp_multi_agent_api::ClientAction {
-                    action: Some(
-                        warp_multi_agent_api::client_action::Action::AppendToMessageContent(
-                            warp_multi_agent_api::client_action::AppendToMessageContent {
-                                task_id: task_id.into(),
-                                message: Some(warp_multi_agent_api::Message {
-                                    id: msg_id,
-                                    task_id: task_id.into(),
-                                    request_id: request_id.into(),
-                                    message: Some(
-                                        warp_multi_agent_api::message::Message::AgentOutput(
-                                            warp_multi_agent_api::message::AgentOutput {
-                                                text: text.into(),
-                                            },
-                                        ),
-                                    ),
-                                    ..Default::default()
-                                }),
-                                mask: Some(prost_types::FieldMask {
-                                    paths: vec!["agent_output.text".into()],
-                                }),
-                            },
-                        ),
-                    ),
-                }],
-            },
-        )),
-    }));
+    sse_body.push_str(&sse_line(&agent_output_placeholder_event(task_id, request_id, &msg_id)));
+    sse_body.push_str(&sse_line(&agent_output_append_event(
+        task_id,
+        request_id,
+        &msg_id,
+        text,
+    )));
 }
 
 // ── LLM backend ──────────────────────────────────────────────────────
@@ -2443,6 +2533,254 @@ struct LlmResult {
     response: LlmResponse,
     /// Fraction of context window used (0.0–1.0), from usage data.
     context_usage: f32,
+}
+
+enum StreamingLlmResult {
+    TextStream(mpsc::Receiver<String>),
+    ToolCalls(Vec<serde_json::Value>, f32),
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    tool_type: String,
+    function_name: String,
+    function_arguments: String,
+}
+
+#[derive(Default)]
+struct StreamToolCallAccumulator {
+    tool_calls: BTreeMap<usize, PartialToolCall>,
+}
+
+impl StreamToolCallAccumulator {
+    fn push_chunk(&mut self, chunks: &[serde_json::Value]) {
+        for chunk in chunks {
+            let index = chunk["index"].as_u64().unwrap_or(0) as usize;
+            let entry = self.tool_calls.entry(index).or_default();
+
+            if let Some(id) = chunk["id"].as_str() {
+                entry.id = id.to_string();
+            }
+            if let Some(tool_type) = chunk["type"].as_str() {
+                entry.tool_type = tool_type.to_string();
+            }
+            if let Some(name) = chunk["function"]["name"].as_str() {
+                entry.function_name = name.to_string();
+            }
+            if let Some(arguments) = chunk["function"]["arguments"].as_str() {
+                entry.function_arguments.push_str(arguments);
+            }
+        }
+    }
+
+    fn into_tool_calls(self) -> Vec<serde_json::Value> {
+        self.tool_calls
+            .into_values()
+            .map(|tool_call| {
+                json!({
+                    "id": tool_call.id,
+                    "type": if tool_call.tool_type.is_empty() { "function" } else { &tool_call.tool_type },
+                    "function": {
+                        "name": tool_call.function_name,
+                        "arguments": tool_call.function_arguments,
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+enum BackendStreamDecision {
+    Text,
+    ToolCalls(Vec<serde_json::Value>),
+}
+
+fn estimate_context_usage_from_messages(messages: &[serde_json::Value]) -> f32 {
+    let estimated_tokens: usize = messages.iter().map(|message| message.to_string().len() / 4).sum();
+    (estimated_tokens as f32 / 128_000.0).min(1.0)
+}
+
+fn drain_sse_line(buffer: &mut Vec<u8>) -> Option<String> {
+    let newline_pos = buffer.iter().position(|byte| *byte == b'\n')?;
+    let mut line = buffer.drain(..=newline_pos).collect::<Vec<_>>();
+    if matches!(line.last(), Some(b'\n')) {
+        line.pop();
+    }
+    if matches!(line.last(), Some(b'\r')) {
+        line.pop();
+    }
+    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
+async fn send_sse_event(
+    tx: &mpsc::Sender<Result<Bytes, Infallible>>,
+    event: warp_multi_agent_api::ResponseEvent,
+) -> Result<(), ()> {
+    tx.send(Ok(Bytes::from(sse_line(&event))))
+        .await
+        .map_err(|_| ())
+}
+
+async fn handle_backend_stream_line(
+    line: &str,
+    text_tx: &mpsc::Sender<String>,
+    decision_tx: &mut Option<oneshot::Sender<Result<BackendStreamDecision, anyhow::Error>>>,
+    tool_calls: &mut StreamToolCallAccumulator,
+    saw_tool_calls: &mut bool,
+) -> Result<bool, anyhow::Error> {
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(true);
+    };
+    let data = data.trim();
+
+    if data.is_empty() {
+        return Ok(true);
+    }
+    if data == "[DONE]" {
+        return Ok(false);
+    }
+
+    let chunk: serde_json::Value = serde_json::from_str(data)?;
+    let Some(choice) = chunk["choices"].as_array().and_then(|choices| choices.first()) else {
+        return Ok(true);
+    };
+    let delta = &choice["delta"];
+
+    if let Some(tool_call_chunks) = delta["tool_calls"].as_array() {
+        *saw_tool_calls = true;
+        tool_calls.push_chunk(tool_call_chunks);
+        return Ok(true);
+    }
+
+    if let Some(content) = delta["content"].as_str() {
+        if content.is_empty() {
+            return Ok(true);
+        }
+        if *saw_tool_calls {
+            tracing::warn!("received content after tool_calls while streaming backend response");
+            return Ok(true);
+        }
+        if let Some(tx) = decision_tx.take() {
+            let _ = tx.send(Ok(BackendStreamDecision::Text));
+        }
+        if text_tx.send(content.to_string()).await.is_err() {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+async fn call_backend_streaming(
+    state: &AppState,
+    messages: &[serde_json::Value],
+    send_tools: bool,
+) -> Result<StreamingLlmResult, anyhow::Error> {
+    let url = state.config.chat_completions_url();
+    let model = &state.config.default_model;
+
+    let mut payload = json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": 4096,
+        "stream": true
+    });
+
+    if send_tools {
+        payload["tools"] = openai_tools();
+    }
+
+    let resp = state
+        .http
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Backend returned {status}: {body}");
+    }
+
+    let estimated_context_usage = estimate_context_usage_from_messages(messages);
+    let (text_tx, text_rx) = mpsc::channel(32);
+    let (decision_tx, decision_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let mut resp = resp;
+        let mut decision_tx = Some(decision_tx);
+        let mut buffer = Vec::new();
+        let mut tool_calls = StreamToolCallAccumulator::default();
+        let mut saw_tool_calls = false;
+
+        let read_result: Result<(), anyhow::Error> = async {
+            while let Some(chunk) = resp.chunk().await? {
+                buffer.extend_from_slice(&chunk);
+                while let Some(line) = drain_sse_line(&mut buffer) {
+                    if !handle_backend_stream_line(
+                        &line,
+                        &text_tx,
+                        &mut decision_tx,
+                        &mut tool_calls,
+                        &mut saw_tool_calls,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+
+            if !buffer.is_empty()
+                && !handle_backend_stream_line(
+                    &String::from_utf8_lossy(&buffer),
+                    &text_tx,
+                    &mut decision_tx,
+                    &mut tool_calls,
+                    &mut saw_tool_calls,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match read_result {
+            Ok(()) => {
+                if saw_tool_calls {
+                    if let Some(tx) = decision_tx.take() {
+                        let _ = tx.send(Ok(BackendStreamDecision::ToolCalls(
+                            tool_calls.into_tool_calls(),
+                        )));
+                    }
+                } else if let Some(tx) = decision_tx.take() {
+                    let _ = tx.send(Ok(BackendStreamDecision::Text));
+                }
+            }
+            Err(err) => {
+                if let Some(tx) = decision_tx.take() {
+                    let _ = tx.send(Err(err));
+                } else {
+                    tracing::error!(error = %err, "backend stream failed after text streaming started");
+                }
+            }
+        }
+    });
+
+    match decision_rx.await {
+        Ok(Ok(BackendStreamDecision::Text)) => Ok(StreamingLlmResult::TextStream(text_rx)),
+        Ok(Ok(BackendStreamDecision::ToolCalls(tool_calls))) => {
+            Ok(StreamingLlmResult::ToolCalls(tool_calls, estimated_context_usage))
+        }
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(anyhow::anyhow!("backend stream ended before mode was determined")),
+    }
 }
 
 async fn call_backend_with_tools(
@@ -2485,7 +2823,7 @@ async fn call_backend_with_tools(
     // Estimate context window usage from token counts
     let prompt_tokens = response_json["usage"]["prompt_tokens"].as_f64().unwrap_or(0.0);
     let total_tokens = response_json["usage"]["total_tokens"].as_f64().unwrap_or(0.0);
-    // Common context windows: 128k for most models, use prompt_tokens/128000 as estimate
+    // Common context windows: 128k for most models, use total_tokens/128000 as estimate
     let context_limit = 128_000.0_f64;
     let context_usage = (total_tokens / context_limit).min(1.0) as f32;
 
@@ -2507,4 +2845,55 @@ async fn call_backend_with_tools(
         response: LlmResponse::Text(text),
         context_usage,
     })
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    #[test]
+    fn drain_sse_line_handles_partial_buffers() {
+        let mut buffer = b"data: one\r\n\r\npartial".to_vec();
+        assert_eq!(drain_sse_line(&mut buffer).as_deref(), Some("data: one"));
+        assert_eq!(drain_sse_line(&mut buffer).as_deref(), Some(""));
+        assert!(drain_sse_line(&mut buffer).is_none());
+        buffer.extend_from_slice(b" line\n");
+        assert_eq!(drain_sse_line(&mut buffer).as_deref(), Some("partial line"));
+    }
+
+    #[test]
+    fn stream_tool_calls_reassemble_from_deltas() {
+        let mut accumulator = StreamToolCallAccumulator::default();
+        accumulator.push_chunk(&[
+            json!({
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "run_shell_command", "arguments": "{\"command\":\"ec" }
+            }),
+            json!({
+                "index": 1,
+                "id": "call_2",
+                "type": "function",
+                "function": { "name": "grep", "arguments": "{\"queries\":[\"foo" }
+            }),
+        ]);
+        accumulator.push_chunk(&[
+            json!({
+                "index": 0,
+                "function": { "arguments": "ho hi\"}" }
+            }),
+            json!({
+                "index": 1,
+                "function": { "arguments": "\"]}" }
+            }),
+        ]);
+
+        let tool_calls = accumulator.into_tool_calls();
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0]["function"]["name"], "run_shell_command");
+        assert_eq!(tool_calls[0]["function"]["arguments"], "{\"command\":\"echo hi\"}");
+        assert_eq!(tool_calls[1]["function"]["name"], "grep");
+        assert_eq!(tool_calls[1]["function"]["arguments"], "{\"queries\":[\"foo\"]}");
+    }
 }
