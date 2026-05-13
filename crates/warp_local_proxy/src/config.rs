@@ -106,15 +106,29 @@ impl Config {
 
     /// Builds the URL for listing models (if the backend supports it).
     pub fn models_url(&self) -> String {
-        let trimmed = self.backend_base_url.trim_end_matches('/');
-        let mut url = format!("{trimmed}/models");
         if matches!(self.backend_auth_style, AuthStyle::AzureApiKey) {
+            // Azure AI Foundry / Azure OpenAI: models endpoint is at the
+            // service root /openai/models, not under the deployment path.
+            let base = self.backend_base_url.trim_end_matches('/');
+            // Strip deployment-specific path segments to get the service root.
+            // e.g. "https://foo.services.ai.azure.com/models" → "https://foo.services.ai.azure.com"
+            // e.g. "https://foo.openai.azure.com/openai/deployments/gpt-4o" → "https://foo.openai.azure.com"
+            let root = if let Some(idx) = base.find(".azure.com") {
+                let end = idx + ".azure.com".len();
+                &base[..end]
+            } else {
+                base
+            };
+            let mut url = format!("{root}/openai/models");
             if let Some(v) = self.azure_api_version.as_deref().filter(|s| !s.is_empty()) {
                 url.push_str("?api-version=");
                 url.push_str(v);
             }
+            url
+        } else {
+            let trimmed = self.backend_base_url.trim_end_matches('/');
+            format!("{trimmed}/models")
         }
-        url
     }
 }
 
