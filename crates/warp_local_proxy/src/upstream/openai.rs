@@ -94,12 +94,35 @@ pub async fn fetch_models(http: &reqwest::Client, config: &Config) -> Vec<String
             Ok(body) => {
                 let models: Vec<String> = if matches!(config.backend_auth_style, AuthStyle::AzureApiKey) {
                     // Azure returns the full catalog (300+ models). Filter to
-                    // chat-capable ones only so the model picker stays usable.
-                    body.data
+                    // chat-capable ones and exclude versioned duplicates — keep
+                    // only the short alias (e.g. "gpt-4o" not "gpt-4o-2024-08-06").
+                    let mut ids: Vec<String> = body.data
                         .into_iter()
                         .filter(|m| m.capabilities.chat_completion)
                         .map(|m| m.id)
-                        .collect()
+                        .filter(|id| {
+                            // Exclude versioned variants (contain date-like suffix)
+                            // Keep: "gpt-4o", "DeepSeek-V3", "Llama-3.3-70B-Instruct"
+                            // Skip: "gpt-4o-2024-08-06", "gpt-35-turbo-0301"
+                            let parts: Vec<&str> = id.rsplitn(2, '-').collect();
+                            if parts.len() == 2 {
+                                let suffix = parts[0];
+                                // Skip if suffix looks like a date (YYYYMMDD or YYYY-MM-DD)
+                                !(suffix.len() >= 8 && suffix.chars().all(|c| c.is_ascii_digit()))
+                            } else {
+                                true
+                            }
+                        })
+                        .collect();
+                    // Ensure default model is first
+                    let default = &config.default_model;
+                    if !ids.iter().any(|id| id == default) {
+                        ids.insert(0, default.clone());
+                    } else {
+                        ids.retain(|id| id != default);
+                        ids.insert(0, default.clone());
+                    }
+                    ids
                 } else {
                     body.data.into_iter().map(|m| m.id).collect()
                 };
