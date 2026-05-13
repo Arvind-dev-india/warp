@@ -39,7 +39,23 @@ PROFILE_DEFAULT="release"
 PROXY_LOG="${WARP_LOCAL_PROXY_LOG:-/tmp/warp-local-proxy.log}"
 PROXY_PIDFILE="${WARP_LOCAL_PROXY_PIDFILE:-/tmp/warp-local-proxy.pid}"
 
-# Honor env-var equivalents.
+# ---- config file (sourced before env vars) ---------------------------------
+# Reads from ~/.config/warp-local/config.env if it exists.
+# The file is a simple KEY=VALUE shell file. Example:
+#
+#   WARP_LOCAL_PROXY_BACKEND=https://my-resource.openai.azure.com/openai/deployments/gpt-4o
+#   WARP_LOCAL_PROXY_AUTH_STYLE=azure-api-key
+#   WARP_LOCAL_PROXY_BACKEND_API_KEY=abc123...
+#   WARP_LOCAL_PROXY_AZURE_API_VERSION=2025-04-01-preview
+#   WARP_LOCAL_PROXY_DEFAULT_MODEL=gpt-4o
+#
+CONFIG_FILE="${WARP_LOCAL_CONFIG:-$HOME/.config/warp-local/config.env}"
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
+
+# Honor env-var equivalents (config file → env var → default).
 PROXY_BIND="${WARP_LOCAL_PROXY_BIND:-$PROXY_BIND_DEFAULT}"
 BACKEND="${WARP_LOCAL_PROXY_BACKEND:-$BACKEND_DEFAULT}"
 AUTH_STYLE="${WARP_LOCAL_PROXY_AUTH_STYLE:-$AUTH_STYLE_DEFAULT}"
