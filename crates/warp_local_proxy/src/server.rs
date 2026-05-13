@@ -98,12 +98,13 @@ impl AppState {
 
 /// Accept WebSocket upgrades on `/graphql/v2` and idle silently.
 /// The Warp client opens a WS for real-time cloud object sync; we accept
-/// the connection so it stops retrying with 405 errors every 30s.
+/// the connection so it stops retrying with errors every 30s.
 async fn ws_idle(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(|mut socket: WebSocket| async move {
-        // Just wait until the client closes the connection
-        while socket.recv().await.is_some() {}
-    })
+    ws.protocols(["graphql-transport-ws"])
+        .on_upgrade(|mut socket: WebSocket| async move {
+            // Just wait until the client closes the connection
+            while socket.recv().await.is_some() {}
+        })
 }
 
 /// Builds the route table. Exposed as a free function so tests can drive it
