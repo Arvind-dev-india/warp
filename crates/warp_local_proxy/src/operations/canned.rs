@@ -288,6 +288,7 @@ pub fn get_user(state: &AppState) -> Value {
                 // here.
                 "anonymousUserInfo": null,
                 "experiments": [],
+                "globalSkills": [],
                 "isOnboarded": true,
                 "isOnWorkDomain": false,
                 "profile": user_profile(),

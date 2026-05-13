@@ -93,15 +93,36 @@ impl Config {
     /// Builds the URL the proxy will POST chat completions to, including the
     /// Azure `api-version` query string when configured.
     pub fn chat_completions_url(&self) -> String {
-        let trimmed = self.backend_base_url.trim_end_matches('/');
-        let mut url = format!("{trimmed}/chat/completions");
+        self.chat_completions_url_for_model(&self.default_model)
+    }
+
+    /// Builds the chat completions URL for a specific model. For Azure
+    /// deployments, the model name is used as the deployment name in the URL
+    /// path, allowing the UI to switch models dynamically.
+    pub fn chat_completions_url_for_model(&self, model: &str) -> String {
         if matches!(self.backend_auth_style, AuthStyle::AzureApiKey) {
+            // Azure OpenAI: replace the deployment name in the URL with the
+            // requested model. The base URL looks like:
+            //   https://<resource>.openai.azure.com/openai/deployments/<deployment>
+            let base = self.backend_base_url.trim_end_matches('/');
+            let root = if let Some(idx) = base.find("/openai/deployments/") {
+                &base[..idx]
+            } else if let Some(idx) = base.find(".azure.com") {
+                let end = idx + ".azure.com".len();
+                &base[..end]
+            } else {
+                base
+            };
+            let mut url = format!("{root}/openai/deployments/{model}/chat/completions");
             if let Some(v) = self.azure_api_version.as_deref().filter(|s| !s.is_empty()) {
                 url.push_str("?api-version=");
                 url.push_str(v);
             }
+            url
+        } else {
+            let trimmed = self.backend_base_url.trim_end_matches('/');
+            format!("{trimmed}/chat/completions")
         }
-        url
     }
 
     /// Builds the URL for listing models (if the backend supports it).

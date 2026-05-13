@@ -58,7 +58,7 @@ $ProxyPidFile = if ($env:WARP_LOCAL_PROXY_PIDFILE) { $env:WARP_LOCAL_PROXY_PIDFI
 # Reads KEY=VALUE lines from ~/.config/warp-local/config.env (same file as Linux).
 
 $ConfigFile = if ($env:WARP_LOCAL_CONFIG) { $env:WARP_LOCAL_CONFIG }
-              else { Join-Path $HOME ".config" "warp-local" "config.env" }
+              else { Join-Path (Join-Path (Join-Path $HOME ".config") "warp-local") "config.env" }
 
 $ConfigVars = @{}
 if (Test-Path $ConfigFile) {
@@ -110,13 +110,13 @@ function Stop-ProxyProcess {
 
     # Try pidfile first
     if (Test-Path $ProxyPidFile) {
-        $pid = (Get-Content $ProxyPidFile -ErrorAction SilentlyContinue).Trim()
-        if ($pid) {
-            $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        $proxyPid = (Get-Content $ProxyPidFile -ErrorAction SilentlyContinue).Trim()
+        if ($proxyPid) {
+            $proc = Get-Process -Id $proxyPid -ErrorAction SilentlyContinue
             if ($proc -and -not $proc.HasExited) {
                 $proc.Kill()
                 $proc.WaitForExit(3000) | Out-Null
-                Write-Host "warp-local: stopped proxy (pid $pid)"
+                Write-Host "warp-local: stopped proxy (pid $proxyPid)"
                 $stopped = $true
             }
         }
@@ -137,13 +137,14 @@ function Stop-ProxyProcess {
 }
 
 function Build-Proxy {
-    $ext = if ($IsWindows -or $env:OS -eq "Windows_NT") { ".exe" } else { "" }
+    $ext = if ($env:OS -eq "Windows_NT") { ".exe" } else { "" }
     $binDir = if ($Profile -eq "release") { "release" } else { "debug" }
-    $proxyBin = Join-Path $RepoRoot "target" $binDir "warp-local-proxy$ext"
+    $proxyBin = Join-Path (Join-Path (Join-Path $RepoRoot "target") $binDir) "warp-local-proxy$ext"
 
     if (Test-Path $proxyBin) { return }
 
     Write-Host "warp-local: building warp_local_proxy ($Profile)..."
+    $env:CARGO_FULL_PROFILE = $Profile
     Push-Location $RepoRoot
     try {
         if ($Profile -eq "release") {
@@ -155,11 +156,12 @@ function Build-Proxy {
 }
 
 function Get-WarpBin {
-    $ext = if ($IsWindows -or $env:OS -eq "Windows_NT") { ".exe" } else { "" }
-    $bin = Join-Path $RepoRoot "target" $Profile "warp-oss$ext"
+    $ext = if ($env:OS -eq "Windows_NT") { ".exe" } else { "" }
+    $bin = Join-Path (Join-Path (Join-Path $RepoRoot "target") $Profile) "warp-oss$ext"
     if (Test-Path $bin) { return $bin }
 
     Write-Host "warp-local: warp-oss not found at $bin, building (profile=$Profile)..."
+    $env:CARGO_FULL_PROFILE = $Profile
     Push-Location $RepoRoot
     try {
         if ($Profile -eq "release") {
@@ -179,9 +181,9 @@ function Start-Proxy {
 
     Build-Proxy
 
-    $ext = if ($IsWindows -or $env:OS -eq "Windows_NT") { ".exe" } else { "" }
+    $ext = if ($env:OS -eq "Windows_NT") { ".exe" } else { "" }
     $binDir = if ($Profile -eq "release") { "release" } else { "debug" }
-    $proxyBin = Join-Path $RepoRoot "target" $binDir "warp-local-proxy$ext"
+    $proxyBin = Join-Path (Join-Path (Join-Path $RepoRoot "target") $binDir) "warp-local-proxy$ext"
 
     $proxyArgs = @(
         "--bind", $Bind,
@@ -199,10 +201,11 @@ function Start-Proxy {
     "" | Set-Content $ProxyLog
 
     # Start as background process
+    $stderrLog = $ProxyLog -replace '\.log$', '-stderr.log'
     $proc = Start-Process -FilePath $proxyBin `
                           -ArgumentList $proxyArgs `
                           -RedirectStandardOutput $ProxyLog `
-                          -RedirectStandardError $ProxyLog `
+                          -RedirectStandardError $stderrLog `
                           -WindowStyle Hidden `
                           -PassThru
 
@@ -226,12 +229,67 @@ function Start-Proxy {
     }
 }
 
+# ---- user pre-seeding -------------------------------------------------------
+# On Windows, if no persisted user exists in secure storage, seed a local-mode
+# user so warp-oss skips the onboarding/login flow (matching Linux behavior
+# where the user was previously signed in).
+
+function Ensure-LocalUser {
+    # state_dir = data_local_dir from directories::ProjectDirs::from("dev","warp","WarpOss")
+    # On Windows: %LOCALAPPDATA%\warp\WarpOss\data
+    $stateDir = Join-Path (Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA "warp") "WarpOss") "data") ""
+    # data_domain = "dev.warp.WarpOss" (qualifier.organization.application_name)
+    $dataDomain = "dev.warp.WarpOss"
+    $userFile = Join-Path $stateDir "$dataDomain-User"
+
+    if (Test-Path $userFile) { return }
+
+    Write-Host "warp-local: seeding local user (first run)..." -ForegroundColor Yellow
+
+    if (-not (Test-Path $stateDir)) {
+        New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+    }
+
+    # Build the PersistedUser JSON matching the exact serde format.
+    # anonymous_user_type is null so is_user_anonymous() returns false,
+    # which enables all AI features (same as the proxy's get_user response).
+    $userJson = @{
+        id_token = @{
+            id_token        = "local-mode-token"
+            refresh_token   = "local-mode-refresh"
+            expiration_time = "2099-12-31T23:59:59Z"
+        }
+        refresh_token          = ""
+        local_id               = "local-user-uid"
+        email                  = "local@local"
+        display_name           = "Local User"
+        photo_url              = $null
+        is_onboarded           = $true
+        needs_sso_link         = $false
+        anonymous_user_type    = $null
+        linked_at              = $null
+        personal_object_limits = $null
+        is_on_work_domain      = $false
+    } | ConvertTo-Json -Compress
+
+    # Encrypt with DPAPI (same as Rust's CryptProtectData, CurrentUser scope)
+    Add-Type -AssemblyName System.Security
+    $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($userJson)
+    $encBytes = [System.Security.Cryptography.ProtectedData]::Protect(
+        $plainBytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    [System.IO.File]::WriteAllBytes($userFile, $encBytes)
+
+    Write-Host "warp-local: local user seeded at $userFile" -ForegroundColor Green
+}
+
 # ---- main flow --------------------------------------------------------------
 
 if ($StopProxy) {
     Stop-ProxyProcess
     exit 0
 }
+
+Ensure-LocalUser
 
 Start-Proxy
 
@@ -245,7 +303,16 @@ try {
         $env:WARP_SERVER_ROOT_URL = "http://$Bind"
     }
 
+    # Suppress noisy INFO logs from warp-oss — only show warnings and errors.
+    # Save and restore so the proxy (already running) is unaffected.
+    $prevRustLog = $env:RUST_LOG
+    if (-not $env:RUST_LOG) {
+        $env:RUST_LOG = "warn"
+    }
+
     & $warpBin @WarpArgs
+
+    $env:RUST_LOG = $prevRustLog
 } finally {
     if (-not $KeepProxy) {
         Stop-ProxyProcess

@@ -1944,6 +1944,23 @@ pub async fn handle(
     let user_query = extract_user_query(&request);
     let tool_results = extract_tool_results(&request);
 
+    // Debug: log the input type to diagnose tool result delivery
+    if let Some(input) = request.input.as_ref() {
+        if let Some(ref input_type) = input.r#type {
+            tracing::info!(input_type = ?std::mem::discriminant(input_type), "request input type");
+        }
+    }
+
+    // Extract the model selected in the UI (from request.settings.model_config.base).
+    // Fall back to the proxy's default model if not specified.
+    let selected_model = request
+        .settings
+        .as_ref()
+        .and_then(|s| s.model_config.as_ref())
+        .map(|mc| mc.base.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| state.config.default_model.clone());
+
     // Detect if this is a continuation by checking for existing tasks or tool results
     let existing_task_id = request
         .task_context
@@ -1957,6 +1974,7 @@ pub async fn handle(
         tool_results = tool_results.len(),
         is_continuation,
         existing_task = existing_task_id.as_deref().unwrap_or("(none)"),
+        model = %selected_model,
         "multi-agent request"
     );
 
@@ -2006,7 +2024,7 @@ pub async fn handle(
             }
         ]);
         let summary_messages: Vec<serde_json::Value> = serde_json::from_value(summary_prompt).unwrap_or_default();
-        let summary_result = call_backend_with_tools(&state, &summary_messages, false).await;
+        let summary_result = call_backend_with_tools(&state, &summary_messages, false, &selected_model).await;
         if let Ok(LlmResult { response: LlmResponse::Text(ref summary), .. }) = summary_result {
             // Replace conversation with system + summary
             openai_messages = vec![
@@ -2141,7 +2159,7 @@ pub async fn handle(
             json!({ "role": "user", "content": summary_text }),
         ];
         if let Ok(LlmResult { response: LlmResponse::Text(ref summary), .. }) =
-            call_backend_with_tools(&state, &summary_msgs, false).await
+            call_backend_with_tools(&state, &summary_msgs, false, &selected_model).await
         {
             openai_messages = vec![
                 openai_messages[0].clone(),
@@ -2202,7 +2220,7 @@ pub async fn handle(
         );
     }
 
-    let llm_result = call_backend_streaming(&state, &llm_messages, send_tools).await;
+    let llm_result = call_backend_streaming(&state, &llm_messages, send_tools, &selected_model).await;
 
     let mut sse_body = String::new();
 
@@ -2629,6 +2647,7 @@ async fn handle_backend_stream_line(
     decision_tx: &mut Option<oneshot::Sender<Result<BackendStreamDecision, anyhow::Error>>>,
     tool_calls: &mut StreamToolCallAccumulator,
     saw_tool_calls: &mut bool,
+    in_reasoning: &mut bool,
 ) -> Result<bool, anyhow::Error> {
     let Some(data) = line.strip_prefix("data:") else {
         return Ok(true);
@@ -2654,17 +2673,39 @@ async fn handle_backend_stream_line(
         return Ok(true);
     }
 
+    // DeepSeek models emit thinking/reasoning tokens in "reasoning_content"
+    // before the final answer in "content". Stream them to the UI wrapped
+    // in a blockquote so the user can distinguish reasoning from the answer.
+    if let Some(reasoning) = delta["reasoning_content"].as_str() {
+        if !reasoning.is_empty() && !*saw_tool_calls {
+            if !*in_reasoning {
+                *in_reasoning = true;
+                let _ = text_tx.send("<details><summary>💭 Thinking...</summary>\n\n".to_string()).await;
+            }
+            if text_tx.send(reasoning.to_string()).await.is_err() {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+        // Empty reasoning_content — fall through to check "content" field
+    }
+
     if let Some(content) = delta["content"].as_str() {
         if content.is_empty() {
             return Ok(true);
         }
         if *saw_tool_calls {
-            tracing::warn!("received content after tool_calls while streaming backend response");
+            // Content after tool_calls is unusual; skip it
             return Ok(true);
         }
-        if let Some(tx) = decision_tx.take() {
-            let _ = tx.send(Ok(BackendStreamDecision::Text));
+        // Close the reasoning block when the actual content starts
+        if *in_reasoning {
+            *in_reasoning = false;
+            let _ = text_tx.send("\n\n</details>\n\n".to_string()).await;
         }
+        // Buffer text but DON'T commit the decision yet — tool calls
+        // may follow. The decision is made at stream end based on
+        // whether saw_tool_calls is set.
         if text_tx.send(content.to_string()).await.is_err() {
             return Ok(false);
         }
@@ -2677,14 +2718,22 @@ async fn call_backend_streaming(
     state: &AppState,
     messages: &[serde_json::Value],
     send_tools: bool,
+    model: &str,
 ) -> Result<StreamingLlmResult, anyhow::Error> {
-    let url = state.config.chat_completions_url();
-    let model = &state.config.default_model;
+    let url = state.config.chat_completions_url_for_model(model);
+
+    // Newer models (gpt-5.x, o-series) require max_completion_tokens;
+    // older models (gpt-4o, DeepSeek, etc.) use max_tokens.
+    let max_tokens_key = if model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
 
     let mut payload = json!({
         "model": model,
         "messages": messages,
-        "max_tokens": 4096,
+        max_tokens_key: 16384,
         "stream": true
     });
 
@@ -2708,7 +2757,9 @@ async fn call_backend_streaming(
     }
 
     let estimated_context_usage = estimate_context_usage_from_messages(messages);
-    let (text_tx, text_rx) = mpsc::channel(32);
+    // Large buffer so text can be buffered while we wait for the stream to
+    // finish before committing the Text-vs-ToolCalls decision.
+    let (text_tx, text_rx) = mpsc::channel(4096);
     let (decision_tx, decision_rx) = oneshot::channel();
 
     tokio::spawn(async move {
@@ -2717,6 +2768,7 @@ async fn call_backend_streaming(
         let mut buffer = Vec::new();
         let mut tool_calls = StreamToolCallAccumulator::default();
         let mut saw_tool_calls = false;
+        let mut in_reasoning = false;
 
         let read_result: Result<(), anyhow::Error> = async {
             while let Some(chunk) = resp.chunk().await? {
@@ -2728,6 +2780,7 @@ async fn call_backend_streaming(
                         &mut decision_tx,
                         &mut tool_calls,
                         &mut saw_tool_calls,
+                        &mut in_reasoning,
                     )
                     .await?
                     {
@@ -2743,6 +2796,7 @@ async fn call_backend_streaming(
                     &mut decision_tx,
                     &mut tool_calls,
                     &mut saw_tool_calls,
+                    &mut in_reasoning,
                 )
                 .await?
             {
@@ -2789,14 +2843,20 @@ async fn call_backend_with_tools(
     state: &AppState,
     messages: &[serde_json::Value],
     send_tools: bool,
+    model: &str,
 ) -> Result<LlmResult, anyhow::Error> {
-    let url = state.config.chat_completions_url();
-    let model = &state.config.default_model;
+    let url = state.config.chat_completions_url_for_model(model);
+
+    let max_tokens_key = if model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
 
     let mut payload = json!({
         "model": model,
         "messages": messages,
-        "max_tokens": 4096,
+        max_tokens_key: 16384,
         "stream": false
     });
 
