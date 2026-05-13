@@ -105,15 +105,19 @@ impl Config {
     }
 
     /// Builds the URL for listing models (if the backend supports it).
-    /// Returns `None` for Azure OpenAI where the deployments API requires
-    /// management-level auth not available with just an API key.
+    /// Builds the URL for listing available models / deployments.
     pub fn models_url(&self) -> Option<String> {
         if matches!(self.backend_auth_style, AuthStyle::AzureApiKey) {
-            // Azure OpenAI's /openai/deployments requires management auth,
-            // and /openai/models returns the full catalog (300+ models).
-            // Neither is useful with just an api-key. Return None so the
-            // proxy uses the configured default_model directly.
-            None
+            // Azure OpenAI: /openai/deployments needs api-version=2022-12-01
+            // (newer versions return 404 for this endpoint).
+            let base = self.backend_base_url.trim_end_matches('/');
+            let root = if let Some(idx) = base.find(".azure.com") {
+                let end = idx + ".azure.com".len();
+                &base[..end]
+            } else {
+                base
+            };
+            Some(format!("{root}/openai/deployments?api-version=2022-12-01"))
         } else {
             let trimmed = self.backend_base_url.trim_end_matches('/');
             Some(format!("{trimmed}/models"))
@@ -220,6 +224,9 @@ mod tests {
             AuthStyle::AzureApiKey,
             Some("2024-10-21"),
         );
-        assert_eq!(c.models_url(), None);
+        assert_eq!(
+            c.models_url(),
+            Some("https://foo.openai.azure.com/openai/deployments?api-version=2022-12-01".into())
+        );
     }
 }

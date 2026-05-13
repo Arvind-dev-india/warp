@@ -76,9 +76,7 @@ pub async fn fetch_models(http: &reqwest::Client, config: &Config) -> Vec<String
     let url = match config.models_url() {
         Some(url) => url,
         None => {
-            // Azure OpenAI — no usable models endpoint with api-key auth.
-            // Return the configured default model as the only entry.
-            tracing::info!("Azure OpenAI: using configured default model only");
+            tracing::info!("no models endpoint; using configured default model only");
             return vec![config.default_model.clone()];
         }
     };
@@ -101,26 +99,11 @@ pub async fn fetch_models(http: &reqwest::Client, config: &Config) -> Vec<String
         Ok(resp) if resp.status().is_success() => match resp.json::<ModelsListResponse>().await {
             Ok(body) => {
                 let models: Vec<String> = if matches!(config.backend_auth_style, AuthStyle::AzureApiKey) {
-                    // Azure returns the full catalog (300+ models). Filter to
-                    // chat-capable ones and exclude versioned duplicates — keep
-                    // only the short alias (e.g. "gpt-4o" not "gpt-4o-2024-08-06").
+                    // Azure /openai/deployments returns your deployed models.
+                    // Each entry has an "id" field = deployment name.
                     let mut ids: Vec<String> = body.data
                         .into_iter()
-                        .filter(|m| m.capabilities.chat_completion)
                         .map(|m| m.id)
-                        .filter(|id| {
-                            // Exclude versioned variants (contain date-like suffix)
-                            // Keep: "gpt-4o", "DeepSeek-V3", "Llama-3.3-70B-Instruct"
-                            // Skip: "gpt-4o-2024-08-06", "gpt-35-turbo-0301"
-                            let parts: Vec<&str> = id.rsplitn(2, '-').collect();
-                            if parts.len() == 2 {
-                                let suffix = parts[0];
-                                // Skip if suffix looks like a date (YYYYMMDD or YYYY-MM-DD)
-                                !(suffix.len() >= 8 && suffix.chars().all(|c| c.is_ascii_digit()))
-                            } else {
-                                true
-                            }
-                        })
                         .collect();
                     // Ensure default model is first
                     let default = &config.default_model;
