@@ -144,20 +144,33 @@ proxy_is_alive() {
 }
 
 stop_proxy_pid() {
+    local stopped=0
+    # First try the pidfile
     if [[ -f "$PROXY_PIDFILE" ]]; then
         local pid
         pid="$(cat "$PROXY_PIDFILE")"
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
-            # Wait briefly for graceful shutdown.
             for _ in 1 2 3 4 5; do
                 kill -0 "$pid" 2>/dev/null || break
                 sleep 0.2
             done
             kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
             echo "warp-local: stopped proxy (pid $pid)"
+            stopped=1
         fi
         rm -f "$PROXY_PIDFILE"
+    fi
+    # Also find any warp-local-proxy process on the bind port
+    if proxy_is_alive && [[ $stopped -eq 0 ]]; then
+        local orphan_pid
+        orphan_pid="$(pgrep -f "warp-local-proxy.*--bind $PROXY_BIND" 2>/dev/null || pgrep -f "warp-local-proxy" 2>/dev/null || true)"
+        if [[ -n "$orphan_pid" ]]; then
+            kill "$orphan_pid" 2>/dev/null || true
+            sleep 1
+            kill -0 "$orphan_pid" 2>/dev/null && kill -9 "$orphan_pid" 2>/dev/null || true
+            echo "warp-local: stopped orphan proxy (pid $orphan_pid)"
+        fi
     fi
 }
 
