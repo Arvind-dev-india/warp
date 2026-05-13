@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::server::AppState;
+use crate::upstream::openai::apply_backend_auth;
 
 // ── OpenAI tool definitions ──────────────────────────────────────────
 
@@ -2691,13 +2692,14 @@ async fn call_backend_streaming(
         payload["tools"] = openai_tools();
     }
 
-    let resp = state
+    let mut req = state
         .http
         .post(&url)
         .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await?;
+        .json(&payload);
+    req = apply_backend_auth(req, &state.config);
+
+    let resp = req.send().await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -2802,13 +2804,14 @@ async fn call_backend_with_tools(
         payload["tools"] = openai_tools();
     }
 
-    let resp = state
+    let mut req = state
         .http
         .post(&url)
         .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await?;
+        .json(&payload);
+    req = apply_backend_auth(req, &state.config);
+
+    let resp = req.send().await?;
 
     if !resp.status().is_success() {
         let status = resp.status();

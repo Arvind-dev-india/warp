@@ -6,9 +6,24 @@
 //! message content as a plain `String`.
 
 use anyhow::{anyhow, Context};
+use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AuthStyle, Config};
+
+/// Attach the appropriate auth header to an outgoing backend request based on
+/// the configured [`AuthStyle`].  This is the single place that maps
+/// `Bearer` → `Authorization: Bearer <key>` and `AzureApiKey` → `api-key: <key>`.
+pub fn apply_backend_auth(mut req: RequestBuilder, config: &Config) -> RequestBuilder {
+    if let Some(key) = config.backend_api_key.as_deref().filter(|s| !s.is_empty()) {
+        match config.backend_auth_style {
+            AuthStyle::Bearer => req = req.bearer_auth(key),
+            AuthStyle::AzureApiKey => req = req.header("api-key", key),
+            AuthStyle::None => {}
+        }
+    }
+    req
+}
 
 #[derive(Debug, Serialize)]
 pub struct ChatRequest<'a> {
@@ -81,19 +96,7 @@ pub async fn fetch_models(http: &reqwest::Client, config: &Config) -> Vec<String
         }
     };
     let mut req = http.get(&url);
-    match config.backend_auth_style {
-        AuthStyle::Bearer => {
-            if let Some(key) = config.backend_api_key.as_deref().filter(|s| !s.is_empty()) {
-                req = req.bearer_auth(key);
-            }
-        }
-        AuthStyle::AzureApiKey => {
-            if let Some(key) = config.backend_api_key.as_deref().filter(|s| !s.is_empty()) {
-                req = req.header("api-key", key);
-            }
-        }
-        AuthStyle::None => {}
-    }
+    req = apply_backend_auth(req, config);
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<ModelsListResponse>().await {
@@ -160,19 +163,7 @@ pub async fn chat_completion(
     };
 
     let mut req = http.post(&url).json(&body);
-    match config.backend_auth_style {
-        AuthStyle::Bearer => {
-            if let Some(key) = config.backend_api_key.as_deref().filter(|s| !s.is_empty()) {
-                req = req.bearer_auth(key);
-            }
-        }
-        AuthStyle::AzureApiKey => {
-            if let Some(key) = config.backend_api_key.as_deref().filter(|s| !s.is_empty()) {
-                req = req.header("api-key", key);
-            }
-        }
-        AuthStyle::None => {}
-    }
+    req = apply_backend_auth(req, config);
 
     let resp = req.send().await.context("backend request failed")?;
     let status = resp.status();
