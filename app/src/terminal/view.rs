@@ -12906,6 +12906,7 @@ impl TerminalView {
     }
 
     pub fn maybe_set_pending_repo_init_path(&mut self, path: PathBuf) {
+        log::warn!("[DEBUG-INIT] maybe_set_pending_repo_init_path called for {path:?}");
         self.on_next_block_completed(move |me, ctx| {
             if me
                 .current_repo_path
@@ -12920,6 +12921,7 @@ impl TerminalView {
     // Initialize project for a path and suppress the agent mode setup banner for that path. This also auto-opens
     // the code-review pane after the initialization step completes.
     fn init_project_and_suppress_banners(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        log::warn!("[DEBUG-INIT] init_project_and_suppress_banners called for {path:?}");
         log::info!("Indexing and running /init for new repo at {path:?}");
 
         // Ensure we don't hit speedumps - Mark this as "already shown and dismissed"
@@ -12960,7 +12962,9 @@ impl TerminalView {
         open_code_review_pane_after_rule_generation: bool,
         ctx: &mut ViewContext<Self>,
     ) {
+        log::warn!("[DEBUG-INIT] init_project called, open_code_review={open_code_review_pane_after_rule_generation}");
         if self.has_active_init_project(ctx) {
+            log::warn!("[DEBUG-INIT] init_project skipped — already active");
             return;
         }
 
@@ -25917,7 +25921,10 @@ impl TypedActionView for TerminalView {
                     cli_agent: None,
                 }));
             }
-            InitProject => self.init_project(false, ctx),
+            InitProject => {
+                log::warn!("[DEBUG-INIT] TerminalAction::InitProject dispatched");
+                self.init_project(false, ctx)
+            }
             SetupCloudEnvironment(repos) => {
                 self.setup_cloud_environment(repos.clone(), ctx);
             }

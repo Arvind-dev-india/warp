@@ -446,11 +446,19 @@ fn openai_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "suggest_prompt",
-                "description": "Suggest a follow-up prompt.",
+                "description": "Suggest a follow-up prompt to the user.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "text": { "type": "string" }
+                        "text": { "type": "string", "description": "The suggested prompt text" },
+                        "label": { "type": "string", "description": "Short label for the prompt chip" },
+                        "display_mode": {
+                            "type": "string",
+                            "enum": ["prompt_chip", "inline_banner"],
+                            "description": "How to display: 'prompt_chip' (small chip) or 'inline_banner' (large banner with title/description)"
+                        },
+                        "title": { "type": "string", "description": "Title for inline_banner mode" },
+                        "description": { "type": "string", "description": "Description for inline_banner mode" }
                     },
                     "required": ["text"]
                 }
@@ -515,13 +523,31 @@ fn openai_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "use_computer",
-                "description": "Perform computer use actions.",
+                "description": "Perform computer use actions (mouse/keyboard/typing).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action_summary": { "type": "string" }
+                        "action_summary": { "type": "string", "description": "Human-readable summary of what the actions do" },
+                        "actions": {
+                            "type": "array",
+                            "description": "List of actions to perform",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": { "type": "string", "enum": ["mouse_move", "mouse_down", "mouse_up", "mouse_wheel", "wait", "type_text", "key_down", "key_up"] },
+                                    "x": { "type": "integer" },
+                                    "y": { "type": "integer" },
+                                    "button": { "type": "string", "enum": ["left", "right", "middle"] },
+                                    "text": { "type": "string" },
+                                    "key": { "type": "string" },
+                                    "direction": { "type": "string", "enum": ["up", "down", "left", "right"] },
+                                    "duration_ms": { "type": "integer" }
+                                },
+                                "required": ["type"]
+                            }
+                        }
                     },
-                    "required": ["action_summary"]
+                    "required": ["action_summary", "actions"]
                 }
             }
         },
@@ -529,11 +555,11 @@ fn openai_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "request_computer_use",
-                "description": "Request permission for computer use.",
+                "description": "Request permission from the user to perform computer use actions.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "task_summary": { "type": "string" }
+                        "task_summary": { "type": "string", "description": "Description of what computer use is needed for" }
                     },
                     "required": ["task_summary"]
                 }
@@ -543,14 +569,19 @@ fn openai_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "subagent",
-                "description": "Spawn a subagent.",
+                "description": "Spawn a subagent to work on a subtask. Use 'cli' type for shell/terminal tasks, 'research' for reading files and searching code, and 'advice' for analysis and recommendations.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "task_id": { "type": "string" },
-                        "payload": { "type": "string" }
+                        "task_id": { "type": "string", "description": "A unique identifier for this subtask" },
+                        "payload": { "type": "string", "description": "The detailed prompt/instructions for the subagent" },
+                        "type": {
+                            "type": "string",
+                            "enum": ["cli", "research", "advice"],
+                            "description": "The type of subagent: 'cli' for shell commands, 'research' for code exploration, 'advice' for analysis"
+                        }
                     },
-                    "required": ["task_id", "payload"]
+                    "required": ["task_id", "payload", "type"]
                 }
             }
         },
@@ -558,12 +589,12 @@ fn openai_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "start_agent",
-                "description": "Start an agent.",
+                "description": "Start a new agent conversation to work on a task independently.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string" },
-                        "prompt": { "type": "string" }
+                        "name": { "type": "string", "description": "A short name for the agent" },
+                        "prompt": { "type": "string", "description": "The detailed task instructions for the agent" }
                     },
                     "required": ["name", "prompt"]
                 }
@@ -603,12 +634,14 @@ fn openai_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "upload_file_artifact",
-                "description": "Upload a file artifact.",
+                "description": "Upload a file as an artifact attached to the conversation.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "description": { "type": "string" }
-                    }
+                        "file_path": { "type": "string", "description": "Path to the file to upload" },
+                        "description": { "type": "string", "description": "Description of the artifact" }
+                    },
+                    "required": ["file_path", "description"]
                 }
             }
         },
@@ -616,14 +649,27 @@ fn openai_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "run_agents",
-                "description": "Run multiple agents.",
+                "description": "Run multiple agents in parallel to work on subtasks. Each agent gets its own conversation.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "summary": { "type": "string" },
-                        "base_prompt": { "type": "string" }
+                        "summary": { "type": "string", "description": "Overall summary of what the agents will accomplish" },
+                        "base_prompt": { "type": "string", "description": "Base instructions shared by all agents" },
+                        "agents": {
+                            "type": "array",
+                            "description": "List of agents to run",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string", "description": "Short name for this agent" },
+                                    "prompt": { "type": "string", "description": "Specific task for this agent" },
+                                    "title": { "type": "string", "description": "Display title for this agent's conversation" }
+                                },
+                                "required": ["name", "prompt"]
+                            }
+                        }
                     },
-                    "required": ["summary", "base_prompt"]
+                    "required": ["summary", "base_prompt", "agents"]
                 }
             }
         }
@@ -1832,17 +1878,31 @@ fn openai_tool_call_to_proto(
                 .unwrap_or_default();
             Tool::AskUserQuestion(warp_multi_agent_api::AskUserQuestion { questions })
         }
-        "suggest_prompt" => Tool::SuggestPrompt(warp_multi_agent_api::message::tool_call::SuggestPrompt {
-            display_mode: Some(
-                warp_multi_agent_api::message::tool_call::suggest_prompt::DisplayMode::PromptChip(
-                    warp_multi_agent_api::message::tool_call::suggest_prompt::PromptChip {
-                        prompt: args["text"].as_str().unwrap_or("").into(),
-                        label: String::new(),
-                    },
-                ),
-            ),
-            ..Default::default()
-        }),
+        "suggest_prompt" => {
+            let display_mode = match args["display_mode"].as_str().unwrap_or("prompt_chip") {
+                "inline_banner" => {
+                    warp_multi_agent_api::message::tool_call::suggest_prompt::DisplayMode::InlineQueryBanner(
+                        warp_multi_agent_api::message::tool_call::suggest_prompt::InlineQueryBanner {
+                            title: args["title"].as_str().unwrap_or("").into(),
+                            description: args["description"].as_str().unwrap_or("").into(),
+                            query: args["text"].as_str().unwrap_or("").into(),
+                        },
+                    )
+                }
+                _ => {
+                    warp_multi_agent_api::message::tool_call::suggest_prompt::DisplayMode::PromptChip(
+                        warp_multi_agent_api::message::tool_call::suggest_prompt::PromptChip {
+                            prompt: args["text"].as_str().unwrap_or("").into(),
+                            label: args["label"].as_str().unwrap_or("").into(),
+                        },
+                    )
+                }
+            };
+            Tool::SuggestPrompt(warp_multi_agent_api::message::tool_call::SuggestPrompt {
+                display_mode: Some(display_mode),
+                ..Default::default()
+            })
+        }
         "read_skill" => {
             let skill_reference = args["skill_path"]
                 .as_str()
@@ -1878,26 +1938,106 @@ fn openai_tool_call_to_proto(
             server_id: args["server_id"].as_str().unwrap_or("").into(),
         }),
         "init_project" => Tool::InitProject(warp_multi_agent_api::message::tool_call::InitProject {}),
-        "use_computer" => Tool::UseComputer(warp_multi_agent_api::message::tool_call::UseComputer {
-            action_summary: args["action_summary"].as_str().unwrap_or("").into(),
-            ..Default::default()
-        }),
+        "use_computer" => {
+            use warp_multi_agent_api::message::tool_call::use_computer::action;
+            use warp_multi_agent_api::message::tool_call::use_computer::Action;
+            let actions = args["actions"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| {
+                            let action_type = a["type"].as_str()?;
+                            let x = a["x"].as_i64().unwrap_or(0) as i32;
+                            let y = a["y"].as_i64().unwrap_or(0) as i32;
+                            let coords = warp_multi_agent_api::Coordinates { x, y };
+                            let t = match action_type {
+                                "mouse_move" => action::Type::MouseMove(action::MouseMove {
+                                    to: Some(coords),
+                                }),
+                                "mouse_down" => action::Type::MouseDown(action::MouseDown {
+                                    button: match a["button"].as_str().unwrap_or("left") {
+                                        "right" => 1,
+                                        "middle" => 2,
+                                        _ => 0,
+                                    },
+                                    at: Some(coords),
+                                }),
+                                "mouse_up" => action::Type::MouseUp(action::MouseUp {
+                                    button: match a["button"].as_str().unwrap_or("left") {
+                                        "right" => 1,
+                                        "middle" => 2,
+                                        _ => 0,
+                                    },
+                                }),
+                                "type_text" => action::Type::TypeText(action::TypeText {
+                                    text: a["text"].as_str().unwrap_or("").into(),
+                                }),
+                                "key_down" => action::Type::KeyDown(action::KeyDown {
+                                    key: a["key"].as_str().map(|k| action::Key {
+                                        data: Some(action::key::Data::Char(k.into())),
+                                    }),
+                                }),
+                                "key_up" => action::Type::KeyUp(action::KeyUp {
+                                    key: a["key"].as_str().map(|k| action::Key {
+                                        data: Some(action::key::Data::Char(k.into())),
+                                    }),
+                                }),
+                                "wait" => action::Type::Wait(action::Wait {
+                                    duration: Some(prost_types::Duration {
+                                        seconds: a["duration_ms"].as_i64().unwrap_or(1000) / 1000,
+                                        nanos: ((a["duration_ms"].as_i64().unwrap_or(1000) % 1000) * 1_000_000) as i32,
+                                    }),
+                                }),
+                                _ => return None,
+                            };
+                            Some(Action { r#type: Some(t) })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Tool::UseComputer(warp_multi_agent_api::message::tool_call::UseComputer {
+                actions,
+                action_summary: args["action_summary"].as_str().unwrap_or("").into(),
+                ..Default::default()
+            })
+        }
         "request_computer_use" => Tool::RequestComputerUse(
             warp_multi_agent_api::message::tool_call::RequestComputerUse {
                 task_summary: args["task_summary"].as_str().unwrap_or("").into(),
                 ..Default::default()
             },
         ),
-        "subagent" => Tool::Subagent(warp_multi_agent_api::message::tool_call::Subagent {
-            task_id: args["task_id"].as_str().unwrap_or("").into(),
-            payload: args["payload"].as_str().unwrap_or("").into(),
-            ..Default::default()
-        }),
-        "start_agent" => Tool::StartAgent(warp_multi_agent_api::StartAgent {
-            name: args["name"].as_str().unwrap_or("").into(),
-            prompt: args["prompt"].as_str().unwrap_or("").into(),
-            ..Default::default()
-        }),
+        "subagent" => {
+            use warp_multi_agent_api::message::tool_call::subagent::Metadata;
+            let metadata = match args["type"].as_str().unwrap_or("research") {
+                "cli" => Some(Metadata::Cli(
+                    warp_multi_agent_api::message::tool_call::subagent::CliSubagent {
+                        command_id: String::new(),
+                    },
+                )),
+                "advice" => Some(Metadata::Advice(())),
+                "computer_use" => Some(Metadata::ComputerUse(())),
+                _ => Some(Metadata::Research(())),
+            };
+            Tool::Subagent(warp_multi_agent_api::message::tool_call::Subagent {
+                task_id: args["task_id"].as_str().unwrap_or("").into(),
+                payload: args["payload"].as_str().unwrap_or("").into(),
+                metadata,
+            })
+        }
+        "start_agent" => {
+            let execution_mode = Some(
+                warp_multi_agent_api::start_agent::ExecutionMode {
+                    mode: Some(warp_multi_agent_api::start_agent::execution_mode::Mode::Local(())),
+                },
+            );
+            Tool::StartAgent(warp_multi_agent_api::StartAgent {
+                name: args["name"].as_str().unwrap_or("").into(),
+                prompt: args["prompt"].as_str().unwrap_or("").into(),
+                execution_mode,
+                ..Default::default()
+            })
+        }
         "send_message_to_agent" => Tool::SendMessageToAgent(warp_multi_agent_api::SendMessageToAgent {
             addresses: json_string_array(&args["addresses"]),
             subject: args["subject"].as_str().unwrap_or("").into(),
@@ -1907,14 +2047,36 @@ fn openai_tool_call_to_proto(
             conversation_id: args["conversation_id"].as_str().unwrap_or("").into(),
         }),
         "upload_file_artifact" => Tool::UploadFileArtifact(warp_multi_agent_api::UploadFileArtifact {
+            file: Some(warp_multi_agent_api::FilePathReference {
+                file_path: args["file_path"].as_str().unwrap_or("").into(),
+            }),
             description: args["description"].as_str().unwrap_or("").into(),
-            ..Default::default()
         }),
-        "run_agents" => Tool::RunAgents(warp_multi_agent_api::RunAgents {
-            summary: args["summary"].as_str().unwrap_or("").into(),
-            base_prompt: args["base_prompt"].as_str().unwrap_or("").into(),
-            ..Default::default()
-        }),
+        "run_agents" => {
+            let agent_run_configs = args["agents"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|agent| {
+                            Some(warp_multi_agent_api::run_agents::AgentRunConfig {
+                                name: agent["name"].as_str()?.into(),
+                                prompt: agent["prompt"].as_str().unwrap_or("").into(),
+                                title: agent["title"].as_str().unwrap_or("").into(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Tool::RunAgents(warp_multi_agent_api::RunAgents {
+                summary: args["summary"].as_str().unwrap_or("").into(),
+                base_prompt: args["base_prompt"].as_str().unwrap_or("").into(),
+                agent_run_configs,
+                execution_mode: Some(warp_multi_agent_api::run_agents::ExecutionMode::Local(
+                    warp_multi_agent_api::run_agents::Local {},
+                )),
+                ..Default::default()
+            })
+        }
         _ => return None,
     };
 
