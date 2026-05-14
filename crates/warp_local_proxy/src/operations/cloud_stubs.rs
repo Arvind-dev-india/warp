@@ -23,11 +23,31 @@ pub fn list_ambient_agent_tasks() -> Value {
 }
 
 pub fn list_ai_conversation_metadata() -> Value {
+    // Return empty — the client stores conversations locally in SQLite.
+    // Returning empty means "no cloud conversations" which is correct for
+    // local mode. The client's local persistence handles the rest.
     json!({
         "listAIConversations": {
             "__typename": "ListAIConversationsOutput",
             "conversations": [],
             "responseContext": { "serverVersion": "warp_local_proxy/0.1.0" }
+        }
+    })
+}
+
+/// `DeleteAIConversation` — acknowledge the delete so the client stops retrying.
+pub fn delete_ai_conversation(variables: &Value) -> Value {
+    let conversation_id = variables
+        .get("input")
+        .and_then(|i| i.get("conversationId").or_else(|| i.get("conversation_id")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    json!({
+        "deleteConversation": {
+            "__typename": "DeleteConversationOutput",
+            "deletedUid": conversation_id,
+            "responseContext": { "serverVersion": "warp_local_proxy/0.1.0" },
+            "success": true
         }
     })
 }

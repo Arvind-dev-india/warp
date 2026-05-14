@@ -108,6 +108,9 @@ pub async fn handle(
         "cloudenvironmentsquery" => Some(cloud_stubs::get_cloud_environments()),
         "availableharnesses" => Some(cloud_stubs::get_available_harnesses()),
         "updateagenttask" => Some(cloud_stubs::update_agent_task()),
+        "deleteaiconversation" | "deleteconversation" => {
+            Some(cloud_stubs::delete_ai_conversation(&req.variables))
+        }
 
         // Anything we haven't taught the proxy yet → structured error.
         _ => None,
