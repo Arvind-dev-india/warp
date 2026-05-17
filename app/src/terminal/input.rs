@@ -31,6 +31,7 @@ pub use self::handoff_compose::{HandoffComposeState, HandoffComposeStateEvent};
 use crate::ai::active_agent_views_model::{ActiveAgentViewsModel, ConversationOrTaskId};
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::{AIAgentExchangeId, CancellationReason};
+use crate::ai::ambient_agents::telemetry::HandoffEntryPoint;
 use crate::ai::blocklist::agent_view::shortcuts::AgentShortcutViewModel;
 use crate::ai::blocklist::agent_view::{AgentViewEntryOrigin, EphemeralMessageModel};
 use crate::ai::blocklist::block::cli_controller::CLISubagentController;
@@ -109,17 +110,23 @@ use crate::persistence::{database_file_path_for_scope, establish_ro_connection, 
 
 use crate::ai::attachment_utils::MAX_ATTACHMENT_SIZE_BYTES;
 use crate::ai::block_context::BlockContext;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use crate::ai::blocklist::agent_view::agent_input_footer::sort_environments_by_recency;
 use crate::ai::blocklist::agent_view::{
-    AgentInputFooter, AgentInputFooterEvent, AgentViewController,
+    is_in_cloud_context, AgentInputFooter, AgentInputFooterEvent, AgentViewController,
+};
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use crate::ai::blocklist::handoff::touched_repos::{
+    pick_handoff_overlap_env, resolve_repo_for_path, TouchedWorkspace,
 };
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::ai::blocklist::handoff::{HandoffLaunchAttachments, PendingCloudLaunch};
 use crate::ai::blocklist::AttachmentType;
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::ai::blocklist::PendingAttachment;
-#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::ai::cloud_environments::CloudAmbientAgentEnvironment;
 use crate::ai::mcp::TemplatableMCPServerManager;
+use crate::cloud_object::model::generic_string_model::StringModel;
 use crate::server::server_api::ai::AttachmentFileInfo;
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::server::server_api::ai::AttachmentInput;
@@ -131,7 +138,6 @@ use crate::{
     ai::{
         agent::{AIAgentContext, EntrypointType},
         blocklist::{
-            is_local_to_cloud_handoff_available,
             prompt::prompt_alert::{PromptAlertEvent, PromptAlertView},
             render_ai_agent_mode_icon, render_ai_follow_up_icon,
             telemetry_banner::should_collect_ai_ugc_telemetry,
@@ -275,6 +281,8 @@ use string_offset::CharOffset;
 use vec1::Vec1;
 use vim::vim::{VimHandler, VimMode};
 use warp_completer::util::parse_current_commands_and_tokens;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use warpui::r#async::FutureExt as _;
 
 use warp_completer::{
     completer::{
@@ -406,7 +414,6 @@ pub(super) const CLI_AGENT_RICH_INPUT_EDITOR_BOTTOM_PADDING: f32 = 8.;
 pub(super) const CLI_AGENT_RICH_INPUT_HINT_TEXT: &str = "Tell the agent what to build...";
 
 const CLOUD_MODE_V2_HINT_TEXT: &str = "Kick off a cloud agent";
-const CLOUD_HANDOFF_HINT_TEXT: &str = "Handoff to cloud";
 const SHORT_CIRCUIT_HIGHLIGHTING_ACTIONS: [Option<PlainTextEditorViewAction>; 7] = [
     Some(PlainTextEditorViewAction::Space),
     Some(PlainTextEditorViewAction::NonExpandingSpace),
@@ -1096,6 +1103,7 @@ pub enum Event {
     OpenShareSessionModal,
     StartRemoteControl,
     OpenHandoffEnvironmentCreationModal,
+    OpenCloudModeV2EnvironmentCreationModal,
 }
 
 pub enum InputState {
@@ -1183,6 +1191,9 @@ pub enum InputAction {
 
     /// Fired when the "Enable Figma MCP" contextual button is clicked.
     FigmaEnableButtonClicked,
+
+    /// Activates `&` cloud handoff compose mode from the message bar hint.
+    ActivateCloudHandoff,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -2219,6 +2230,7 @@ impl Input {
                         );
                     });
                 }
+
                 // Re-render on status-footer transitions and on status-affecting events that
                 // decide whether the input is in its composing shape.
                 let should_notify = handle.as_ref(ctx).should_show_status_footer()
@@ -2232,9 +2244,12 @@ impl Input {
                             | AmbientAgentViewModelEvent::Cancelled
                             | AmbientAgentViewModelEvent::NeedsGithubAuth
                             | AmbientAgentViewModelEvent::HarnessSelected
+                            | AmbientAgentViewModelEvent::PendingHandoffChanged
                             | AmbientAgentViewModelEvent::HandoffSnapshotUploadFailed { .. }
                     );
+
                 if should_notify {
+                    me.set_zero_state_hint_text(ctx);
                     ctx.notify();
                 }
             });
@@ -2531,7 +2546,7 @@ impl Input {
                     ctx.emit(Event::OpenPluginInstructionsPane(*agent, *kind));
                 }
                 AgentInputFooterEvent::OpenHandoffPane => {
-                    me.activate_cloud_handoff_compose(ctx);
+                    me.activate_cloud_handoff_compose(HandoffEntryPoint::FooterChip, ctx);
                 }
             }
         });
@@ -3693,10 +3708,10 @@ impl Input {
     pub(crate) fn restore_cloud_handoff_draft(
         &mut self,
         launch: PendingCloudLaunch,
-        explicit_environment_id: Option<SyncId>,
+        environment_id: Option<SyncId>,
         ctx: &mut ViewContext<Self>,
     ) {
-        self.activate_cloud_handoff_compose(ctx);
+        self.activate_cloud_handoff_compose(HandoffEntryPoint::Ampersand, ctx);
         self.editor.update(ctx, |editor, ctx| {
             editor.set_buffer_text(&launch.prompt, ctx);
         });
@@ -3705,7 +3720,7 @@ impl Input {
                 model.append_pending_attachments(vec![attachment], ctx);
             }
         });
-        if let Some(env_id) = explicit_environment_id {
+        if let Some(env_id) = environment_id {
             self.handoff_compose_state.update(ctx, |state, ctx| {
                 state.set_environment_id(Some(env_id), true, ctx);
             });
@@ -3729,7 +3744,11 @@ impl Input {
 
     /// Switches the input into cloud handoff compose mode, locking it to AI input
     /// and activating the handoff compose state.
-    fn activate_cloud_handoff_compose(&mut self, ctx: &mut ViewContext<Self>) {
+    fn activate_cloud_handoff_compose(
+        &mut self,
+        entry_point: HandoffEntryPoint,
+        ctx: &mut ViewContext<Self>,
+    ) {
         if self.prefix_mode(ctx) == InputPrefixMode::CloudHandoff {
             return;
         }
@@ -3747,9 +3766,57 @@ impl Input {
         });
 
         self.handoff_compose_state
-            .update(ctx, |state, ctx| state.activate(ctx));
+            .update(ctx, |state, ctx| state.activate(entry_point, ctx));
         self.is_editor_empty_on_last_edit = is_input_buffer_empty;
+
+        #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+        self.auto_select_environment_from_pwd(ctx);
+
         ctx.notify();
+    }
+
+    /// Spawns an async task to resolve the pwd's git repo and pick the best
+    /// environment overlap, updating the handoff compose state when done.
+    #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+    fn auto_select_environment_from_pwd(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(pwd) = self
+            .active_session_path_if_local(ctx)
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+
+        let handoff_compose_state = self.handoff_compose_state.clone();
+        ctx.spawn(
+            async move {
+                resolve_repo_for_path(&pwd)
+                    .with_timeout(Duration::from_secs(5))
+                    .await
+                    .ok()
+                    .flatten()
+            },
+            move |_input, touched_repo, ctx| {
+                let Some(touched_repo) = touched_repo else {
+                    return;
+                };
+                let workspace = TouchedWorkspace {
+                    repos: vec![touched_repo],
+                    orphan_files: vec![],
+                };
+                let mut envs = CloudAmbientAgentEnvironment::get_all(ctx);
+                sort_environments_by_recency(&mut envs);
+                if let Some(overlap_env) = pick_handoff_overlap_env(&workspace, envs) {
+                    handoff_compose_state.update(ctx, |state, ctx| {
+                        state.set_environment_id(Some(overlap_env), false, ctx);
+                    });
+                }
+            },
+        );
+    }
+
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub(crate) fn handoff_entry_point(&self, ctx: &AppContext) -> HandoffEntryPoint {
+        self.handoff_compose_state.as_ref(ctx).entry_point()
     }
 
     #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
@@ -3791,11 +3858,22 @@ impl Input {
         edit_origin: &EditOrigin,
         ctx: &AppContext,
     ) -> bool {
+        let is_powershell_with_nld_enabled = self.editor.as_ref(ctx).shell_family()
+            == Some(ShellFamily::PowerShell)
+            && AISettings::as_ref(ctx).is_ai_autodetection_enabled(ctx);
+        let is_cloud = {
+            let terminal_model = self.model.lock();
+            is_in_cloud_context(
+                terminal_model.block_list().agent_view_state(),
+                &terminal_model,
+            )
+        };
         *edit_origin == EditOrigin::UserTyped
-            && is_local_to_cloud_handoff_available()
+            && AISettings::as_ref(ctx).is_ampersand_handoff_enabled(ctx)
+            && !is_powershell_with_nld_enabled
             && FeatureFlag::AgentView.is_enabled()
             && self.agent_view_controller.as_ref(ctx).is_fullscreen()
-            && self.ambient_agent_view_model().is_none()
+            && !is_cloud
             && !CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.terminal_view_id)
             && self.prefix_mode(ctx) == InputPrefixMode::None
     }
@@ -3838,9 +3916,14 @@ impl Input {
             );
         });
 
-        self.handoff_compose_state
-            .update(ctx, |state, ctx| state.activate(ctx));
+        self.handoff_compose_state.update(ctx, |state, ctx| {
+            state.activate(HandoffEntryPoint::Ampersand, ctx)
+        });
         self.is_editor_empty_on_last_edit = is_input_buffer_empty;
+
+        #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+        self.auto_select_environment_from_pwd(ctx);
+
         ctx.notify();
         true
     }
@@ -3918,7 +4001,9 @@ impl Input {
 
     #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
     fn maybe_launch_cloud_handoff_request(&mut self, ctx: &mut ViewContext<Self>) -> bool {
-        if !is_local_to_cloud_handoff_available()
+        if !FeatureFlag::OzHandoff.is_enabled()
+            || !FeatureFlag::HandoffLocalCloud.is_enabled()
+            || !cfg!(all(feature = "local_fs", not(target_family = "wasm")))
             || self.prefix_mode(ctx) != InputPrefixMode::CloudHandoff
         {
             return false;
@@ -3935,10 +4020,12 @@ impl Input {
         }
 
         let attachments = self.collect_cloud_launch_attachments(ctx);
-        let explicit_environment_id = self
+        let environment_id = self
             .handoff_compose_state
             .as_ref(ctx)
-            .explicit_environment_id();
+            .selected_environment_id()
+            .cloned();
+        let entry_point = self.handoff_compose_state.as_ref(ctx).entry_point();
         let launch = PendingCloudLaunch {
             prompt,
             attachments,
@@ -3948,7 +4035,8 @@ impl Input {
 
         ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenLocalToCloudHandoffPane {
             launch: Some(launch),
-            explicit_environment_id,
+            environment_id,
+            entry_point,
         });
         true
     }
@@ -5703,6 +5791,10 @@ impl Input {
         &self.editor
     }
 
+    pub(crate) fn ai_context_model(&self) -> &ModelHandle<BlocklistAIContextModel> {
+        &self.ai_context_model
+    }
+
     pub fn buffer_text(&self, ctx: &AppContext) -> String {
         self.editor.as_ref(ctx).buffer_text(ctx)
     }
@@ -6211,18 +6303,19 @@ impl Input {
             return;
         }
         if self.prefix_mode(ctx) == InputPrefixMode::CloudHandoff {
-            let hint = self
-                .handoff_compose_state
-                .as_ref(ctx)
-                .selected_environment_id()
-                .and_then(|id| {
-                    crate::ai::cloud_environments::CloudAmbientAgentEnvironment::get_by_id(id, ctx)
-                })
-                .map(|env| {
-                    use crate::cloud_object::model::generic_string_model::StringModel;
-                    format!("Hand off to {}", env.model().string_model.display_name())
-                })
-                .unwrap_or_else(|| CLOUD_HANDOFF_HINT_TEXT.to_owned());
+            let conversation_is_empty = BlocklistAIHistoryModel::as_ref(ctx)
+                .active_conversation(self.terminal_view_id)
+                .is_none_or(|c| c.is_empty());
+            let hint = if conversation_is_empty {
+                CLOUD_MODE_V2_HINT_TEXT.to_owned()
+            } else {
+                self.handoff_compose_state
+                    .as_ref(ctx)
+                    .selected_environment_id()
+                    .and_then(|id| CloudAmbientAgentEnvironment::get_by_id(id, ctx))
+                    .map(|env| format!("Hand off to {}", env.model().string_model.display_name()))
+                    .unwrap_or_else(|| "Handoff to cloud".to_owned())
+            };
             self.editor.update(ctx, |editor, ctx| {
                 editor.set_placeholder_text(&hint, ctx);
             });
@@ -8408,13 +8501,16 @@ impl Input {
             !context_model.pending_context_block_ids().is_empty()
                 || context_model.pending_context_selected_text().is_some()
         };
-        if vim_mode == Some(VimMode::Insert)
+        let should_escape_vim_before_dismissing = (vim_mode == Some(VimMode::Insert)
             && (self.suggestions_mode_model.as_ref(ctx).is_history_up()
                 || self
                     .suggestions_mode_model
                     .as_ref(ctx)
-                    .is_inline_history_menu())
-        {
+                    .is_inline_history_menu()))
+            || (vim_mode == Some(VimMode::Insert)
+                && self.prefix_mode(ctx) == InputPrefixMode::CloudHandoff);
+
+        if should_escape_vim_before_dismissing {
             self.editor.update(ctx, |editor, editor_ctx| {
                 editor.handle_action(&EditorAction::VimEscape, editor_ctx);
             });
@@ -10314,8 +10410,12 @@ impl Input {
                                     .and_then(|pwd| {
                                         // Find git repo and construct absolute path
                                         use repo_metadata::repositories::DetectedRepositories;
+                                        use warp_util::local_or_remote_path::LocalOrRemotePath;
                                         let git_repo_path = DetectedRepositories::as_ref(ctx)
-                                            .get_root_for_path(Path::new(pwd))?;
+                                            .get_root_for_path(&LocalOrRemotePath::Local(
+                                                Path::new(pwd).to_path_buf(),
+                                            ))
+                                            .and_then(|r| PathBuf::try_from(r).ok())?;
                                         let absolute_path = git_repo_path.join(file_path);
 
                                         // Try to get relative path if it's shorter
@@ -12570,6 +12670,19 @@ impl Input {
                 let prompt = command.trim().to_owned();
                 if prompt.is_empty() {
                     return;
+                }
+
+                if self.is_cloud_mode_input_v2_composing(ctx) {
+                    if let Some(ambient_agent_view_model) = self.ambient_agent_view_model() {
+                        let needs_env_modal = ambient_agent_view_model
+                            .as_ref(ctx)
+                            .selected_environment_id()
+                            .is_none();
+                        if needs_env_modal {
+                            ctx.emit(Event::OpenCloudModeV2EnvironmentCreationModal);
+                            return;
+                        }
+                    }
                 }
 
                 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
@@ -14859,6 +14972,9 @@ impl TypedActionView for Input {
             }
             InputAction::ClearAttachedContext => {
                 self.clear_attached_context(ctx);
+            }
+            InputAction::ActivateCloudHandoff => {
+                self.activate_cloud_handoff_compose(HandoffEntryPoint::Ampersand, ctx);
             }
         }
     }

@@ -11,6 +11,7 @@ use indexmap::IndexMap;
 use crate::ai::request_usage_model::RequestLimitInfo;
 use crate::auth::AuthStateProvider;
 use crate::report_if_error;
+use crate::settings::PrivacySettings;
 use crate::terminal::CLIAgent;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 use cfg_if::cfg_if;
@@ -1218,16 +1219,16 @@ define_settings_group!(AISettings, settings: [
         description: "Whether the \"What's new\" section is shown in the agent view.",
     }
 
-    // Whether or not the user has enabled the ability to use Warp credits even when providing
-    // their own LLM provider API key.
-    can_use_warp_credits_with_byok: CanUseWarpCreditsWithByok {
+    // Whether or not the user has enabled fallback to Warp credits for user-provided models.
+    can_use_warp_credits_for_fallback: CanUseWarpCreditsForFallback {
         type: bool,
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
         private: false,
+        storage_key: "CanUseWarpCreditsWithByok",
         toml_path: "cloud_platform.third_party_api_keys.can_use_warp_credits_with_byok",
-        description: "Whether Warp credits can be used even when providing your own API key.",
+        description: "Whether Warp credits can be used as a fallback for user-provided models.",
     }
 
     should_render_use_agent_footer_for_user_commands: ShouldRenderUseAgentToolbarForUserCommands {
@@ -1383,20 +1384,6 @@ define_settings_group!(AISettings, settings: [
         description: "Whether computer use is enabled for cloud agent conversations.",
     }
 
-    // Whether multi-agent orchestration is enabled. When enabled, the agent can
-    // spawn and coordinate parallel sub-agents via StartAgent / SendMessageToAgent
-    // tools. This setting is only effective when FeatureFlag::Orchestration is also
-    // enabled.
-    orchestration_enabled: OrchestrationEnabled {
-        type: bool,
-        default: true,
-        supported_platforms: SupportedPlatforms::DESKTOP,
-        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
-        private: false,
-        toml_path: "agents.warp_agent.other.orchestration_enabled",
-        description: "Whether multi-agent orchestration is enabled.",
-        feature_flag: FeatureFlag::Orchestration,
-    }
 
     // Whether file-based MCP servers from third-party AI tools (e.g. Claude, Codex) should
     // be automatically detected and spawned. Warp-native config files (.warp/.mcp.json) are
@@ -1485,6 +1472,26 @@ define_settings_group!(AISettings, settings: [
         private: false,
         toml_path: "agents.warp_agent.other.agent_attribution_enabled",
         description: "Whether the Warp Agent adds an attribution co-author line to commit messages and pull requests it creates.",
+    }
+
+    should_force_disable_cloud_handoff: ShouldForceDisableCloudHandoff {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "agents.warp_agent.other.should_force_disable_cloud_handoff",
+        description: "Whether to force-disable local-to-cloud handoff.",
+    }
+
+    should_force_disable_ampersand_handoff: ShouldForceDisableAmpersandHandoff {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "agents.warp_agent.other.should_force_disable_ampersand_handoff",
+        description: "Whether to force-disable the & prefix for cloud handoff compose mode.",
     }
 ]);
 
@@ -1663,9 +1670,34 @@ impl AISettings {
     }
 
     pub fn is_orchestration_enabled(&self, app: &warpui::AppContext) -> bool {
-        FeatureFlag::Orchestration.is_enabled()
-            && self.is_any_ai_enabled(app)
-            && *self.orchestration_enabled
+        FeatureFlag::OrchestrationV2.is_enabled() && self.is_any_ai_enabled(app)
+    }
+
+    /// Returns true when local-to-cloud handoff is effectively enabled.
+    /// False when the user/org has disabled it, cloud conversations are off,
+    /// or AI is globally off.
+    pub fn is_cloud_handoff_enabled(&self, app: &warpui::AppContext) -> bool {
+        if !self.is_any_ai_enabled(app) || *self.should_force_disable_cloud_handoff {
+            return false;
+        }
+        if !FeatureFlag::OzHandoff.is_enabled()
+            || !FeatureFlag::HandoffLocalCloud.is_enabled()
+            || !cfg!(all(feature = "local_fs", not(target_family = "wasm")))
+        {
+            return false;
+        }
+        let privacy = PrivacySettings::as_ref(app);
+        if !privacy.is_cloud_conversation_storage_enabled {
+            return false;
+        }
+        !matches!(
+            UserWorkspaces::as_ref(app).get_cloud_conversation_storage_enablement_setting(),
+            crate::workspaces::workspace::AdminEnablementSetting::Disable
+        )
+    }
+
+    pub fn is_ampersand_handoff_enabled(&self, app: &warpui::AppContext) -> bool {
+        self.is_cloud_handoff_enabled(app) && !*self.should_force_disable_ampersand_handoff
     }
 
     /// Determines whether a quota reset banner should be displayed to the user.

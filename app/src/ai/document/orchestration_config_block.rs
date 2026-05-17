@@ -15,6 +15,7 @@ use warpui::platform::Cursor;
 use warpui::{AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext};
 
 use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::blocklist::inline_action::host_picker::{HostPicker, HostPickerEvent};
 use crate::ai::blocklist::inline_action::orchestration_controls::{
     self as oc, OrchestrationControlAction, OrchestrationEditState, OrchestrationPickerHandles,
 };
@@ -83,6 +84,7 @@ pub enum OrchestrationConfigBlockAction {
     HarnessChanged { harness_type: String },
     EnvironmentChanged { environment_id: String },
     WorkerHostChanged { worker_host: String },
+    AuthSecretChanged { auth_secret_name: Option<String> },
 }
 
 impl OrchestrationControlAction for OrchestrationConfigBlockAction {
@@ -98,8 +100,8 @@ impl OrchestrationControlAction for OrchestrationConfigBlockAction {
     fn environment_changed(environment_id: String) -> Self {
         Self::EnvironmentChanged { environment_id }
     }
-    fn worker_host_changed(worker_host: String) -> Self {
-        Self::WorkerHostChanged { worker_host }
+    fn auth_secret_changed(auth_secret_name: Option<String>) -> Self {
+        Self::AuthSecretChanged { auth_secret_name }
     }
 }
 
@@ -185,17 +187,26 @@ impl OrchestrationConfigBlockView {
             }
         });
 
-        // Repopulate harness and model pickers when the server-provided
-        // harness list or harness model catalogs change.
+        // Repopulate pickers when the server-provided harness list,
+        // harness model catalogs, or per-harness auth secrets change.
+        // Without an `AuthSecretsLoaded` handler the picker stays on
+        // "Loading…" forever after the lazy fetch completes.
         ctx.subscribe_to_model(
             &HarnessAvailabilityModel::handle(ctx),
-            |me, _, event, ctx| {
-                if let HarnessAvailabilityEvent::Changed = event {
+            |me, _, event, ctx| match event {
+                HarnessAvailabilityEvent::Changed
+                | HarnessAvailabilityEvent::AuthSecretsLoaded
+                | HarnessAvailabilityEvent::AuthSecretCreated { .. }
+                | HarnessAvailabilityEvent::AuthSecretsFetchFailed => {
+                    // Repopulate on fetch failure too, otherwise the picker
+                    // would stay on the "Loading…" placeholder we wrote
+                    // when the fetch started.
                     if me.pickers_initialized {
                         oc::repopulate_all_pickers(&mut me.edit_state, &me.pickers, ctx);
                     }
                     ctx.notify();
                 }
+                HarnessAvailabilityEvent::AuthSecretCreationFailed { .. } => {}
             },
         );
 
@@ -269,7 +280,12 @@ impl OrchestrationConfigBlockView {
 
         let harness_handle = oc::new_standard_picker_dropdown(&colors, ctx);
         harness_handle.update(ctx, |d, c| d.set_use_overlay_layer(true, c));
-        oc::populate_harness_picker(&harness_handle, &self.edit_state.harness_type, ctx);
+        oc::populate_harness_picker(
+            &harness_handle,
+            &self.edit_state.harness_type,
+            is_local,
+            ctx,
+        );
         self.pickers.harness_picker = Some(harness_handle);
 
         // When restoring a Remote config with empty host or
@@ -286,8 +302,13 @@ impl OrchestrationConfigBlockView {
         };
         let mut filled_defaults = false;
         if needs_host {
-            self.edit_state
-                .set_worker_host(oc::ORCHESTRATION_WARP_WORKER_HOST.to_string());
+            // Prefer the workspace default (or the dev env-var override)
+            // over the bare "warp" fallback so self-hosted teams see
+            // their default pre-selected. Mirrors the Oz webapp's
+            // `HostSelector` initial-selection behavior.
+            let default_host = oc::resolve_default_host_slug(ctx)
+                .unwrap_or_else(|| oc::ORCHESTRATION_WARP_WORKER_HOST.to_string());
+            self.edit_state.set_worker_host(default_host);
             filled_defaults = true;
         }
         if needs_env {
@@ -311,10 +332,37 @@ impl OrchestrationConfigBlockView {
             RunAgentsExecutionMode::Remote { worker_host, .. } => worker_host.as_str(),
             RunAgentsExecutionMode::Local => oc::ORCHESTRATION_WARP_WORKER_HOST,
         };
-        let host_handle = oc::new_standard_picker_dropdown(&colors, ctx);
-        host_handle.update(ctx, |d, c| d.set_use_overlay_layer(true, c));
+        let host_handle = ctx.add_typed_action_view(HostPicker::new);
+        // Paint the open menu in the overlay layer so it doesn't get covered
+        // by sibling pickers, matching the other pickers in this view.
+        host_handle.update(ctx, |picker, picker_ctx| {
+            picker.set_use_overlay_layer(true, picker_ctx);
+        });
         oc::populate_host_picker(&host_handle, initial_host, ctx);
+        ctx.subscribe_to_view(&host_handle, |_me, _, event, ctx| {
+            if let HostPickerEvent::HostChanged { slug } = event {
+                ctx.dispatch_typed_action(&OrchestrationConfigBlockAction::WorkerHostChanged {
+                    worker_host: slug.clone(),
+                });
+            }
+        });
         self.pickers.host_picker = Some(host_handle);
+
+        // Seed the auth secret from persisted per-harness settings before
+        // building the picker so the dropdown shows the last selection.
+        if self.edit_state.auth_secret_name.is_none() {
+            self.edit_state.auth_secret_name =
+                oc::resolve_default_auth_secret_for_harness(&self.edit_state.harness_type, ctx);
+        }
+        let auth_secret_handle = oc::new_standard_picker_dropdown(&colors, ctx);
+        auth_secret_handle.update(ctx, |d, c| d.set_use_overlay_layer(true, c));
+        oc::populate_auth_secret_picker_for_harness(
+            &auth_secret_handle,
+            self.edit_state.auth_secret_name.as_deref(),
+            &self.edit_state.harness_type,
+            ctx,
+        );
+        self.pickers.auth_secret_picker = Some(auth_secret_handle);
 
         self.pickers_initialized = true;
         oc::sync_picker_selections(&self.edit_state, &self.pickers, ctx);
@@ -574,7 +622,24 @@ impl TypedActionView for OrchestrationConfigBlockView {
             }
             OrchestrationConfigBlockAction::WorkerHostChanged { worker_host } => {
                 self.edit_state.set_worker_host(worker_host.clone());
+                oc::persist_host_selection(worker_host, ctx);
                 self.apply_field_change(ctx);
+                ctx.notify();
+            }
+            OrchestrationConfigBlockAction::AuthSecretChanged { auth_secret_name } => {
+                // No `apply_field_change` here: managed secrets are user-scoped
+                // (not plan-scoped), so they are persisted side-channel via
+                // `CloudAgentSettings.last_selected_auth_secret` instead of
+                // being baked into `OrchestrationConfig`. Consequence: changing
+                // the picker doesn't surface a "config modified" signal, and
+                // two users on the same approved plan can have different secret
+                // selections without conflicting.
+                oc::apply_auth_secret_change(
+                    &mut self.edit_state,
+                    &self.pickers,
+                    auth_secret_name.clone(),
+                    ctx,
+                );
                 ctx.notify();
             }
         }
