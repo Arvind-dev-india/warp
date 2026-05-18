@@ -2367,7 +2367,7 @@ pub async fn handle(
     };
 
     // Count tool call rounds for the max-rounds limit
-    const MAX_TOOL_ROUNDS: u32 = 15;
+    const MAX_TOOL_ROUNDS: u32 = 200;
     let prior_tool_rounds = llm_messages
         .iter()
         .filter(|m| m.get("tool_calls").is_some())
