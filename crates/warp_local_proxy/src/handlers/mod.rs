@@ -27,7 +27,7 @@ pub async fn healthz() -> impl IntoResponse {
 
 pub async fn unsupported() -> impl IntoResponse {
     (
-        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::NOT_FOUND,
         Json(serde_json::json!({
             "error": {
                 "code": "LOCAL_PROXY_UNSUPPORTED",
