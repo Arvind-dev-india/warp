@@ -776,11 +776,7 @@ fn request_tool_call_result_to_text(
                 format!("Command: {} — Permission denied by user", r.command)
             }
             None => {
-                #[allow(deprecated)]
-                format!(
-                    "Command: {}\nExit code: {}\nOutput:\n{}",
-                    r.command, r.exit_code, r.output
-                )
+                format!("Command: {} — (no structured result)", r.command)
             }
         },
         R::ReadFiles(r) => match &r.result {
@@ -865,271 +861,6 @@ fn request_tool_call_result_to_text(
     }
 }
 
-// ── Message-level tool result → text (for history replay) ────────────
-
-fn message_tool_call_result_to_text(tcr: &warp_multi_agent_api::message::ToolCallResult) -> String {
-    let Some(ref result) = tcr.result else {
-        return "(no result)".to_string();
-    };
-
-    use warp_multi_agent_api::message::tool_call_result::Result as R;
-    match result {
-        R::RunShellCommand(r) => match &r.result {
-            Some(warp_multi_agent_api::run_shell_command_result::Result::CommandFinished(f)) => {
-                format!(
-                    "Command: {}\nExit code: {}\nOutput:\n{}",
-                    r.command, f.exit_code, f.output
-                )
-            }
-            Some(
-                warp_multi_agent_api::run_shell_command_result::Result::LongRunningCommandSnapshot(
-                    s,
-                ),
-            ) => {
-                format!(
-                    "Command: {} (still running)\nOutput so far:\n{}",
-                    r.command, s.output
-                )
-            }
-            Some(warp_multi_agent_api::run_shell_command_result::Result::PermissionDenied(_)) => {
-                format!("Command: {} — Permission denied by user", r.command)
-            }
-            None => {
-                #[allow(deprecated)]
-                format!(
-                    "Command: {}\nExit code: {}\nOutput:\n{}",
-                    r.command, r.exit_code, r.output
-                )
-            }
-        },
-        R::ReadFiles(r) => match &r.result {
-            Some(warp_multi_agent_api::read_files_result::Result::TextFilesSuccess(s)) => s
-                .files
-                .iter()
-                .map(|f| format!("=== {} ===\n{}", f.file_path, f.content))
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-            Some(warp_multi_agent_api::read_files_result::Result::Error(e)) => {
-                format!("Error reading files: {}", e.message)
-            }
-            _ => "(file read result)".to_string(),
-        },
-        R::Grep(r) => match &r.result {
-            Some(warp_multi_agent_api::grep_result::Result::Success(s)) => s
-                .matched_files
-                .iter()
-                .map(|f| {
-                    let lines: Vec<String> = f
-                        .matched_lines
-                        .iter()
-                        .map(|l| l.line_number.to_string())
-                        .collect();
-                    format!("{}:{}", f.file_path, lines.join(","))
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Some(warp_multi_agent_api::grep_result::Result::Error(e)) => {
-                format!("Grep error: {}", e.message)
-            }
-            None => "(no grep result)".to_string(),
-        },
-        R::FileGlobV2(r) => match &r.result {
-            Some(warp_multi_agent_api::file_glob_v2_result::Result::Success(s)) => s
-                .matched_files
-                .iter()
-                .map(|f| f.file_path.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Some(warp_multi_agent_api::file_glob_v2_result::Result::Error(e)) => {
-                format!("Glob error: {}", e.message)
-            }
-            None => "(no glob result)".to_string(),
-        },
-        R::SearchCodebase(r) => match &r.result {
-            Some(warp_multi_agent_api::search_codebase_result::Result::Success(s)) => s
-                .files
-                .iter()
-                .map(|f| format!("=== {} ===\n{}", f.file_path, f.content))
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-            Some(warp_multi_agent_api::search_codebase_result::Result::Error(e)) => {
-                format!("Search error: {}", e.message)
-            }
-            None => "(no search result)".to_string(),
-        },
-        R::ApplyFileDiffs(r) => match &r.result {
-            Some(warp_multi_agent_api::apply_file_diffs_result::Result::Success(s)) => {
-                let files: Vec<_> = s
-                    .updated_files_v2
-                    .iter()
-                    .filter_map(|f| f.file.as_ref())
-                    .map(|f| f.file_path.as_str())
-                    .collect();
-                format!("Successfully applied diffs to: {}", files.join(", "))
-            }
-            Some(warp_multi_agent_api::apply_file_diffs_result::Result::Error(e)) => {
-                format!("Diff error: {}", e.message)
-            }
-            None => "(no diff result)".to_string(),
-        },
-        R::SuggestPlan(_) => "Plan accepted by user.".to_string(),
-        R::SuggestCreatePlan(r) => {
-            if r.accepted {
-                "Plan creation accepted.".into()
-            } else {
-                "Plan creation rejected.".into()
-            }
-        }
-        R::Cancel(_) => "Tool call was cancelled by user.".to_string(),
-        _ => "(tool result)".to_string(),
-    }
-}
-
-// ── Build OpenAI messages from conversation history ──────────────────
-
-fn build_openai_messages(
-    request: &warp_multi_agent_api::Request,
-    user_query: Option<&str>,
-    tool_results: &[(String, String)],
-) -> Vec<serde_json::Value> {
-    let mut messages = vec![json!({
-        "role": "system",
-        "content": "You are a helpful AI assistant integrated into the Warp terminal. You have \
-                    access to tools that let you run shell commands, read files, edit files, \
-                    search code, and more. Use tools when needed to help the user. \
-                    When providing code changes, use the apply_file_diffs tool. \
-                    When you need to understand existing code, use read_files or grep. \
-                    Be concise but thorough."
-    })];
-
-    // Replay conversation history from task_context.
-    // First, collect all tool_call_ids that have matching results so we
-    // can skip orphaned ToolCall messages (OpenAI requires every
-    // assistant tool_call to be followed by a matching tool result).
-    if let Some(ref tc) = request.task_context {
-        let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut tool_call_count = 0u32;
-        let mut tool_result_count = 0u32;
-        let mut user_query_count = 0u32;
-        let mut agent_output_count = 0u32;
-        let mut other_count = 0u32;
-
-        for task in &tc.tasks {
-            for msg in &task.messages {
-                match msg.message.as_ref() {
-                    Some(warp_multi_agent_api::message::Message::ToolCallResult(tcr)) => {
-                        result_ids.insert(tcr.tool_call_id.clone());
-                        tool_result_count += 1;
-                    }
-                    Some(warp_multi_agent_api::message::Message::ToolCall(_)) => {
-                        tool_call_count += 1;
-                    }
-                    Some(warp_multi_agent_api::message::Message::UserQuery(_)) => {
-                        user_query_count += 1;
-                    }
-                    Some(warp_multi_agent_api::message::Message::AgentOutput(_)) => {
-                        agent_output_count += 1;
-                    }
-                    _ => {
-                        other_count += 1;
-                    }
-                }
-            }
-        }
-        // Also count tool results from the current request input
-        for (id, _) in tool_results {
-            result_ids.insert(id.clone());
-        }
-
-        tracing::info!(
-            tasks = tc.tasks.len(),
-            tool_calls = tool_call_count,
-            tool_results_in_history = tool_result_count,
-            tool_results_in_input = tool_results.len(),
-            matched_result_ids = result_ids.len(),
-            user_queries = user_query_count,
-            agent_outputs = agent_output_count,
-            other = other_count,
-            "conversation history summary"
-        );
-
-        for task in &tc.tasks {
-            for msg in &task.messages {
-                if let Some(ref m) = msg.message {
-                    match m {
-                        warp_multi_agent_api::message::Message::UserQuery(q) => {
-                            messages.push(json!({ "role": "user", "content": q.query }));
-                        }
-                        warp_multi_agent_api::message::Message::AgentOutput(a)
-                            if !a.text.is_empty() =>
-                        {
-                            messages.push(json!({ "role": "assistant", "content": a.text }));
-                        }
-                        warp_multi_agent_api::message::Message::ToolCall(tc) => {
-                            let (fn_name, fn_args) = tool_call_to_openai(tc);
-                            messages.push(json!({
-                                "role": "assistant",
-                                "content": null,
-                                "tool_calls": [{
-                                    "id": tc.tool_call_id,
-                                    "type": "function",
-                                    "function": { "name": fn_name, "arguments": fn_args }
-                                }]
-                            }));
-                            // If this tool call has no matching result in history
-                            // or current input, synthesize a placeholder so
-                            // OpenAI's API doesn't reject the orphaned tool_call.
-                            if !result_ids.contains(&tc.tool_call_id) {
-                                messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tc.tool_call_id,
-                                    "content": "(result not available)"
-                                }));
-                            }
-                        }
-                        warp_multi_agent_api::message::Message::ToolCallResult(tcr) => {
-                            let text = message_tool_call_result_to_text(tcr);
-                            messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tcr.tool_call_id,
-                                "content": text
-                            }));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    // New user query (fresh turn)
-    if let Some(q) = user_query {
-        if !q.is_empty() {
-            messages.push(json!({ "role": "user", "content": q }));
-        }
-    }
-
-    // Tool results from current request input (continuation turn)
-    for (tool_call_id, result_text) in tool_results {
-        messages.push(json!({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": result_text
-        }));
-    }
-
-    messages
-}
-
-fn line_ranges_to_json(
-    line_ranges: &[warp_multi_agent_api::FileContentLineRange],
-) -> Vec<serde_json::Value> {
-    line_ranges
-        .iter()
-        .map(|range| json!({ "start": range.start, "end": range.end }))
-        .collect()
-}
-
 fn json_to_line_ranges(
     value: &serde_json::Value,
 ) -> Vec<warp_multi_agent_api::FileContentLineRange> {
@@ -1161,20 +892,6 @@ fn json_string_array(value: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn write_mode_to_json(
-    mode: Option<
-        &warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::Mode,
-    >,
-) -> &'static str {
-    use warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::mode::Mode;
-
-    match mode.and_then(|mode| mode.mode.as_ref()) {
-        Some(Mode::Line(_)) => "line",
-        Some(Mode::Block(_)) => "block",
-        _ => "raw",
-    }
-}
-
 fn json_to_write_mode(
     mode: Option<&str>,
 ) -> Option<warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::Mode> {
@@ -1189,33 +906,6 @@ fn json_to_write_mode(
             _ => Mode::Raw(()),
         }),
     })
-}
-
-fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
-    use prost_types::value::Kind;
-
-    match value.kind.as_ref() {
-        Some(Kind::NullValue(_)) => serde_json::Value::Null,
-        Some(Kind::BoolValue(v)) => serde_json::Value::Bool(*v),
-        Some(Kind::NumberValue(v)) => serde_json::Number::from_f64(*v)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        Some(Kind::StringValue(v)) => serde_json::Value::String(v.clone()),
-        Some(Kind::StructValue(v)) => prost_struct_to_json(v),
-        Some(Kind::ListValue(v)) => {
-            serde_json::Value::Array(v.values.iter().map(prost_value_to_json).collect())
-        }
-        None => serde_json::Value::Null,
-    }
-}
-
-fn prost_struct_to_json(value: &prost_types::Struct) -> serde_json::Value {
-    serde_json::Value::Object(
-        value
-            .fields
-            .iter()
-            .map(|(key, value)| (key.clone(), prost_value_to_json(value)))
-            .collect(),
-    )
 }
 
 fn json_to_prost_value(value: &serde_json::Value) -> prost_types::Value {
@@ -1249,310 +939,6 @@ fn json_to_prost_struct(value: &serde_json::Value) -> Option<prost_types::Struct
                 .collect(),
         }),
         _ => None,
-    }
-}
-
-fn tool_call_to_openai(tc: &warp_multi_agent_api::message::ToolCall) -> (String, String) {
-    let Some(ref tool) = tc.tool else {
-        return ("unknown".into(), "{}".into());
-    };
-    use warp_multi_agent_api::message::tool_call::Tool;
-    match tool {
-        Tool::RunShellCommand(cmd) => (
-            "run_shell_command".into(),
-            json!({ "command": cmd.command, "is_read_only": cmd.is_read_only }).to_string(),
-        ),
-        Tool::WriteToLongRunningShellCommand(cmd) => (
-            "write_to_long_running_shell_command".into(),
-            json!({
-                "input": String::from_utf8_lossy(&cmd.input),
-                "mode": write_mode_to_json(cmd.mode.as_ref()),
-                "command_id": cmd.command_id,
-            })
-            .to_string(),
-        ),
-        Tool::ReadShellCommandOutput(cmd) => {
-            let mut payload = json!({ "command_id": cmd.command_id });
-            match cmd.delay.as_ref() {
-                Some(warp_multi_agent_api::message::tool_call::read_shell_command_output::Delay::Duration(duration)) => {
-                    payload["delay_seconds"] = json!(duration.seconds);
-                }
-                Some(warp_multi_agent_api::message::tool_call::read_shell_command_output::Delay::OnCompletion(_)) => {
-                    payload["wait_for_completion"] = json!(true);
-                }
-                None => {}
-            }
-            ("read_shell_command_output".into(), payload.to_string())
-        }
-        Tool::TransferShellCommandControlToUser(cmd) => (
-            "transfer_shell_command_control_to_user".into(),
-            json!({ "reason": cmd.reason }).to_string(),
-        ),
-        Tool::ReadFiles(rf) => {
-            let files: Vec<_> = rf
-                .files
-                .iter()
-                .map(|file| json!({ "name": file.name, "line_ranges": line_ranges_to_json(&file.line_ranges) }))
-                .collect();
-            ("read_files".into(), json!({ "files": files }).to_string())
-        }
-        Tool::ReadDocuments(rd) => {
-            let documents: Vec<_> = rd
-                .documents
-                .iter()
-                .map(|document| {
-                    json!({
-                        "document_id": document.document_id,
-                        "line_ranges": line_ranges_to_json(&document.line_ranges),
-                    })
-                })
-                .collect();
-            ("read_documents".into(), json!({ "documents": documents }).to_string())
-        }
-        Tool::ApplyFileDiffs(afd) => {
-            let diffs: Vec<_> = afd
-                .diffs
-                .iter()
-                .map(|diff| json!({ "file_path": diff.file_path, "search": diff.search, "replace": diff.replace }))
-                .collect();
-            let new_files: Vec<_> = afd
-                .new_files
-                .iter()
-                .map(|file| json!({ "file_path": file.file_path, "content": file.content }))
-                .collect();
-            let deleted_files: Vec<_> = afd
-                .deleted_files
-                .iter()
-                .map(|file| json!({ "file_path": file.file_path }))
-                .collect();
-            let v4a_updates: Vec<_> = afd
-                .v4a_updates
-                .iter()
-                .map(|update| {
-                    json!({
-                        "file_path": update.file_path,
-                        "move_to": update.move_to,
-                        "hunks": update
-                            .hunks
-                            .iter()
-                            .map(|hunk| {
-                                json!({
-                                    "change_context": hunk.change_context,
-                                    "pre_context": hunk.pre_context,
-                                    "old": hunk.old,
-                                    "new": hunk.new,
-                                    "post_context": hunk.post_context,
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    })
-                })
-                .collect();
-            (
-                "apply_file_diffs".into(),
-                json!({
-                    "summary": afd.summary,
-                    "diffs": diffs,
-                    "new_files": new_files,
-                    "deleted_files": deleted_files,
-                    "v4a_updates": v4a_updates,
-                })
-                .to_string(),
-            )
-        }
-        Tool::EditDocuments(ed) => {
-            let diffs: Vec<_> = ed
-                .diffs
-                .iter()
-                .map(|diff| json!({ "document_id": diff.document_id, "search": diff.search, "replace": diff.replace }))
-                .collect();
-            ("edit_documents".into(), json!({ "diffs": diffs }).to_string())
-        }
-        Tool::CreateDocuments(cd) => {
-            let new_documents: Vec<_> = cd
-                .new_documents
-                .iter()
-                .map(|document| json!({ "content": document.content, "title": document.title }))
-                .collect();
-            ("create_documents".into(), json!({ "new_documents": new_documents }).to_string())
-        }
-        Tool::Grep(g) => (
-            "grep".into(),
-            json!({ "queries": g.queries, "path": g.path }).to_string(),
-        ),
-        Tool::FileGlobV2(fg) => (
-            "file_glob".into(),
-            json!({
-                "patterns": fg.patterns,
-                "search_dir": fg.search_dir,
-                "max_matches": fg.max_matches,
-                "max_depth": fg.max_depth,
-                "min_depth": fg.min_depth,
-            })
-            .to_string(),
-        ),
-        Tool::SearchCodebase(sc) => (
-            "search_codebase".into(),
-            json!({
-                "query": sc.query,
-                "path_filters": sc.path_filters,
-                "codebase_path": sc.codebase_path,
-            })
-            .to_string(),
-        ),
-        Tool::SuggestPlan(plan) => (
-            "suggest_plan".into(),
-            json!({ "summary": plan.summary }).to_string(),
-        ),
-        Tool::SuggestCreatePlan(_) => ("suggest_create_plan".into(), "{}".into()),
-        Tool::ReadMcpResource(resource) => (
-            "read_mcp_resource".into(),
-            json!({ "uri": resource.uri, "server_id": resource.server_id }).to_string(),
-        ),
-        Tool::CallMcpTool(tool_call) => (
-            "call_mcp_tool".into(),
-            json!({
-                "name": tool_call.name,
-                "args": tool_call.args.as_ref().map(prost_struct_to_json).unwrap_or(serde_json::Value::Null),
-                "server_id": tool_call.server_id,
-            })
-            .to_string(),
-        ),
-        Tool::SuggestPrompt(prompt) => {
-            let text = match prompt.display_mode.as_ref() {
-                Some(warp_multi_agent_api::message::tool_call::suggest_prompt::DisplayMode::PromptChip(chip)) => {
-                    chip.prompt.clone()
-                }
-                Some(warp_multi_agent_api::message::tool_call::suggest_prompt::DisplayMode::InlineQueryBanner(banner)) => {
-                    banner.query.clone()
-                }
-                None => String::new(),
-            };
-            ("suggest_prompt".into(), json!({ "text": text }).to_string())
-        }
-        Tool::OpenCodeReview(_) => ("open_code_review".into(), "{}".into()),
-        Tool::InitProject(_) => ("init_project".into(), "{}".into()),
-        Tool::Subagent(subagent) => (
-            "subagent".into(),
-            json!({ "task_id": subagent.task_id, "payload": subagent.payload }).to_string(),
-        ),
-        Tool::UseComputer(use_computer) => (
-            "use_computer".into(),
-            json!({ "action_summary": use_computer.action_summary }).to_string(),
-        ),
-        Tool::InsertReviewComments(review) => {
-            let comments: Vec<_> = review
-                .comments
-                .iter()
-                .map(|comment| {
-                    let mut value = json!({
-                        "comment_id": comment.comment_id,
-                        "author": comment.author,
-                        "last_modified_timestamp": comment.last_modified_timestamp,
-                        "comment_body": comment.comment_body,
-                        "parent_comment_id": comment.parent_comment_id,
-                        "html_url": comment.html_url,
-                    });
-                    if let Some(location) = comment.location.as_ref() {
-                        let mut location_value = json!({ "file_path": location.file_path });
-                        if let Some(line) = location.line.as_ref() {
-                            let side = match warp_multi_agent_api::message::tool_call::insert_review_comments::CommentSide::try_from(line.side)
-                            {
-                                Ok(warp_multi_agent_api::message::tool_call::insert_review_comments::CommentSide::Old) => "old",
-                                _ => "new",
-                            };
-                            location_value["line"] = json!({
-                                "diff_hunk": line.diff_hunk,
-                                "range": line.range.as_ref().map(|range| json!({ "start": range.start, "end": range.end })),
-                                "side": side,
-                            });
-                        }
-                        value["location"] = location_value;
-                    }
-                    value
-                })
-                .collect();
-            (
-                "insert_review_comments".into(),
-                json!({
-                    "repo_path": review.repo_path,
-                    "comments": comments,
-                    "base_branch": review.base_branch,
-                })
-                .to_string(),
-            )
-        }
-        Tool::ReadSkill(skill) => {
-            let mut payload = json!({ "name": skill.name });
-            match skill.skill_reference.as_ref() {
-                Some(warp_multi_agent_api::message::tool_call::read_skill::SkillReference::SkillPath(path)) => {
-                    payload["skill_path"] = json!(path);
-                }
-                Some(warp_multi_agent_api::message::tool_call::read_skill::SkillReference::BundledSkillId(id)) => {
-                    payload["bundled_skill_id"] = json!(id);
-                }
-                None => {}
-            }
-            ("read_skill".into(), payload.to_string())
-        }
-        Tool::RequestComputerUse(request) => (
-            "request_computer_use".into(),
-            json!({ "task_summary": request.task_summary }).to_string(),
-        ),
-        Tool::FetchConversation(fetch) => (
-            "fetch_conversation".into(),
-            json!({ "conversation_id": fetch.conversation_id }).to_string(),
-        ),
-        Tool::StartAgent(agent) => (
-            "start_agent".into(),
-            json!({ "name": agent.name, "prompt": agent.prompt }).to_string(),
-        ),
-        Tool::SendMessageToAgent(message) => (
-            "send_message_to_agent".into(),
-            json!({
-                "addresses": message.addresses,
-                "subject": message.subject,
-                "message": message.message,
-            })
-            .to_string(),
-        ),
-        Tool::AskUserQuestion(question) => {
-            let questions: Vec<_> = question
-                .questions
-                .iter()
-                .map(|question| {
-                    let mut value = json!({
-                        "question_id": question.question_id,
-                        "question": question.question,
-                    });
-                    if let Some(warp_multi_agent_api::ask_user_question::question::QuestionType::MultipleChoice(multiple_choice)) =
-                        question.question_type.as_ref()
-                    {
-                        value["multiple_choice"] = json!({
-                            "options": multiple_choice
-                                .options
-                                .iter()
-                                .map(|option| option.label.clone())
-                                .collect::<Vec<_>>(),
-                            "is_multiselect": multiple_choice.is_multiselect,
-                            "supports_other": multiple_choice.supports_other,
-                            "recommended_option_index": multiple_choice.recommended_option_index,
-                        });
-                    }
-                    value
-                })
-                .collect();
-            ("ask_user_question".into(), json!({ "questions": questions }).to_string())
-        }
-        Tool::UploadFileArtifact(artifact) => (
-            "upload_file_artifact".into(),
-            json!({ "description": artifact.description }).to_string(),
-        ),
-        Tool::RunAgents(run_agents) => (
-            "run_agents".into(),
-            json!({ "summary": run_agents.summary, "base_prompt": run_agents.base_prompt }).to_string(),
-        ),
-        _ => ("unknown".into(), "{}".into()),
     }
 }
 
@@ -2707,13 +2093,13 @@ fn emit_agent_output(sse_body: &mut String, task_id: &str, request_id: &str, tex
 
 enum LlmResponse {
     Text(String),
-    ToolCalls(Vec<serde_json::Value>),
+    ToolCalls(()),
 }
 
 struct LlmResult {
     response: LlmResponse,
     /// Fraction of context window used (0.0–1.0), from usage data.
-    context_usage: f32,
+    _context_usage: f32,
 }
 
 enum StreamingLlmResult {
@@ -2806,7 +2192,7 @@ async fn send_sse_event(
 async fn handle_backend_stream_line(
     line: &str,
     text_tx: &mpsc::Sender<String>,
-    decision_tx: &mut Option<oneshot::Sender<Result<BackendStreamDecision, anyhow::Error>>>,
+    _decision_tx: &mut Option<oneshot::Sender<Result<BackendStreamDecision, anyhow::Error>>>,
     tool_calls: &mut StreamToolCallAccumulator,
     saw_tool_calls: &mut bool,
     in_reasoning: &mut bool,
@@ -3056,8 +2442,8 @@ async fn call_backend_with_tools(
         if !tool_calls.is_empty() {
             tracing::info!(count = tool_calls.len(), prompt_tokens, "LLM requested tool calls");
             return Ok(LlmResult {
-                response: LlmResponse::ToolCalls(tool_calls.clone()),
-                context_usage,
+                response: LlmResponse::ToolCalls(()),
+                _context_usage: context_usage,
             });
         }
     }
@@ -3068,7 +2454,7 @@ async fn call_backend_with_tools(
         .to_string();
     Ok(LlmResult {
         response: LlmResponse::Text(text),
-        context_usage,
+        _context_usage: context_usage,
     })
 }
 

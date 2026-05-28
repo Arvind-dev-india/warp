@@ -67,16 +67,6 @@ struct ModelsListResponse {
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
     pub id: String,
-    #[serde(default)]
-    pub capabilities: ModelCapabilities,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ModelCapabilities {
-    #[serde(default)]
-    pub chat_completion: bool,
-    #[serde(default)]
-    pub inference: bool,
 }
 
 /// Fetches the list of model ids the configured backend exposes via

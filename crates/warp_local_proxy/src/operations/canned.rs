@@ -239,18 +239,6 @@ fn user_profile() -> Value {
     })
 }
 
-fn anonymous_user_info() -> Value {
-    json!({
-        "anonymousUserType": "NATIVE_CLIENT_ANONYMOUS_USER",
-        "linkedAt": null,
-        "personalObjectLimits": {
-            "envVarLimit": 999999,
-            "notebookLimit": 999999,
-            "workflowLimit": 999999
-        }
-    })
-}
-
 fn response_context() -> Value {
     json!({ "serverVersion": "warp_local_proxy/0.1.0" })
 }
