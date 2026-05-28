@@ -1,9 +1,10 @@
+use url::Url;
 use warpui::{App, EntityId};
 
 use super::*;
 use crate::ai::blocklist::handoff::HandoffLaunchAttachments;
+use crate::ai::llms::LLMPreferences;
 use crate::test_util::terminal::initialize_app_for_terminal_view;
-use url::Url;
 
 fn attachment() -> AttachmentInput {
     AttachmentInput {
@@ -77,6 +78,10 @@ fn retry_request(prompt: impl Into<String>) -> SpawnAgentRequest {
     }
 }
 
+fn test_environment_id() -> ServerId {
+    ServerId::from(123)
+}
+
 #[test]
 fn github_auth_url_for_initial_run_includes_focus_cloud_mode_next() {
     App::test((), |mut app| async move {
@@ -98,6 +103,7 @@ fn github_auth_url_for_initial_run_includes_focus_cloud_mode_next() {
 
         model.read(&app, |model, _| {
             let auth_url = model.github_auth_url().expect("auth url should be present");
+            assert_eq!(model.github_auth_error_message(), Some("auth required"));
             let parsed = Url::parse(auth_url).expect("auth url should parse");
             let next = parsed
                 .query_pairs()
@@ -162,6 +168,59 @@ fn github_auth_completed_retries_stored_initial_run_request() {
             assert_eq!(config.worker_host.as_deref(), Some("worker-123"));
             assert_eq!(config.computer_use_enabled, Some(false));
         });
+    });
+}
+
+#[test]
+fn viewed_task_config_preserves_environment_before_cloud_model_load() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let model = add_model(&mut app);
+        let environment_id = test_environment_id();
+
+        model.update(&mut app, |model, ctx| {
+            model.apply_viewed_task_config_snapshot(
+                Some(&AgentConfigSnapshot {
+                    environment_id: Some(environment_id.to_string()),
+                    ..Default::default()
+                }),
+                ctx,
+            );
+            model.validate_environment_after_initial_load(ctx);
+        });
+
+        model.read(&app, |model, _| {
+            assert_eq!(
+                model.selected_environment_id(),
+                Some(&SyncId::ServerId(environment_id))
+            );
+        });
+    });
+}
+
+#[test]
+fn viewed_task_config_applies_oz_model_override() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let model = add_model(&mut app);
+        let terminal_view_id = model.read(&app, |model, _| model.terminal_view_id);
+
+        model.update(&mut app, |model, ctx| {
+            model.apply_viewed_task_config_snapshot(
+                Some(&AgentConfigSnapshot {
+                    model_id: Some("model-from-run".to_string()),
+                    ..Default::default()
+                }),
+                ctx,
+            );
+        });
+
+        let override_value = model.read(&app, |_, app| {
+            LLMPreferences::as_ref(app)
+                .get_base_llm_override(terminal_view_id)
+                .expect("viewed run model should be stored as a pane override")
+        });
+        assert_eq!(override_value, "\"model-from-run\"");
     });
 }
 

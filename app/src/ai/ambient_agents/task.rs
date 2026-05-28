@@ -1,7 +1,8 @@
 //! Ambient agent task types and utilities.
 
 use anyhow::anyhow;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use iso8601_duration::Duration as Iso8601Duration;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use session_sharing_protocol::common::SessionId;
 use url::Url;
@@ -9,15 +10,14 @@ use warp_cli::agent::Harness;
 use warp_core::report_error;
 use warp_core::ui::theme::WarpTheme;
 use warpui::color::ColorU;
+use warpui::{SingletonEntity, View, ViewContext};
 
+use super::AmbientAgentTaskId;
 use crate::ai::artifacts::{deserialize_artifacts, Artifact};
 use crate::server::server_api::ServerApiProvider;
 use crate::ui_components::icons::Icon;
 use crate::view_components::DismissibleToast;
 use crate::workspace::ToastStack;
-use warpui::{SingletonEntity, View, ViewContext};
-
-use super::AmbientAgentTaskId;
 
 /// Runtime configuration snapshot for agent execution.
 ///
@@ -281,6 +281,8 @@ pub struct AmbientAgentTask {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub run_time: Option<Iso8601Duration>,
     pub status_message: Option<TaskStatusMessage>,
     #[serde(default, deserialize_with = "deserialize_ambient_agent_source")]
     pub source: Option<AgentSource>,
@@ -360,9 +362,35 @@ pub struct TaskAttachment {
     pub mime_type: String,
 }
 
+/// Returns the trimmed orchestrator agent name, or `None` when empty / whitespace-only.
+pub fn normalize_orchestrator_agent_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 impl AmbientAgentTask {
     pub fn run_id(&self) -> AmbientAgentTaskId {
         self.task_id
+    }
+
+    /// Returns the short label for this task: trimmed `agent_config_snapshot.name`,
+    /// trimmed `title`, or `"Agent"`.
+    pub fn display_name(&self) -> &str {
+        if let Some(name) = self
+            .agent_config_snapshot
+            .as_ref()
+            .and_then(|c| c.name.as_deref())
+        {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+        let trimmed_title = self.title.trim();
+        if !trimmed_title.is_empty() {
+            return trimmed_title;
+        }
+        "Agent"
     }
 
     pub fn conversation_id(&self) -> Option<&str> {
@@ -433,11 +461,9 @@ impl AmbientAgentTask {
         })
     }
 
-    /// Duration from started_at to updated_at.
-    pub fn run_time(&self) -> Option<chrono::Duration> {
-        let started = self.started_at?;
-        let duration = self.updated_at.signed_duration_since(started);
-        (duration.num_seconds() >= 0).then_some(duration)
+    /// Server-reported run duration.
+    pub fn run_time(&self) -> Option<ChronoDuration> {
+        self.run_time.and_then(|run_time| run_time.to_chrono())
     }
 
     /// Creator's display name, if available.

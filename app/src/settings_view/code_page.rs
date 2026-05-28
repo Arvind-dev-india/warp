@@ -1,47 +1,7 @@
-#[cfg(feature = "local_fs")]
-use super::features::external_editor::ExternalEditorView;
-use super::{
-    flags,
-    settings_page::{
-        build_sub_header, render_body_item, render_separator, Category, MatchData, PageType,
-        SettingsPageMeta, SettingsPageViewHandle, SettingsWidget, HEADER_PADDING,
-        TOGGLE_BUTTON_RIGHT_PADDING,
-    },
-    LocalOnlyIconState, SettingsAction, SettingsSection, ToggleSettingActionPair, ToggleState,
-};
-#[cfg(not(target_family = "wasm"))]
-use crate::remote_server::codebase_index_model::{
-    RemoteCodebaseIndexModel, RemoteCodebaseIndexModelEvent, RemoteCodebaseIndexSettingsEntry,
-};
-use crate::{
-    ai::persisted_workspace::{
-        EnablementState, LspRepoStatus, PersistedWorkspace, PersistedWorkspaceEvent,
-    },
-    appearance::Appearance,
-    code::{
-        buffer_location::LocalOrRemotePath,
-        lsp_telemetry::{LspControlActionType, LspEnablementSource, LspTelemetryEvent},
-    },
-    send_telemetry_from_ctx,
-    settings::{AISettings, CodeSettings},
-    terminal::general_settings::GeneralSettings,
-    ui_components::{
-        avatar::{Avatar, AvatarContent, StatusElementTypes},
-        buttons::icon_button,
-        icons::Icon,
-    },
-    view_components::{
-        action_button::{ActionButton, SecondaryTheme},
-        DismissibleToast,
-    },
-    workspace::tab_settings::TabSettings,
-    workspace::ToastStack,
-    workspaces::{
-        update_manager::TeamUpdateManager, user_workspaces::UserWorkspaces,
-        workspace::AdminEnablementSetting,
-    },
-    TelemetryEvent,
-};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use ai::index::full_source_code_embedding::manager::{
     CodebaseIndexFinishedStatus, CodebaseIndexManager, CodebaseIndexManagerEvent,
     CodebaseIndexStatus, CodebaseIndexingError,
@@ -54,36 +14,63 @@ use lsp::{LspManagerModel, LspManagerModelEvent, LspServerModel, LspState};
 use pathfinder_color::ColorU;
 #[cfg(not(target_family = "wasm"))]
 use remote_server::codebase_index_proto::{RemoteCodebaseIndexState, RemoteCodebaseIndexStatus};
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use warp_core::{
-    features::FeatureFlag,
-    report_if_error,
-    settings::ToggleableSetting as _,
-    ui::theme::{AnsiColorIdentifier, Fill as ThemeFill},
-};
+use warp_core::features::FeatureFlag;
+use warp_core::report_if_error;
+use warp_core::settings::ToggleableSetting as _;
+use warp_core::ui::theme::{AnsiColorIdentifier, Fill as ThemeFill};
 use warp_util::path::user_friendly_path;
 #[cfg(not(target_family = "wasm"))]
 use warp_util::remote_path::RemotePath;
-use warpui::{
-    elements::{
-        ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element, Empty,
-        Expanded, Fill, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement,
-        Radius, Shrinkable,
-    },
-    fonts::Weight,
-    id,
-    keymap::ContextPredicate,
-    platform::{Cursor, FilePickerConfiguration},
-    ui_components::{
-        button::ButtonVariant,
-        components::{Coords, UiComponent, UiComponentStyles},
-        switch::{SwitchStateHandle, TooltipConfig},
-    },
-    Action, AppContext, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle,
+use warpui::elements::{
+    ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element, Empty,
+    Expanded, Fill, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Radius,
+    Shrinkable,
 };
+use warpui::fonts::Weight;
+use warpui::keymap::ContextPredicate;
+use warpui::platform::{Cursor, FilePickerConfiguration};
+use warpui::ui_components::button::ButtonVariant;
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
+use warpui::ui_components::switch::{SwitchStateHandle, TooltipConfig};
+use warpui::{
+    id, Action, AppContext, Entity, ModelHandle, SingletonEntity, TypedActionView, View,
+    ViewContext, ViewHandle,
+};
+
+#[cfg(feature = "local_fs")]
+use super::features::external_editor::ExternalEditorView;
+use super::settings_page::{
+    build_sub_header, render_body_item, render_separator, Category, MatchData, PageType,
+    SettingsPageMeta, SettingsPageViewHandle, SettingsWidget, HEADER_PADDING,
+    TOGGLE_BUTTON_RIGHT_PADDING,
+};
+use super::{
+    flags, LocalOnlyIconState, SettingsAction, SettingsSection, ToggleSettingActionPair,
+    ToggleState,
+};
+use crate::ai::persisted_workspace::{
+    EnablementState, LspRepoStatus, PersistedWorkspace, PersistedWorkspaceEvent,
+};
+use crate::appearance::Appearance;
+use crate::code::buffer_location::LocalOrRemotePath;
+use crate::code::lsp_telemetry::{LspControlActionType, LspEnablementSource, LspTelemetryEvent};
+#[cfg(not(target_family = "wasm"))]
+use crate::remote_server::codebase_index_model::{
+    RemoteCodebaseIndexModel, RemoteCodebaseIndexModelEvent, RemoteCodebaseIndexSettingsEntry,
+};
+use crate::settings::{AISettings, CodeSettings};
+use crate::terminal::general_settings::GeneralSettings;
+use crate::ui_components::avatar::{Avatar, AvatarContent, StatusElementTypes};
+use crate::ui_components::buttons::icon_button;
+use crate::ui_components::icons::Icon;
+use crate::view_components::action_button::{ActionButton, SecondaryTheme};
+use crate::view_components::DismissibleToast;
+use crate::workspace::tab_settings::TabSettings;
+use crate::workspace::ToastStack;
+use crate::workspaces::update_manager::TeamUpdateManager;
+use crate::workspaces::user_workspaces::UserWorkspaces;
+use crate::workspaces::workspace::AdminEnablementSetting;
+use crate::{send_telemetry_from_ctx, TelemetryEvent};
 
 const MAIN_SECTION_MARGIN: f32 = 12.;
 const SUB_SECTION_MARGIN: f32 = 8.;
@@ -102,6 +89,9 @@ const INDEXING_WORKSPACE_ENABLED_ADMIN_TEXT: &str = "Team admins have enabled co
 const INDEXING_DISABLED_GLOBAL_AI_TEXT: &str =
     "AI Features must be enabled to use codebase indexing.";
 const CODEBASE_INDEX_LIMIT_REACHED: &str = "You have reached the maximum number of codebase indices for your plan. Delete existing indices to auto-index new codebases.";
+#[cfg(not(target_family = "wasm"))]
+const REMOTE_CODEBASE_INDEX_LIMIT_REACHED_FAILURE: &str =
+    "maximum number of codebase indexes has been reached";
 
 /// Identifies which subpage of the Code settings the user is viewing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +116,53 @@ impl CodeSubpage {
             Self::Indexing => "Codebase Indexing",
             Self::EditorAndCodeReview => "Editor and Code Review",
         }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn remote_codebase_index_limit_reached(status: &RemoteCodebaseIndexStatus) -> bool {
+    status
+        .failure_message
+        .as_deref()
+        .is_some_and(|message| message.contains(REMOTE_CODEBASE_INDEX_LIMIT_REACHED_FAILURE))
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use remote_server::codebase_index_proto::{
+        RemoteCodebaseIndexState, RemoteCodebaseIndexStatus,
+    };
+
+    use super::remote_codebase_index_limit_reached;
+
+    fn remote_status_with_failure(failure_message: Option<&str>) -> RemoteCodebaseIndexStatus {
+        RemoteCodebaseIndexStatus {
+            repo_path: "/workspaces/repo".to_string(),
+            state: RemoteCodebaseIndexState::Unavailable,
+            last_updated_epoch_millis: Some(1),
+            progress_completed: None,
+            progress_total: None,
+            failure_message: failure_message.map(ToOwned::to_owned),
+            root_hash: None,
+        }
+    }
+
+    #[test]
+    fn remote_index_limit_failure_is_detected_from_status_message() {
+        let status = remote_status_with_failure(Some(
+            "Cannot index remote codebase because the maximum number of codebase indexes has been reached.",
+        ));
+
+        assert!(remote_codebase_index_limit_reached(&status));
+    }
+
+    #[test]
+    fn other_unavailable_failures_are_not_index_limit_failures() {
+        let status = remote_status_with_failure(Some(
+            "Cannot index remote codebase because indexing did not start.",
+        ));
+
+        assert!(!remote_codebase_index_limit_reached(&status));
     }
 }
 
@@ -155,10 +192,19 @@ struct IndexingStatusPresentation {
     text: Cow<'static, str>,
     color: ColorU,
     icon: Option<Icon>,
-    show_retry: bool,
+    refresh_action: Option<IndexingRefreshAction>,
     show_delete: bool,
 }
 
+#[derive(Clone)]
+enum IndexingRefreshAction {
+    /// Remote rows use the same refresh icon for both "create an index for this remote path" and
+    /// "refresh an existing index". Missing or disabled remote indexes need a request/create call
+    /// because resync only applies once the daemon already has index state for that path.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    RequestRemote,
+    Resync,
+}
 pub struct CodeSettingsPageView {
     page: PageType<Self>,
     active_subpage: Option<CodeSubpage>,
@@ -192,7 +238,11 @@ impl CodeSettingsPageView {
             .count();
 
         ctx.subscribe_to_model(&index_manager, |me, index, event, ctx| {
-            if let CodebaseIndexManagerEvent::SyncStateUpdated = event {
+            if matches!(
+                event,
+                CodebaseIndexManagerEvent::SyncStateUpdated { .. }
+                    | CodebaseIndexManagerEvent::NewIndexCreated { .. }
+            ) {
                 let codebase_count = index.as_ref(ctx).get_codebase_index_statuses(ctx).count();
 
                 // Only update mouse states if the number of codebases changed
@@ -580,6 +630,8 @@ pub enum CodeSettingsPageAction {
     ManualResync(PathBuf),
     DeleteIndex(PathBuf),
     #[cfg(not(target_family = "wasm"))]
+    RequestRemoteIndex(RemotePath),
+    #[cfg(not(target_family = "wasm"))]
     ManualResyncRemote(RemotePath),
     #[cfg(not(target_family = "wasm"))]
     DeleteRemoteIndex(RemotePath),
@@ -682,9 +734,15 @@ impl TypedActionView for CodeSettingsPageView {
                 });
             }
             #[cfg(not(target_family = "wasm"))]
-            CodeSettingsPageAction::ManualResyncRemote(remote_path) => {
+            CodeSettingsPageAction::RequestRemoteIndex(remote_path) => {
                 RemoteCodebaseIndexModel::handle(ctx).update(ctx, |model, ctx| {
                     model.request_index(remote_path.clone(), ctx);
+                });
+            }
+            #[cfg(not(target_family = "wasm"))]
+            CodeSettingsPageAction::ManualResyncRemote(remote_path) => {
+                RemoteCodebaseIndexModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.resync_index(remote_path.clone(), ctx);
                 });
             }
             #[cfg(not(target_family = "wasm"))]
@@ -909,6 +967,54 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             app,
         );
     }
+
+    if FeatureFlag::OpenWarpNewSettingsModes.is_enabled() {
+        ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(
+            vec![
+                ToggleSettingActionPair::new(
+                    "auto open code review panel",
+                    builder(SettingsAction::Code(
+                        CodeSettingsPageAction::ToggleAutoOpenCodeReviewPane,
+                    )),
+                    context,
+                    flags::AUTO_OPEN_CODE_REVIEW_PANE_FLAG,
+                ),
+                ToggleSettingActionPair::new(
+                    "code review button",
+                    builder(SettingsAction::Code(
+                        CodeSettingsPageAction::ToggleCodeReviewPanel,
+                    )),
+                    context,
+                    flags::SHOW_CODE_REVIEW_BUTTON_FLAG,
+                ),
+                ToggleSettingActionPair::new(
+                    "diff stats on code review button",
+                    builder(SettingsAction::Code(
+                        CodeSettingsPageAction::ToggleShowCodeReviewDiffStats,
+                    )),
+                    context,
+                    flags::SHOW_CODE_REVIEW_DIFF_STATS_FLAG,
+                ),
+                ToggleSettingActionPair::new(
+                    "project explorer",
+                    builder(SettingsAction::Code(
+                        CodeSettingsPageAction::ToggleProjectExplorer,
+                    )),
+                    context,
+                    flags::SHOW_PROJECT_EXPLORER,
+                ),
+                ToggleSettingActionPair::new(
+                    "global file search",
+                    builder(SettingsAction::Code(
+                        CodeSettingsPageAction::ToggleGlobalSearch,
+                    )),
+                    context,
+                    flags::SHOW_GLOBAL_SEARCH,
+                ),
+            ],
+            app,
+        );
+    }
 }
 
 struct CodePageWidget {
@@ -998,7 +1104,13 @@ impl CodePageWidget {
             UserWorkspaces::as_ref(app).is_codebase_context_enabled(app);
 
         let mut rows = vec![
-            self.render_autoindex_row(auto_indexing_enabled, appearance),
+            self.render_autoindex_row(
+                AUTO_INDEX_FEATURE_NAME,
+                self.auto_index_switch_state.clone(),
+                auto_indexing_enabled,
+                CodeSettingsPageAction::ToggleAutoIndexing,
+                appearance,
+            ),
             // Use subtext styling for description (gray color per Figma)
             self.render_settings_subtext(
                 codebase_indexing_enabled,
@@ -1026,7 +1138,10 @@ impl CodePageWidget {
 
     fn render_autoindex_row(
         &self,
+        label: &'static str,
+        switch_state: SwitchStateHandle,
         auto_indexing_enabled: bool,
+        action: CodeSettingsPageAction,
         appearance: &Appearance,
     ) -> Box<dyn Element> {
         let ui_builder = appearance.ui_builder();
@@ -1038,7 +1153,7 @@ impl CodePageWidget {
                 .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
                 .with_child(
                     ui_builder
-                        .span(AUTO_INDEX_FEATURE_NAME)
+                        .span(label)
                         .with_style(UiComponentStyles {
                             font_size: Some(16.0),
                             font_weight: Some(Weight::Semibold),
@@ -1051,13 +1166,11 @@ impl CodePageWidget {
                 .with_child(
                     Container::new(
                         ui_builder
-                            .switch(self.auto_index_switch_state.clone())
+                            .switch(switch_state)
                             .check(auto_indexing_enabled)
                             .build()
                             .on_click(move |ctx, _, _| {
-                                ctx.dispatch_typed_action(
-                                    CodeSettingsPageAction::ToggleAutoIndexing,
-                                );
+                                ctx.dispatch_typed_action(action.clone());
                             })
                             .finish(),
                     )
@@ -1635,7 +1748,7 @@ impl CodePageWidget {
                 text: Cow::from("No index created"),
                 color: theme.disabled_ui_text_color().into_solid(),
                 icon: Some(Icon::SlashCircle),
-                show_retry: false,
+                refresh_action: None,
                 show_delete: false,
             };
         };
@@ -1656,7 +1769,7 @@ impl CodePageWidget {
                 text,
                 color: theme.disabled_ui_text_color().into_solid(),
                 icon: None,
-                show_retry: false,
+                refresh_action: None,
                 show_delete: true,
             };
         }
@@ -1688,7 +1801,7 @@ impl CodePageWidget {
                 text: Cow::from(text),
                 color,
                 icon: Some(icon),
-                show_retry: true,
+                refresh_action: Some(IndexingRefreshAction::Resync),
                 show_delete: true,
             };
         }
@@ -1698,7 +1811,7 @@ impl CodePageWidget {
             text: Cow::from("No index built"),
             color: theme.nonactive_ui_text_color().into_solid(),
             icon: None,
-            show_retry: false,
+            refresh_action: None,
             show_delete: true,
         }
     }
@@ -1716,28 +1829,43 @@ impl CodePageWidget {
                 text: Cow::from("No index created"),
                 color: theme.disabled_ui_text_color().into_solid(),
                 icon: Some(Icon::SlashCircle),
-                show_retry: true,
+                refresh_action: Some(IndexingRefreshAction::RequestRemote),
                 show_delete: true,
             },
-            RemoteCodebaseIndexState::Unavailable => IndexingStatusPresentation {
-                text: Cow::from("Unavailable"),
-                color: theme.disabled_ui_text_color().into_solid(),
-                icon: Some(Icon::SlashCircle),
-                show_retry: false,
-                show_delete: true,
-            },
+            RemoteCodebaseIndexState::Unavailable => {
+                let limit_reached = remote_codebase_index_limit_reached(status);
+                IndexingStatusPresentation {
+                    text: Cow::from(if limit_reached {
+                        "Index limit reached"
+                    } else {
+                        "Unavailable"
+                    }),
+                    color: if limit_reached {
+                        theme.ui_warning_color()
+                    } else {
+                        theme.disabled_ui_text_color().into_solid()
+                    },
+                    icon: Some(if limit_reached {
+                        Icon::AlertTriangle
+                    } else {
+                        Icon::SlashCircle
+                    }),
+                    refresh_action: Some(IndexingRefreshAction::RequestRemote),
+                    show_delete: true,
+                }
+            }
             RemoteCodebaseIndexState::Disabled => IndexingStatusPresentation {
                 text: Cow::from("Disabled"),
                 color: theme.disabled_ui_text_color().into_solid(),
                 icon: Some(Icon::SlashCircle),
-                show_retry: true,
+                refresh_action: Some(IndexingRefreshAction::RequestRemote),
                 show_delete: true,
             },
             RemoteCodebaseIndexState::Queued => IndexingStatusPresentation {
                 text: Cow::from("Queued"),
                 color: theme.disabled_ui_text_color().into_solid(),
                 icon: None,
-                show_retry: false,
+                refresh_action: None,
                 show_delete: true,
             },
             RemoteCodebaseIndexState::Indexing => {
@@ -1754,7 +1882,7 @@ impl CodePageWidget {
                     text,
                     color: theme.disabled_ui_text_color().into_solid(),
                     icon: None,
-                    show_retry: false,
+                    refresh_action: None,
                     show_delete: true,
                 }
             }
@@ -1762,21 +1890,21 @@ impl CodePageWidget {
                 text: Cow::from("Synced"),
                 color: theme.ansi_fg_green(),
                 icon: Some(Icon::Check),
-                show_retry: true,
+                refresh_action: Some(IndexingRefreshAction::Resync),
                 show_delete: true,
             },
             RemoteCodebaseIndexState::Stale => IndexingStatusPresentation {
                 text: Cow::from("Stale"),
                 color: theme.nonactive_ui_detail().into_solid(),
                 icon: Some(Icon::ClockRefresh),
-                show_retry: true,
+                refresh_action: Some(IndexingRefreshAction::Resync),
                 show_delete: true,
             },
             RemoteCodebaseIndexState::Failed => IndexingStatusPresentation {
                 text: Cow::from("Failed"),
                 color: theme.ui_error_color(),
                 icon: Some(Icon::AlertTriangle),
-                show_retry: true,
+                refresh_action: Some(IndexingRefreshAction::Resync),
                 show_delete: true,
             },
         }
@@ -1830,7 +1958,7 @@ impl CodePageWidget {
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(4.);
-        if presentation.show_retry {
+        if let Some(refresh_action) = presentation.refresh_action {
             if let Some(action_target) = action_target.clone() {
                 buttons_row.add_child(
                     icon_button(appearance, Icon::Refresh, false, manual_resync_mouse_state)
@@ -1839,20 +1967,37 @@ impl CodePageWidget {
                             ..Default::default()
                         })
                         .build()
-                        .on_click(move |ctx, _, _| match &action_target {
-                            LocalOrRemotePath::Local(codebase_path) => {
+                        .on_click(move |ctx, _, _| match (&action_target, &refresh_action) {
+                            (
+                                LocalOrRemotePath::Local(codebase_path),
+                                IndexingRefreshAction::Resync,
+                            ) => {
                                 ctx.dispatch_typed_action(CodeSettingsPageAction::ManualResync(
                                     codebase_path.clone(),
                                 ));
                             }
+                            (LocalOrRemotePath::Local(_), IndexingRefreshAction::RequestRemote) => {
+                            }
                             #[cfg(not(target_family = "wasm"))]
-                            LocalOrRemotePath::Remote(remote_path) => {
+                            (
+                                LocalOrRemotePath::Remote(remote_path),
+                                IndexingRefreshAction::Resync,
+                            ) => {
                                 ctx.dispatch_typed_action(
                                     CodeSettingsPageAction::ManualResyncRemote(remote_path.clone()),
                                 );
                             }
+                            #[cfg(not(target_family = "wasm"))]
+                            (
+                                LocalOrRemotePath::Remote(remote_path),
+                                IndexingRefreshAction::RequestRemote,
+                            ) => {
+                                ctx.dispatch_typed_action(
+                                    CodeSettingsPageAction::RequestRemoteIndex(remote_path.clone()),
+                                );
+                            }
                             #[cfg(target_family = "wasm")]
-                            LocalOrRemotePath::Remote(_) => {}
+                            (LocalOrRemotePath::Remote(_), _) => {}
                         })
                         .finish(),
                 );

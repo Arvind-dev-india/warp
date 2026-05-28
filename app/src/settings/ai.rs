@@ -6,32 +6,32 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use cfg_if::cfg_if;
+use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
+use lazy_static::lazy_static;
+use regex::Regex;
+use serde::de::Deserializer;
+use serde::{Deserialize, Serialize};
+use settings::{
+    define_settings_group, RespectUserSyncSetting, Setting, SupportedPlatforms, SyncToCloud,
+};
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
+use warp_core::execution_mode::AppExecutionMode;
+use warp_core::features::FeatureFlag;
+use warpui::platform::keyboard::KeyCode;
+use warpui::platform::OperatingSystem;
+use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity, UpdateModel};
 
+use crate::ai::agent::conversation::AIConversation;
+use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::ai::request_usage_model::RequestLimitInfo;
 use crate::auth::AuthStateProvider;
 use crate::report_if_error;
 use crate::settings::PrivacySettings;
 use crate::terminal::CLIAgent;
 use crate::workspaces::user_workspaces::UserWorkspaces;
-use cfg_if::cfg_if;
-use chrono::{DateTime, Utc};
-use lazy_static::lazy_static;
-use regex::Regex;
-use warpui::platform::OperatingSystem;
-use warpui::{
-    platform::keyboard::KeyCode, AppContext, Entity, ModelContext, SingletonEntity, UpdateModel,
-};
-
-use settings::{
-    define_settings_group, RespectUserSyncSetting, Setting, SupportedPlatforms, SyncToCloud,
-};
-use warp_core::execution_mode::AppExecutionMode;
-use warp_core::features::FeatureFlag;
-
-use serde::{de::Deserializer, Deserialize, Serialize};
-use strum::IntoEnumIterator;
-use strum_macros::EnumIter;
 
 pub enum FocusedTerminalInfoEvent {
     TerminalInfoUpdated,
@@ -1218,6 +1218,16 @@ define_settings_group!(AISettings, settings: [
         toml_path: "agents.warp_agent.other.should_show_oz_updates_in_zero_state",
         description: "Whether the \"What's new\" section is shown in the agent view.",
     }
+    // Controls whether Warp's built-in feedback skill is available to the Warp Agent.
+    feedback_bundled_skill_enabled: FeedbackBundledSkillEnabled {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "agents.warp_agent.other.feedback_bundled_skill_enabled",
+        description: "Whether Warp's built-in feedback skill is available to the Warp Agent.",
+    }
 
     // Whether or not the user has enabled fallback to Warp credits for user-provided models.
     can_use_warp_credits_for_fallback: CanUseWarpCreditsForFallback {
@@ -1493,6 +1503,16 @@ define_settings_group!(AISettings, settings: [
         toml_path: "agents.warp_agent.other.should_force_disable_ampersand_handoff",
         description: "Whether to force-disable the & prefix for cloud handoff compose mode.",
     }
+
+    auto_handoff_on_sleep_enabled: AutoHandoffOnSleepEnabled {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::MAC,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "agents.warp_agent.other.auto_handoff_on_sleep_enabled",
+        description: "Whether Warp automatically hands off local agent conversations to cloud when the computer is about to sleep.",
+    }
 ]);
 
 impl AISettings {
@@ -1695,9 +1715,53 @@ impl AISettings {
             crate::workspaces::workspace::AdminEnablementSetting::Disable
         )
     }
+    pub fn is_cloud_handoff_enabled_for_conversation(
+        &self,
+        conversation: Option<&AIConversation>,
+        app: &warpui::AppContext,
+    ) -> bool {
+        self.is_cloud_handoff_enabled(app)
+            && !conversation
+                .is_some_and(|conversation| is_orchestration_conversation(conversation, app))
+    }
+
+    pub fn is_cloud_handoff_enabled_for_terminal_view(
+        &self,
+        terminal_view_id: EntityId,
+        app: &warpui::AppContext,
+    ) -> bool {
+        let active_conversation =
+            BlocklistAIHistoryModel::as_ref(app).active_conversation(terminal_view_id);
+        self.is_cloud_handoff_enabled_for_conversation(active_conversation, app)
+    }
 
     pub fn is_ampersand_handoff_enabled(&self, app: &warpui::AppContext) -> bool {
         self.is_cloud_handoff_enabled(app) && !*self.should_force_disable_ampersand_handoff
+    }
+    pub fn is_ampersand_handoff_enabled_for_conversation(
+        &self,
+        conversation: Option<&AIConversation>,
+        app: &warpui::AppContext,
+    ) -> bool {
+        self.is_cloud_handoff_enabled_for_conversation(conversation, app)
+            && !*self.should_force_disable_ampersand_handoff
+    }
+
+    pub fn is_ampersand_handoff_enabled_for_terminal_view(
+        &self,
+        terminal_view_id: EntityId,
+        app: &warpui::AppContext,
+    ) -> bool {
+        self.is_cloud_handoff_enabled_for_terminal_view(terminal_view_id, app)
+            && !*self.should_force_disable_ampersand_handoff
+    }
+
+    pub fn is_auto_handoff_on_sleep_enabled(&self, app: &warpui::AppContext) -> bool {
+        self.is_cloud_handoff_enabled(app)
+            && self
+                .auto_handoff_on_sleep_enabled
+                .is_supported_on_current_platform()
+            && *self.auto_handoff_on_sleep_enabled
     }
 
     /// Determines whether a quota reset banner should be displayed to the user.
@@ -1852,6 +1916,10 @@ impl AISettings {
         self.is_any_ai_enabled(app)
     }
 
+    pub fn is_run_agents_permissions_editable(&self, app: &AppContext) -> bool {
+        self.is_orchestration_enabled(app)
+    }
+
     pub fn show_code_suggestion_speedbump(&self, app: &AppContext) -> bool {
         self.is_any_ai_enabled(app) && *self.show_code_suggestion_speedbump
     }
@@ -1982,6 +2050,12 @@ impl AISettings {
     }
 }
 
+fn is_orchestration_conversation(conversation: &AIConversation, app: &AppContext) -> bool {
+    conversation.has_parent_agent()
+        || !BlocklistAIHistoryModel::as_ref(app)
+            .child_conversation_ids_of(&conversation.id())
+            .is_empty()
+}
 /// Singleton model that caches compiled regexes for the `cli_agent_footer_enabled_commands`
 /// setting. Each entry pairs a compiled regex with the CLI agent it maps to.
 pub struct CompiledCommandsForCodingAgentToolbar {

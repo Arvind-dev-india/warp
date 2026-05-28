@@ -12,17 +12,8 @@ use serde_json::{Map, Value};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 use warp_cli::agent::Harness;
-use warpui::{ModelHandle, ModelSpawner};
-
-use crate::ai::agent::conversation::AIConversationId;
-use crate::ai::ambient_agents::{task::HarnessModelConfig, AmbientAgentTaskId};
-use crate::ai::mcp::JSONTransportType;
-use crate::server::server_api::harness_support::{upload_to_target, HarnessSupportClient};
-use crate::server::server_api::ServerApi;
-use crate::terminal::model::block::BlockId;
-use crate::terminal::model::session::ExecuteCommandOptions;
-use crate::terminal::CLIAgent;
 use warp_managed_secrets::ManagedSecretValue;
+use warpui::{ModelHandle, ModelSpawner};
 
 use super::super::terminal::{CommandHandle, TerminalDriver};
 use super::super::{AgentDriver, AgentDriverError};
@@ -35,26 +26,38 @@ use super::{
     cli_agent_session_status, write_temp_file, HarnessCleanupDisposition, HarnessRunner,
     JSONMCPServer, ResumePayload, SavePoint, ThirdPartyHarness,
 };
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent_sdk::setup_observability::{SetupClientEventReporter, SetupStep};
+use crate::ai::ambient_agents::task::HarnessModelConfig;
+use crate::ai::ambient_agents::AmbientAgentTaskId;
+use crate::ai::mcp::JSONTransportType;
+use crate::server::server_api::harness_support::{upload_to_target, HarnessSupportClient};
+use crate::server::server_api::ServerApi;
+use crate::terminal::model::block::BlockId;
+use crate::terminal::model::session::ExecuteCommandOptions;
+use crate::terminal::CLIAgent;
 mod parent_bridge;
 mod wake_driver;
 
-#[cfg(test)]
-use super::super::OZ_MESSAGE_LISTENER_STATE_ROOT_ENV;
 #[cfg(test)]
 use parent_bridge::{
     acknowledge_parent_bridge_hook_output, ensure_parent_bridge_state_dir,
     parent_bridge_char_count, parent_bridge_event_cursor_file, parent_bridge_hook_output_ack_file,
     parent_bridge_hook_output_file, parent_bridge_root, parent_bridge_staged_message_path,
     parent_bridge_surfaced_message_path, prepare_parent_bridge_hook_output,
-    read_parent_bridge_event_cursor, render_parent_bridge_message_block,
-    stage_parent_bridge_message, write_parent_bridge_event_cursor, MessageBridgeHookOutput,
-    MessageBridgeMessageRecord, MESSAGE_BRIDGE_CONTEXT_PREAMBLE,
+    prime_parent_bridge_for_wake, read_parent_bridge_event_cursor,
+    render_parent_bridge_message_block, stage_parent_bridge_message,
+    write_parent_bridge_event_cursor, MessageBridgeHookOutput, MessageBridgeMessageRecord,
+    MESSAGE_BRIDGE_CONTEXT_PREAMBLE,
 };
 use parent_bridge::{MessageBridge, MessageBridgeCleanupDisposition};
 #[cfg(test)]
 use shell_words::quote as shell_quote;
 #[cfg(test)]
 use wake_driver::{ClaudeWakeRemoteContext, CLAUDE_WAKE_PROMPT_FILE_NAME};
+
+#[cfg(test)]
+use super::super::OZ_MESSAGE_LISTENER_STATE_ROOT_ENV;
 
 pub(crate) struct ClaudeHarness;
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
@@ -70,6 +73,35 @@ impl ThirdPartyHarness for ClaudeHarness {
 
     fn install_docs_url(&self) -> Option<&'static str> {
         Some("https://code.claude.com/docs/en/quickstart")
+    }
+
+    fn auth_check_command(&self) -> Option<String> {
+        let cli = self.cli_agent().command_prefix();
+        Some(format!("{cli} auth status --json"))
+    }
+
+    fn runtime_error_patterns(&self) -> &'static [&'static str] {
+        &[
+            // Out-of-credits / billing.
+            "Credit balance too low",
+            // Plan/usage limits emitted as `You've hit your <kind> limit`.
+            // We match on the common prefix so the variants (session,
+            // weekly, Opus, etc.) all hit.
+            "You've hit your",
+            // Invalid or malformed API key.
+            "Invalid API key",
+            "This organization has been disabled",
+            "belongs to a disabled organization",
+            // OAuth / login state.
+            "Not logged in",
+            "OAuth token revoked",
+            "OAuth token has expired",
+            // Routines disabled by org policy.
+            "Routines are disabled by your organization's policy",
+            // Generic upstream API failures Claude Code surfaces verbatim.
+            "API Error: Request rejected (429)",
+            "authentication_error",
+        ]
     }
 
     /// Fetch the Claude Code transcript for the current task's conversation and wrap it
@@ -414,9 +446,14 @@ impl ClaudeHarnessRunner {
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl HarnessRunner for ClaudeHarnessRunner {
+    fn harness_name(&self) -> &str {
+        &self.cli_name
+    }
+
     async fn start(
         &self,
         foreground: &ModelSpawner<AgentDriver>,
+        setup_events: &SetupClientEventReporter,
     ) -> Result<CommandHandle, AgentDriverError> {
         // When resuming, we already have a server conversation id from the prior run.
         // Otherwise create a fresh external conversation record for this run.
@@ -428,14 +465,17 @@ impl HarnessRunner for ClaudeHarnessRunner {
                 id
             }
             None => {
-                let id = self
-                    .client
-                    .create_external_conversation(CLAUDE_CODE_FORMAT)
-                    .await
-                    .map_err(|e| {
-                        log::error!("Failed to create external conversation: {e}");
-                        AgentDriverError::ConfigBuildFailed(e)
-                    })?;
+                let id = setup_events
+                    .record_result(SetupStep::ThirdPartyHarnessExternalConversation, async {
+                        self.client
+                            .create_external_conversation(CLAUDE_CODE_FORMAT)
+                            .await
+                            .map_err(|e| {
+                                log::error!("Failed to create external conversation: {e}");
+                                AgentDriverError::ConfigBuildFailed(e)
+                            })
+                    })
+                    .await?;
                 log::info!("Created external conversation {id}");
                 id
             }

@@ -10,15 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tempfile::NamedTempFile;
 use warp_cli::agent::Harness;
-use warpui::{ModelHandle, ModelSpawner};
-
-use crate::ai::agent::conversation::AIConversationId;
-use crate::ai::ambient_agents::{task::HarnessModelConfig, AmbientAgentTaskId};
-use crate::server::server_api::harness_support::HarnessSupportClient;
-use crate::server::server_api::ServerApi;
-use crate::terminal::model::block::BlockId;
-use crate::terminal::CLIAgent;
 use warp_managed_secrets::ManagedSecretValue;
+use warpui::{ModelHandle, ModelSpawner};
 
 use super::super::terminal::{CommandHandle, TerminalDriver};
 use super::super::{AgentDriver, AgentDriverError};
@@ -27,6 +20,14 @@ use super::{
     write_temp_file, HarnessCleanupDisposition, HarnessRunner, JSONMCPServer, ResumePayload,
     SavePoint, ThirdPartyHarness,
 };
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent_sdk::setup_observability::{SetupClientEventReporter, SetupStep};
+use crate::ai::ambient_agents::task::HarnessModelConfig;
+use crate::ai::ambient_agents::AmbientAgentTaskId;
+use crate::server::server_api::harness_support::HarnessSupportClient;
+use crate::server::server_api::ServerApi;
+use crate::terminal::model::block::BlockId;
+use crate::terminal::CLIAgent;
 
 pub(crate) struct GeminiHarness;
 
@@ -112,6 +113,8 @@ enum GeminiRunnerState {
 
 struct GeminiHarnessRunner {
     command: String,
+    /// The CLI name used to invoke Gemini.
+    cli_name: String,
     /// Held so the temp file is cleaned up when the runner is dropped.
     _temp_prompt_file: NamedTempFile,
     client: Arc<dyn HarnessSupportClient>,
@@ -133,6 +136,7 @@ impl GeminiHarnessRunner {
 
         Ok(Self {
             command: gemini_command(cli_command, &prompt_path),
+            cli_name: cli_command.to_string(),
             _temp_prompt_file: temp_file,
             client,
             terminal_driver,
@@ -144,19 +148,27 @@ impl GeminiHarnessRunner {
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl HarnessRunner for GeminiHarnessRunner {
+    fn harness_name(&self) -> &str {
+        &self.cli_name
+    }
+
     async fn start(
         &self,
         foreground: &ModelSpawner<AgentDriver>,
+        setup_events: &SetupClientEventReporter,
     ) -> Result<CommandHandle, AgentDriverError> {
         // Create the external conversation record on the server.
-        let conversation_id = self
-            .client
-            .create_external_conversation(GEMINI_CLI_FORMAT)
-            .await
-            .map_err(|e| {
-                log::error!("Failed to create external conversation: {e}");
-                AgentDriverError::ConfigBuildFailed(e)
-            })?;
+        let conversation_id = setup_events
+            .record_result(SetupStep::ThirdPartyHarnessExternalConversation, async {
+                self.client
+                    .create_external_conversation(GEMINI_CLI_FORMAT)
+                    .await
+                    .map_err(|e| {
+                        log::error!("Failed to create external conversation: {e}");
+                        AgentDriverError::ConfigBuildFailed(e)
+                    })
+            })
+            .await?;
         log::info!("Created external conversation {conversation_id}");
 
         let command = self.command.clone();

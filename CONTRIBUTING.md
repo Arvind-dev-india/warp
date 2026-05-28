@@ -11,6 +11,7 @@ Thanks for helping improve Warp! This guide explains how to open issues, propose
 - Feature requests must be marked `ready-to-spec` or `ready-to-implement` before PRs are accepted.
 - Specs are the place where technical and design discussion on larger issues happen.
 - Oz automatically triages incoming issues and reviews open PRs.
+- Implementation PRs must include proof of manual testing.
 
 ## How Contributing to Warp Works
 
@@ -111,11 +112,27 @@ You **do not need to manually request reviewers**. Oz is auto-assigned to PRs th
 
 After you push changes that address Oz's feedback, comment `/oz-review` on the PR to request a re-review — you can do this up to **three times** per PR. If something looks stuck or you need more reviews than that, mention **@oss-maintainers** on the PR to escalate to the team.
 
+**You must include proof of [manual testing](#manual-testing)**. For small, isolated, and visual changes, you should include **before and after screenshots**. For larger, broad, or interactive changes, you should also include a **narrated screen recording**.
+
+If a maintainer requests changes to your PR, you will need to request `/oz-review` again and pass it before a re-review can be requested. Oz will request the re-review for you automatically once you pass its reviews.
+
+### PRs opened without a linked issue
+
+We require PRs to be linked to an associated issue. This is where problems get scoped, [readiness labels](#readiness-labels) get applied, and some features go through a [spec phase](#opening-a-spec-pr) before any code is written. See the [Contribution Flow](#contribution-flow) for the full picture.
+
+That said, if you open a PR ahead of the standard issue workflow, here's what we recommend:
+
+First, **search for a related issue.** Due to the volume of issues we receive, there's often an existing issue for a given feature or bug fix. If you find one, link it in your PR description. Ideally, this issue will have been reviewed by a maintainer with a [readiness label](#readiness-labels) applied. If you do not find a related issue, file an issue describing what your PR resolves. Once a maintainer has reviewed the issue and associated PR, we can apply a readiness label to unblock final checks.
+
+Then, **ensure your PR passes code review and includes relevant tests** per our [Opening a Code PR guide.](#opening-a-code-pr) If code review passes and relevant tests are present, that's high signal for us to review your work sooner.
+
 ## Using a Coding Agent
 
 You can use **any coding agent** to implement a contribution — for example, Warp's built-in agent, Claude Code, Codex, Gemini CLI, or others — or no agent at all. This repository ships agent-readable context (skills under [`.agents/skills/`](.agents/skills/), specs under [`specs/`](specs/), and [`WARP.md`](WARP.md)) that any harness supporting these formats can pick up.
 
 If you'd rather have an **Oz cloud agent** implement a ready issue for you, mention **@oss-maintainers** on the issue to request it. Approved requests run **for free** on complimentary Oz credits — you don't need to set up your own Oz account or pay for compute.
+
+While you can use coding agents for implementation, we expect contributors to **collaborate with us personally**. This means that you should not be using agents like OpenClaw to engage in conversation with our team. Our maintainers will always talk to you as a human, so please talk to us as a human as well.
 
 ## Code Review
 
@@ -141,7 +158,7 @@ cargo run            # build and run Warp
 Tests are required for most code changes:
 
 ### Manual Testing
-Manual testing is required for changes that can be manually tested, and almost all changes can be manually tested. If your change can be manually tested, please include screenshots or a screen recording that show it working end to end in the PR description.
+Manual testing is required for changes that can be manually tested, and almost all changes can be manually tested. For small, isolated, and visual changes, you should include **before and after screenshots**. For larger, broad, or interactive changes, you should also include a **narrated screen recording**.
 
 You can run the app locally using `./script/run` - see [WARP.md](WARP.md) for more details on how to get set up.
 

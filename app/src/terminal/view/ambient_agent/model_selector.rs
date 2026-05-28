@@ -1,24 +1,23 @@
 use std::sync::Arc;
 
 use pathfinder_geometry::vector::vec2f;
+use settings::Setting as _;
 use warp_cli::agent::Harness;
+use warp_core::ui::appearance::Appearance;
+use warp_core::ui::theme::color::internal_colors;
+use warp_core::ui::theme::Fill;
+use warp_editor::editor::NavigationKey;
+use warpui::elements::{
+    Border, ChildAnchor, ChildView, Container, OffsetPositioning, ParentAnchor, ParentElement as _,
+    ParentOffsetBounds, Stack,
+};
 use warpui::{
-    elements::{
-        Border, ChildAnchor, ChildView, Container, OffsetPositioning, ParentAnchor,
-        ParentElement as _, ParentOffsetBounds, Stack,
-    },
     AppContext, Element, Entity, EntityId, ModelHandle, SingletonEntity, TypedActionView, View,
     ViewContext, ViewHandle,
 };
 
-use warp_core::ui::appearance::Appearance;
-use warp_core::ui::theme::color::internal_colors;
-use warp_core::ui::theme::Fill;
-
-use settings::Setting as _;
-
 use crate::ai::blocklist::agent_view::agent_input_footer::AgentInputButtonTheme;
-use crate::ai::cloud_agent_settings::{CloudAgentSettings, HarnessModelSelection};
+use crate::ai::cloud_agent_settings::CloudAgentSettings;
 use crate::ai::execution_profiles::model_menu_items::is_auto;
 use crate::ai::harness_availability::{HarnessAvailabilityEvent, HarnessAvailabilityModel};
 use crate::ai::harness_display::icon_for as harness_icon_for;
@@ -28,12 +27,10 @@ use crate::editor::{
     SingleLineEditorOptions, TextOptions,
 };
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields, MenuVariant};
-use crate::report_if_error;
 use crate::terminal::input::{MenuPositioning, MenuPositioningProvider};
 use crate::terminal::view::ambient_agent::{AmbientAgentViewModel, AmbientAgentViewModelEvent};
 use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{ActionButton, ButtonSize};
-use warp_editor::editor::NavigationKey;
 
 const ITEM_FONT_SIZE: f32 = 14.;
 
@@ -195,7 +192,9 @@ impl ModelSelector {
                 HarnessAvailabilityEvent::AuthSecretsLoaded
                 | HarnessAvailabilityEvent::AuthSecretCreated { .. }
                 | HarnessAvailabilityEvent::AuthSecretCreationFailed { .. }
-                | HarnessAvailabilityEvent::AuthSecretsFetchFailed => {}
+                | HarnessAvailabilityEvent::AuthSecretsFetchFailed
+                | HarnessAvailabilityEvent::AuthSecretDeleted { .. }
+                | HarnessAvailabilityEvent::AuthSecretDeletionFailed { .. } => {}
             },
         );
 
@@ -469,17 +468,18 @@ impl ModelSelector {
             .clone();
 
         let mut auto_choices = Vec::new();
-        let mut custom_choices = Vec::new();
         let mut other_choices = Vec::new();
         for llm in llm_preferences.get_base_llm_choices_for_agent_mode(ctx) {
+            if llm_preferences.custom_llm_info_for_id(&llm.id).is_some() {
+                continue;
+            }
+
             let display_name = llm.menu_display_name();
             if !query.is_empty() && !display_name.to_lowercase().contains(query) {
                 continue;
             }
             if is_auto(llm) {
                 auto_choices.push(llm);
-            } else if llm_preferences.custom_llm_info_for_id(&llm.id).is_some() {
-                custom_choices.push(llm);
             } else {
                 other_choices.push(llm);
             }
@@ -487,23 +487,17 @@ impl ModelSelector {
 
         let items: Vec<MenuItem<ModelSelectorAction>> = auto_choices
             .into_iter()
-            .chain(custom_choices)
             .chain(other_choices)
             .map(|llm| {
                 let display_name = llm.menu_display_name();
-                let is_custom = llm_preferences.custom_llm_info_for_id(&llm.id).is_some();
-                let mut fields = MenuItemFields::new(display_name)
+                let fields = MenuItemFields::new(display_name)
+                    .with_icon(llm.provider.icon().unwrap_or(Icon::Oz))
                     .with_icon_size_override(ITEM_ICON_SIZE)
                     .with_font_size_override(ITEM_FONT_SIZE)
                     .with_padding_override(ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
                     .with_override_hover_background_color(hover_background)
                     .with_on_select_action(ModelSelectorAction::SelectModel(llm.id.clone()))
                     .with_disabled(llm.disable_reason.is_some());
-                if is_custom {
-                    fields = fields.with_right_side_icon(Icon::Key);
-                } else {
-                    fields = fields.with_icon(llm.provider.icon().unwrap_or(Icon::Oz));
-                }
                 MenuItem::Item(fields)
             })
             .collect();
@@ -667,19 +661,12 @@ impl TypedActionView for ModelSelector {
                 }
                 // Persist the selection per-harness to settings for next time.
                 CloudAgentSettings::handle(ctx).update(ctx, |settings, ctx| {
-                    let mut map = settings.last_selected_harness_model.value().clone();
-                    if is_default {
-                        map.remove(harness.config_name());
-                    } else {
-                        map.insert(
-                            harness.config_name().to_string(),
-                            HarnessModelSelection {
-                                model_id: model_id.clone(),
-                                reasoning_level: reasoning_level.clone(),
-                            },
-                        );
-                    }
-                    report_if_error!(settings.last_selected_harness_model.set_value(map, ctx));
+                    settings.persist_harness_model_selection(
+                        *harness,
+                        model_id,
+                        reasoning_level.clone(),
+                        ctx,
+                    );
                 });
                 self.set_menu_visibility(false, ctx);
                 self.refresh_button(ctx);

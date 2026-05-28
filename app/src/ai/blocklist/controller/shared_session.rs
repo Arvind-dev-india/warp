@@ -6,8 +6,10 @@ use std::collections::HashMap;
 use itertools::Itertools;
 use session_sharing_protocol::common::{AgentAttachment, ParticipantId, ServerConversationToken};
 use warp_core::features::FeatureFlag;
+use warp_multi_agent_api::client_action::Action;
+use warp_multi_agent_api::message::Message;
 use warp_multi_agent_api::response_event::{stream_finished, ClientActions};
-use warp_multi_agent_api::{client_action::Action, message::Message};
+use warpui::{AppContext, ModelContext, SingletonEntity};
 
 use super::response_stream::ResponseStreamId;
 use super::{BlocklistAIController, RequestInput};
@@ -20,7 +22,6 @@ use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::blocklist::history_model::BlocklistAIHistoryModel;
 use crate::server::server_api::ServerApiProvider;
 use crate::terminal::model::block::BlockId;
-use warpui::{AppContext, ModelContext, SingletonEntity};
 
 #[derive(Default)]
 pub(super) struct SharedSessionState {
@@ -499,6 +500,7 @@ impl BlocklistAIController {
                 .map(|conversation| stream_finished::ConversationUsageMetadata {
                     context_window_usage: conversation.context_window_usage(),
                     credits_spent: conversation.credits_spent(),
+                    platform_credits_spent: 0.0,
                     summarized: conversation.was_summarized(),
                     #[allow(deprecated)]
                     token_usage: conversation
@@ -516,6 +518,11 @@ impl BlocklistAIController {
                         .token_usage()
                         .iter()
                         .filter_map(|u| u.to_proto_byok_usage())
+                        .collect(),
+                    custom_endpoint_token_usage: conversation
+                        .token_usage()
+                        .iter()
+                        .filter_map(|u| u.to_proto_custom_endpoint_usage())
                         .collect(),
                 })
         });

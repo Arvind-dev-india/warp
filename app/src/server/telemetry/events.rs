@@ -1,97 +1,81 @@
-use std::collections::HashSet;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use serde_json::Value;
-use session_sharing_protocol::common::ParticipantId;
-use session_sharing_protocol::common::Role;
-use session_sharing_protocol::common::SessionId as SharedSessionId;
-use session_sharing_protocol::sharer::SessionEndedReason;
-use strum_macros::EnumDiscriminants;
-use strum_macros::EnumIter;
+use serde_json::{json, Value};
+use session_sharing_protocol::common::{ParticipantId, Role, SessionId as SharedSessionId};
+use session_sharing_protocol::sharer::{SessionEndedReason, SessionSourceType};
+use strum_macros::{EnumDiscriminants, EnumIter};
 use warp_completer::completer::MatchType;
 use warp_core::command::ExitCode;
-use warp_core::telemetry::EnablementState;
-use warp_core::telemetry::TelemetryEvent as TelemetryEventTrait;
-use warp_core::telemetry::TelemetryEventDesc;
+use warp_core::interval_timer::TimingDataPoint;
+use warp_core::telemetry::{
+    EnablementState, TelemetryEvent as TelemetryEventTrait, TelemetryEventDesc,
+};
 use warpui::keymap::Keystroke;
 use warpui::notification::{NotificationSendError, RequestPermissionsOutcome};
 use warpui::rendering::ThinStrokes;
 
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::AIConversationId;
-use crate::ai::agent::AIAgentActionId;
-use crate::ai::agent::AIAgentExchangeId;
-use crate::ai::agent::AIAgentInput as FullAIAgentInput;
-use crate::ai::agent::AIIdentifiers;
-use crate::ai::agent::EntrypointType;
-use crate::ai::agent::PassiveSuggestionTrigger;
-use crate::ai::agent::ServerOutputId;
-use crate::ai::agent::SuggestedLoggingId;
+use crate::ai::agent::{
+    AIAgentActionId, AIAgentExchangeId, AIAgentInput as FullAIAgentInput, AIIdentifiers,
+    EntrypointType, PassiveSuggestionTrigger, ServerOutputId, SuggestedLoggingId,
+};
 use crate::ai::agent_management::notifications::NotificationSourceAgent;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
-use crate::ai::blocklist::AIBlockResponseRating;
-use crate::ai::blocklist::CommandExecutionPermissionAllowedReason;
-use crate::ai::blocklist::InputType;
+use crate::ai::blocklist::{
+    AIBlockResponseRating, CommandExecutionPermissionAllowedReason, InputType,
+    InputTypeAutoDetectionSource, QueuedQueryOrigin,
+};
 use crate::ai::execution_profiles::AskUserQuestionPermission;
 use crate::ai::mcp::TemplateVariable;
-use crate::ai::predict::generate_ai_input_suggestions::GenerateAIInputSuggestionsRequest;
-use crate::ai::predict::generate_ai_input_suggestions::GenerateAIInputSuggestionsResponseV2;
+use crate::ai::predict::generate_ai_input_suggestions::{
+    GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsResponseV2,
+};
 use crate::ai::predict::next_command_model::HistoryBasedAutosuggestionState;
 use crate::auth::auth_manager::LoginGatedFeature;
 use crate::channel::Channel;
-use crate::cloud_object::{
-    model::generic_string_model::GenericStringObjectId, GenericStringObjectFormat, ObjectType,
-    Space,
-};
+use crate::cloud_object::model::generic_string_model::GenericStringObjectId;
+use crate::cloud_object::{GenericStringObjectFormat, ObjectType, Space};
 #[cfg(feature = "local_fs")]
 use crate::code::editor_management::CodeSource;
-use crate::drive::CloudObjectTypeAndId;
-use crate::drive::DriveSortOrder;
+use crate::drive::{CloudObjectTypeAndId, DriveSortOrder};
 use crate::features::FeatureFlag;
 use crate::launch_configs::save_modal::SaveState;
 use crate::notebooks::telemetry::NotebookTelemetryAction;
-use crate::notebooks::NotebookId;
-use crate::notebooks::NotebookLocation;
+use crate::notebooks::{NotebookId, NotebookLocation};
 use crate::palette::PaletteMode;
 use crate::pane_group::PaneDragDropLocation;
 use crate::prompt::editor_modal::OpenSource as PromptEditorOpenSource;
 use crate::search::command_search::searcher::CommandSearchItemAction;
 use crate::search::QueryFilter;
 use crate::server::block::DisplaySetting;
-use crate::server::ids::ObjectUid;
-use crate::server::ids::ServerId;
-use crate::settings::import::config::ParsedTerminalSetting;
-use crate::settings::import::config::SettingType;
+use crate::server::ids::{ObjectUid, ServerId};
+use crate::settings::import::config::{ParsedTerminalSetting, SettingType};
 use crate::settings::import::model::TerminalType;
 use crate::settings::AgentModeCodingPermissionsType;
 use crate::settings_view::TeamsInviteOption;
 use crate::tab::TabTelemetryAction;
 use crate::terminal::block_list_viewport::InputMode;
-use crate::terminal::cli_agent_sessions::CLIAgentInputEntrypoint;
-use crate::terminal::cli_agent_sessions::CLIAgentRichInputCloseReason;
+use crate::terminal::cli_agent_sessions::{CLIAgentInputEntrypoint, CLIAgentRichInputCloseReason};
 use crate::terminal::input::TelemetryInputSuggestionsMode;
 use crate::terminal::model::ansi::WarpificationUnavailableReason;
 use crate::terminal::model::block::BlockId;
 use crate::terminal::model::session::SessionId;
-use crate::terminal::model::terminal_model::BlockSelectionCardinality;
-use crate::terminal::model::terminal_model::TmuxInstallationState;
+use crate::terminal::model::terminal_model::{BlockSelectionCardinality, TmuxInstallationState};
 use crate::terminal::settings::AltScreenPaddingMode;
 use crate::terminal::shared_session::SharedSessionActionSource;
 use crate::terminal::shell::ShellType;
 use crate::terminal::ssh::ssh_detection::SshInteractiveSessionDetected;
 use crate::terminal::view::block_onboarding::onboarding_agentic_suggestions_block::OnboardingChipType;
-use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionTriggeredFrom;
-use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionType;
-use crate::terminal::view::BlockEntity;
-use crate::terminal::view::BlockSelectionDetails;
-use crate::terminal::view::ContextMenuInfo;
-use crate::terminal::view::GridHighlightedLink;
-use crate::terminal::view::PromptPart;
+use crate::terminal::view::inline_banner::{
+    ZeroStatePromptSuggestionTriggeredFrom, ZeroStatePromptSuggestionType,
+};
 use crate::terminal::view::{
+    BlockEntity, BlockSelectionDetails, ContextMenuInfo, GridHighlightedLink,
     NotificationsDiscoveryBannerAction, NotificationsErrorBannerAction, NotificationsTrigger,
+    PromptPart,
 };
 use crate::terminal::ShareBlockType;
 use crate::tips::WelcomeTipFeature;
@@ -99,14 +83,9 @@ use crate::tips::WelcomeTipFeature;
 use crate::util::file::external_editor::settings::EditorLayout;
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::FileTarget;
-use crate::workflows::WorkflowId;
-use crate::workflows::WorkflowSelectionSource;
-use crate::workflows::WorkflowSource;
-use crate::workspace::tab_settings::TabCloseButtonPosition;
-use crate::workspace::tab_settings::WorkspaceDecorationVisibility;
+use crate::workflows::{WorkflowId, WorkflowSelectionSource, WorkflowSource};
+use crate::workspace::tab_settings::{TabCloseButtonPosition, WorkspaceDecorationVisibility};
 use crate::workspace::TabMovement;
-use session_sharing_protocol::sharer::SessionSourceType;
-use warp_core::interval_timer::TimingDataPoint;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BootstrappingInfo {
@@ -1204,6 +1183,26 @@ pub enum LoginEventSource {
     AuthModal,
 }
 
+/// Origin of a queued prompt, mirrored for telemetry so we don't pull serde derives onto the
+/// canonical `QueuedQueryOrigin` enum (which doesn't otherwise need them).
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryQueuedQueryOrigin {
+    InitialCloudMode,
+    QueueSlashCommand,
+    AutoQueueToggle,
+}
+
+impl From<QueuedQueryOrigin> for TelemetryQueuedQueryOrigin {
+    fn from(origin: QueuedQueryOrigin) -> Self {
+        match origin {
+            QueuedQueryOrigin::InitialCloudMode => Self::InitialCloudMode,
+            QueuedQueryOrigin::QueueSlashCommand => Self::QueueSlashCommand,
+            QueuedQueryOrigin::AutoQueueToggle => Self::AutoQueueToggle,
+        }
+    }
+}
+
 /// Details about which type of slash command was accepted
 #[derive(Clone, Debug, Serialize)]
 pub enum SlashCommandAcceptedDetails {
@@ -1236,6 +1235,20 @@ pub enum CLISubagentControlState {
     UserInControl,
     AgentTaggedIn,
     AgentTaggedOut,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCodebaseIndexStatusTelemetrySource {
+    Snapshot,
+    PushUpdate,
+    MutationResponse,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCodebaseAutoIndexTrigger {
+    NavigatedToGitRepo,
+    CodebaseContextEnablementChanged,
 }
 
 #[derive(Clone, EnumDiscriminants)]
@@ -1557,10 +1570,6 @@ pub enum TelemetryEvent {
     },
     CommandSearchFilterChanged {
         new_filter: Option<QueryFilter>,
-    },
-    CommandSearchAsyncQueryCompleted {
-        filters: HashSet<QueryFilter>,
-        error_payload: Option<Value>,
     },
     GlobalSearchOpened,
     GlobalSearchQueryStarted,
@@ -2515,6 +2524,7 @@ pub enum TelemetryEvent {
     },
     AIExecutionProfileContextWindowSelected {
         tokens: Option<u32>,
+        model_id: String,
     },
     /// The AI input was not sent because there was already an in-flight request.
     AIInputNotSent {
@@ -2550,7 +2560,9 @@ pub enum TelemetryEvent {
     InputBufferSubmitted {
         input_type: input_classifier::InputType,
         is_locked: bool,
+        input_type_decision_source: Option<InputTypeAutoDetectionSource>,
         was_lock_set_with_empty_buffer: bool,
+        block_id: BlockId,
     },
     /// User submitted a prompt from the create project view - metadata (non-UGC)
     CreateProjectPromptSubmitted {
@@ -2834,6 +2846,9 @@ pub enum TelemetryEvent {
         exit_code: Option<i32>,
         /// Whether the SSH subprocess was killed by a signal.
         signal_killed: Option<bool>,
+        /// Last lines from the proxy's stderr, if available.
+        /// Provides server-side context for why the proxy exited.
+        proxy_stderr: Option<String>,
     },
     /// Emitted when an established remote server connection drops.
     RemoteServerDisconnection {
@@ -2883,6 +2898,14 @@ pub enum TelemetryEvent {
         remote_os: Option<String>,
         remote_arch: Option<String>,
     },
+    /// Emitted when the remote server daemon process finishes startup and
+    /// binds its Unix domain socket.  Reports the same `IntervalTimer`
+    /// data that `AppStartup` reports for the GUI, but from the headless
+    /// daemon process on the remote host.  Only emitted on success — if
+    /// the daemon crashes before binding, no event is sent.
+    RemoteServerDaemonStartup {
+        timing_data: Vec<warp_core::interval_timer::TimingDataPoint>,
+    },
     /// Emitted when all reconnection attempts are exhausted.
     RemoteServerReconnectExhausted {
         attempts: u32,
@@ -2890,6 +2913,45 @@ pub enum TelemetryEvent {
         remote_arch: Option<String>,
         exit_code: Option<i32>,
         signal_killed: Option<bool>,
+    },
+    /// Emitted when the remote codebase index status changes.
+    RemoteCodebaseIndexStatusChanged {
+        state: remote_server::codebase_index_proto::RemoteCodebaseIndexState,
+        previous_state: Option<remote_server::codebase_index_proto::RemoteCodebaseIndexState>,
+        has_root_hash: bool,
+        has_failure_message: bool,
+        progress_completed: Option<u64>,
+        progress_total: Option<u64>,
+        mutation_kind: Option<remote_server::manager::RemoteCodebaseIndexUpdateOperation>,
+        source: RemoteCodebaseIndexStatusTelemetrySource,
+        remote_os: Option<String>,
+        remote_arch: Option<String>,
+    },
+    /// Emitted when auto-indexing requests one or more remote codebases.
+    RemoteCodebaseAutoIndexRequested {
+        trigger: RemoteCodebaseAutoIndexTrigger,
+        requested_count: usize,
+        remote_os: Option<String>,
+        remote_arch: Option<String>,
+    },
+    /// Emitted when the user commits a non-empty edit to a queued prompt row.
+    QueuedPromptEdited {
+        origin: TelemetryQueuedQueryOrigin,
+    },
+    /// Emitted when the user deletes a queued prompt row via the trash button or the
+    /// commit-empty edit shortcut.
+    QueuedPromptDeleted {
+        origin: TelemetryQueuedQueryOrigin,
+    },
+    /// Emitted when the user reorders a queued prompt row via drag-and-drop.
+    QueuedPromptReordered {
+        origin: TelemetryQueuedQueryOrigin,
+        from_index: usize,
+        to_index: usize,
+    },
+    /// Emitted when the user toggles the queued prompts panel collapse state.
+    QueuedPromptPanelCollapseToggled {
+        collapsed: bool,
     },
 }
 
@@ -3178,10 +3240,6 @@ impl TelemetryEvent {
             TelemetryEvent::CommandSearchFilterChanged { new_filter } => {
                 Some(json!({ "new_filter": new_filter }))
             }
-            TelemetryEvent::CommandSearchAsyncQueryCompleted {
-                filters,
-                error_payload,
-            } => Some(json!({ "filter": filters, "error": error_payload })),
             TelemetryEvent::AICommandSearchOpened { entrypoint } => {
                 Some(json!({ "entrypoint": entrypoint }))
             }
@@ -4213,6 +4271,7 @@ impl TelemetryEvent {
                 remote_arch,
                 exit_code,
                 signal_killed,
+                proxy_stderr,
             } => Some(json!({
                 "phase": phase,
                 "error": error,
@@ -4220,6 +4279,7 @@ impl TelemetryEvent {
                 "remote_arch": remote_arch,
                 "exit_code": exit_code,
                 "signal_killed": signal_killed,
+                "proxy_stderr": proxy_stderr,
             })),
             TelemetryEvent::RemoteServerDisconnection {
                 remote_os,
@@ -4268,6 +4328,43 @@ impl TelemetryEvent {
                 "remote_os": remote_os,
                 "remote_arch": remote_arch,
             })),
+            TelemetryEvent::RemoteCodebaseIndexStatusChanged {
+                state,
+                previous_state,
+                has_root_hash,
+                has_failure_message,
+                progress_completed,
+                progress_total,
+                mutation_kind,
+                source,
+                remote_os,
+                remote_arch,
+            } => Some(json!({
+                "state": state,
+                "previous_state": previous_state,
+                "has_root_hash": has_root_hash,
+                "has_failure_message": has_failure_message,
+                "progress_completed": progress_completed,
+                "progress_total": progress_total,
+                "mutation_kind": mutation_kind,
+                "source": source,
+                "remote_os": remote_os,
+                "remote_arch": remote_arch,
+            })),
+            TelemetryEvent::RemoteCodebaseAutoIndexRequested {
+                trigger,
+                requested_count,
+                remote_os,
+                remote_arch,
+            } => Some(json!({
+                "trigger": trigger,
+                "requested_count": requested_count,
+                "remote_os": remote_os,
+                "remote_arch": remote_arch,
+            })),
+            TelemetryEvent::RemoteServerDaemonStartup { timing_data } => {
+                Some(json!({ "timing_data": timing_data }))
+            }
             TelemetryEvent::RemoteServerSetupDuration {
                 duration_ms,
                 installed_binary,
@@ -4354,9 +4451,12 @@ impl TelemetryEvent {
                 "model_type": model_type,
                 "model_value": model_value,
             })),
-            TelemetryEvent::AIExecutionProfileContextWindowSelected { tokens } => Some(json!({
-                "tokens": tokens,
-            })),
+            TelemetryEvent::AIExecutionProfileContextWindowSelected { tokens, model_id } => {
+                Some(json!({
+                    "tokens": tokens,
+                    "model_id": model_id,
+                }))
+            }
             TelemetryEvent::AIInputNotSent {
                 entrypoint,
                 inputs,
@@ -4411,11 +4511,15 @@ impl TelemetryEvent {
             TelemetryEvent::InputBufferSubmitted {
                 input_type,
                 is_locked,
+                input_type_decision_source,
                 was_lock_set_with_empty_buffer,
+                block_id,
             } => Some(json!({
                 "input_type": input_type,
                 "is_locked": is_locked,
+                "input_type_decision_source": input_type_decision_source,
                 "was_lock_set_with_empty_buffer": was_lock_set_with_empty_buffer,
+                "block_id": block_id,
             })),
             TelemetryEvent::CreateProjectPromptSubmitted {
                 is_custom_prompt,
@@ -4667,6 +4771,24 @@ impl TelemetryEvent {
             | TelemetryEvent::OpenAuthPrivacySettings { source } => Some(json!({
                 "source": source,
             })),
+            TelemetryEvent::QueuedPromptEdited { origin } => Some(json!({
+                "origin": origin,
+            })),
+            TelemetryEvent::QueuedPromptDeleted { origin } => Some(json!({
+                "origin": origin,
+            })),
+            TelemetryEvent::QueuedPromptReordered {
+                origin,
+                from_index,
+                to_index,
+            } => Some(json!({
+                "origin": origin,
+                "from_index": from_index,
+                "to_index": to_index,
+            })),
+            TelemetryEvent::QueuedPromptPanelCollapseToggled { collapsed } => Some(json!({
+                "collapsed": collapsed,
+            })),
         }
     }
 
@@ -4680,6 +4802,7 @@ impl TelemetryEvent {
             TelemetryEvent::AgentExitedShellProcess { .. } => true,
             TelemetryEvent::CreateProjectPromptSubmitted { .. } => false,
             TelemetryEvent::CreateProjectPromptSubmittedContent { .. } => true,
+            TelemetryEvent::InputBufferSubmitted { .. } => false,
             TelemetryEvent::AgentModePrediction {
                 actual_next_command_run,
                 history_based_autosuggestion_state,
@@ -4837,7 +4960,6 @@ impl TelemetryEvent {
             | TelemetryEvent::CommandSearchExited { .. }
             | TelemetryEvent::CommandSearchResultAccepted { .. }
             | TelemetryEvent::CommandSearchFilterChanged { .. }
-            | TelemetryEvent::CommandSearchAsyncQueryCompleted { .. }
             | TelemetryEvent::AICommandSearchOpened { .. }
             | TelemetryEvent::OpenNotebook(_)
             | TelemetryEvent::EditNotebook { .. }
@@ -5085,12 +5207,15 @@ impl TelemetryEvent {
             | TelemetryEvent::InlineConversationMenuOpened { .. }
             | TelemetryEvent::InlineConversationMenuItemSelected { .. }
             | TelemetryEvent::AgentShortcutsViewToggled { .. }
-            | TelemetryEvent::InputBufferSubmitted { .. }
             | TelemetryEvent::RecentMenuItemSelected { .. }
             | TelemetryEvent::OpenRepoFolderSubmitted { .. }
             | TelemetryEvent::OutOfCreditsBannerClosed { .. }
             | TelemetryEvent::AutoReloadModalClosed { .. }
             | TelemetryEvent::AutoReloadToggledFromBillingSettings { .. }
+            | TelemetryEvent::QueuedPromptEdited { .. }
+            | TelemetryEvent::QueuedPromptDeleted { .. }
+            | TelemetryEvent::QueuedPromptReordered { .. }
+            | TelemetryEvent::QueuedPromptPanelCollapseToggled { .. }
             | TelemetryEvent::CLISubagentControlStateChanged { .. }
             | TelemetryEvent::CLISubagentResponsesToggled { .. }
             | TelemetryEvent::CLISubagentInputDismissed { .. }
@@ -5131,13 +5256,16 @@ impl TelemetryEvent {
             | TelemetryEvent::RemoteServerBinaryCheck { .. }
             | TelemetryEvent::RemoteServerInstallation { .. }
             | TelemetryEvent::RemoteServerInitialization { .. }
+            | TelemetryEvent::RemoteServerDaemonStartup { .. }
             | TelemetryEvent::RemoteServerDisconnection { .. }
             | TelemetryEvent::RemoteServerClientRequestError { .. }
             | TelemetryEvent::RemoteServerMessageDecodingError { .. }
             | TelemetryEvent::RemoteServerSetupDuration { .. }
             | TelemetryEvent::RemoteServerHostUnsupported { .. }
             | TelemetryEvent::RemoteServerReconnection { .. }
-            | TelemetryEvent::RemoteServerReconnectExhausted { .. } => false,
+            | TelemetryEvent::RemoteServerReconnectExhausted { .. }
+            | TelemetryEvent::RemoteCodebaseIndexStatusChanged { .. }
+            | TelemetryEvent::RemoteCodebaseAutoIndexRequested { .. } => false,
             #[cfg(feature = "local_fs")]
             TelemetryEvent::CodePaneOpened { .. }
             | TelemetryEvent::CodePanelsFileOpened { .. }
@@ -5157,7 +5285,7 @@ impl TelemetryEvent {
     #[cfg(not(target_family = "wasm"))]
     pub fn print_telemetry_events_json() -> anyhow::Result<()> {
         // We initialize the feature flags so that we can determine which telemetry events to print.
-        crate::init_feature_flags();
+        crate::features::init_feature_flags();
 
         let events: serde_json::Map<String, Value> = warp_core::telemetry::all_events()
             .filter_map(|event| {
@@ -5397,7 +5525,6 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::CommandSearchExited => EnablementState::Always,
             Self::CommandSearchResultAccepted => EnablementState::Always,
             Self::CommandSearchFilterChanged => EnablementState::Always,
-            Self::CommandSearchAsyncQueryCompleted => EnablementState::Always,
             Self::AICommandSearchOpened => EnablementState::Always,
             Self::OpenedAltScreenFind => EnablementState::Always,
             Self::UserInitiatedClose => EnablementState::Always,
@@ -5702,14 +5829,23 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::RemoteServerBinaryCheck
             | Self::RemoteServerInstallation
             | Self::RemoteServerInitialization
+            | Self::RemoteServerDaemonStartup
             | Self::RemoteServerDisconnection
             | Self::RemoteServerClientRequestError
             | Self::RemoteServerMessageDecodingError
             | Self::RemoteServerSetupDuration
             | Self::RemoteServerHostUnsupported
             | Self::RemoteServerReconnection
-            | Self::RemoteServerReconnectExhausted => {
+            | Self::RemoteServerReconnectExhausted
+            | Self::RemoteCodebaseIndexStatusChanged
+            | Self::RemoteCodebaseAutoIndexRequested => {
                 EnablementState::Flag(FeatureFlag::SshRemoteServer)
+            }
+            Self::QueuedPromptEdited
+            | Self::QueuedPromptDeleted
+            | Self::QueuedPromptReordered
+            | Self::QueuedPromptPanelCollapseToggled => {
+                EnablementState::Flag(FeatureFlag::QueueSlashCommand)
             }
         }
     }
@@ -5894,7 +6030,6 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::CommandSearchExited => "Command Search Exited",
             Self::CommandSearchResultAccepted => "Command Search Result Accepted",
             Self::CommandSearchFilterChanged => "Command Search Filter Changed",
-            Self::CommandSearchAsyncQueryCompleted => "Command Search Async Query Completed",
             Self::AICommandSearchOpened => "AI Command Search opened",
             Self::OpenNotebook => "Notebook Opened",
             Self::EditNotebook => "Notebook Edited",
@@ -6113,6 +6248,7 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::RemoteServerBinaryCheck => "RemoteServer.BinaryCheck",
             Self::RemoteServerInstallation => "RemoteServer.Installation",
             Self::RemoteServerInitialization => "RemoteServer.Initialization",
+            Self::RemoteServerDaemonStartup => "RemoteServer.DaemonStartup",
             Self::RemoteServerDisconnection => "RemoteServer.Disconnection",
             Self::RemoteServerClientRequestError => "RemoteServer.ClientRequestError",
             Self::RemoteServerMessageDecodingError => "RemoteServer.MessageDecodingError",
@@ -6120,6 +6256,12 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::RemoteServerHostUnsupported => "RemoteServer.HostUnsupported",
             Self::RemoteServerReconnection => "RemoteServer.Reconnection",
             Self::RemoteServerReconnectExhausted => "RemoteServer.ReconnectExhausted",
+            Self::RemoteCodebaseIndexStatusChanged => "RemoteCodebaseIndex.StatusChanged",
+            Self::RemoteCodebaseAutoIndexRequested => "RemoteCodebaseIndex.AutoIndexRequested",
+            Self::QueuedPromptEdited => "QueuedPrompt.Edited",
+            Self::QueuedPromptDeleted => "QueuedPrompt.Deleted",
+            Self::QueuedPromptReordered => "QueuedPrompt.Reordered",
+            Self::QueuedPromptPanelCollapseToggled => "QueuedPrompt.PanelCollapseToggled",
             #[cfg(windows)]
             Self::WSLRegistryError => "WSL Distribution Registry Error",
             #[cfg(windows)]
@@ -6271,7 +6413,7 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
 
     fn description(&self) -> &'static str {
         match self {
-            Self::AIExecutionProfileContextWindowSelected => {
+            Self::AIExecutionProfileContextWindowSelected { .. } => {
                 "Selected a context window limit for an execution profile's base model"
             }
             Self::AISuggestedAgentModeWorkflowAdded => {
@@ -6530,9 +6672,6 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             }
             Self::CommandSearchResultAccepted => "Accepted command search result",
             Self::CommandSearchFilterChanged => "Changed command search filter",
-            Self::CommandSearchAsyncQueryCompleted => {
-                "Finished searching for a command in the background"
-            }
             Self::AICommandSearchOpened => {
                 "Opened the modal for AI Command Search, where you can use natural language to search for commands"
             }
@@ -7156,6 +7295,9 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::RemoteServerInitialization => {
                 "Remote server connection and initialization completed (success or failure)"
             }
+            Self::RemoteServerDaemonStartup => {
+                "Remote server daemon startup completed and socket bound"
+            }
             Self::RemoteServerDisconnection => {
                 "An established remote server connection was dropped"
             }
@@ -7177,6 +7319,20 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             }
             Self::RemoteServerReconnectExhausted => {
                 "All reconnection attempts were exhausted after a spontaneous disconnect"
+            }
+            Self::RemoteCodebaseIndexStatusChanged => "The remote codebase index status changed",
+            Self::RemoteCodebaseAutoIndexRequested => {
+                "Remote codebase auto-indexing requested one or more repositories"
+            }
+            Self::QueuedPromptEdited => {
+                "User committed a non-empty edit to a queued prompt row"
+            }
+            Self::QueuedPromptDeleted => "User deleted a queued prompt row",
+            Self::QueuedPromptReordered => {
+                "User reordered a queued prompt row via drag-and-drop"
+            }
+            Self::QueuedPromptPanelCollapseToggled => {
+                "User toggled the queued prompts panel collapse state"
             }
         }
     }

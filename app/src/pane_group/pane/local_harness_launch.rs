@@ -1,28 +1,24 @@
-use std::{collections::HashMap, ffi::OsString, path::PathBuf, sync::Arc};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::ai::local_child_harnesses::local_child_harness_disabled_message;
-use crate::ai::{
-    agent_sdk::{
-        driver::{
-            harness::{
-                claude_code::prepare_claude_environment_config, harness_kind,
-                harness_model_env_vars, HarnessKind,
-            },
-            AgentDriverError,
-        },
-        task_env_vars, validate_cli_installed,
-    },
-    ambient_agents::{
-        task::{HarnessConfig, HarnessModelConfig},
-        AgentConfigSnapshot, AmbientAgentTaskId,
-    },
-};
-use crate::server::server_api::ai::AIClient;
-use crate::terminal::cli_agent_sessions::plugin_manager::plugin_manager_for;
-use crate::terminal::shell::ShellType;
 use shell_words::quote as shell_quote;
 use uuid::Uuid;
 use warp_cli::agent::Harness;
+
+use crate::ai::agent_sdk::driver::harness::claude_code::prepare_claude_environment_config;
+use crate::ai::agent_sdk::driver::harness::{harness_kind, harness_model_env_vars, HarnessKind};
+use crate::ai::agent_sdk::driver::AgentDriverError;
+use crate::ai::agent_sdk::{task_env_vars, validate_cli_installed};
+use crate::ai::ambient_agents::task::{
+    normalize_orchestrator_agent_name, HarnessConfig, HarnessModelConfig,
+};
+use crate::ai::ambient_agents::{AgentConfigSnapshot, AmbientAgentTaskId};
+use crate::ai::local_child_harnesses::local_child_harness_disabled_message;
+use crate::server::server_api::ai::AIClient;
+use crate::terminal::cli_agent_sessions::plugin_manager::plugin_manager_for;
+use crate::terminal::shell::ShellType;
 
 #[derive(Clone)]
 pub(super) struct PreparedLocalHarnessLaunch {
@@ -69,11 +65,18 @@ pub(super) fn build_local_codex_child_command(prompt: &str) -> String {
     format!("codex --dangerously-bypass-approvals-and-sandbox {quoted_prompt}")
 }
 
-fn local_child_task_config(harness: Harness) -> Option<AgentConfigSnapshot> {
+pub(super) fn local_child_task_config(
+    harness: Harness,
+    agent_name: Option<String>,
+) -> Option<AgentConfigSnapshot> {
+    let agent_name = agent_name
+        .as_deref()
+        .and_then(normalize_orchestrator_agent_name);
     match harness {
         Harness::Oz | Harness::Unknown => None,
         Harness::Claude | Harness::OpenCode | Harness::Gemini | Harness::Codex => {
             Some(AgentConfigSnapshot {
+                name: agent_name,
                 harness: Some(HarnessConfig::from_harness_type(harness)),
                 ..Default::default()
             })
@@ -81,11 +84,13 @@ fn local_child_task_config(harness: Harness) -> Option<AgentConfigSnapshot> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare_local_harness_child_launch(
     prompt: String,
     harness_type: String,
     model_id: Option<String>,
     parent_run_id: Option<String>,
+    agent_name: Option<String>,
     shell_type: Option<ShellType>,
     startup_directory: Option<PathBuf>,
     ai_client: Arc<dyn AIClient>,
@@ -177,7 +182,7 @@ pub(super) async fn prepare_local_harness_child_launch(
             prompt.clone(),
             None,
             parent_run_id.clone(),
-            local_child_task_config(harness),
+            local_child_task_config(harness, agent_name),
         )
         .await
         .map_err(|error| {

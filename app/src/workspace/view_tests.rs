@@ -1,4 +1,29 @@
+use std::collections::HashMap;
+
+use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
+use ai::project_context::model::ProjectContextModel;
+use pane_group::{NotebookPane, PaneState, SplitPaneState, TerminalPaneId};
+use repo_metadata::repositories::DetectedRepositories;
+use repo_metadata::watcher::DirectoryWatcher;
+#[cfg(feature = "local_fs")]
+use repo_metadata::CanonicalizedPath;
+#[cfg(feature = "local_fs")]
+use repo_metadata::RepoMetadataModel;
+use session_sharing_protocol::common::SessionId;
+#[cfg(feature = "local_fs")]
+use tempfile::TempDir;
+use terminal::shared_session::permissions_manager::SessionPermissionsManager;
+use terminal::view::ActiveSessionState;
+use warp_editor::editor::NavigationKey;
+use warpui::platform::WindowStyle;
+use warpui::{AddSingletonModel, App, ViewHandle};
+use watcher::HomeDirectoryWatcher;
+
 use super::*;
+use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
+use crate::ai::agent_conversations_model::AgentConversationsModel;
+use crate::ai::agent_tips::AITipModel;
+use crate::ai::ambient_agents::github_auth_notifier::GitHubAuthNotifier;
 use crate::ai::blocklist::agent_view::orchestration_pill_bar_model::OrchestrationPillBarModel;
 use crate::ai::blocklist::{BlocklistAIHistoryModel, BlocklistAIPermissions};
 use crate::ai::document::ai_document_model::AIDocumentModel;
@@ -6,6 +31,9 @@ use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::facts::manager::AIFactManager;
 use crate::ai::harness_availability::HarnessAvailabilityModel;
 use crate::ai::llms::LLMPreferences;
+use crate::ai::mcp::gallery::MCPGalleryManager;
+use crate::ai::mcp::templatable_manager::TemplatableMCPServerManager;
+use crate::ai::mcp::{FileBasedMCPManager, FileMCPWatcher};
 use crate::ai::outline::RepoOutlines;
 use crate::ai::persisted_workspace::PersistedWorkspace;
 use crate::ai::restored_conversations::RestoredAgentConversations;
@@ -23,70 +51,42 @@ use crate::pane_group::{Direction, PaneGroupAction, PaneId};
 use crate::pricing::PricingInfoModel;
 #[cfg(not(target_family = "wasm"))]
 use crate::remote_server::codebase_index_model::RemoteCodebaseIndexModel;
-use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
-#[cfg(feature = "local_fs")]
-use crate::user_config::tab_configs_dir;
-use repo_metadata::repositories::DetectedRepositories;
-use repo_metadata::watcher::DirectoryWatcher;
-#[cfg(feature = "local_fs")]
-use repo_metadata::CanonicalizedPath;
-#[cfg(feature = "local_fs")]
-use repo_metadata::RepoMetadataModel;
-use session_sharing_protocol::sharer::SessionSourceType;
-use std::collections::HashMap;
-#[cfg(feature = "local_fs")]
-use tempfile::TempDir;
-use watcher::HomeDirectoryWatcher;
-
-use crate::server::cloud_objects::{listener::Listener, update_manager::UpdateManager};
+use crate::resource_center::Tip;
+use crate::server::cloud_objects::listener::Listener;
+use crate::server::cloud_objects::update_manager::UpdateManager;
 use crate::server::experiments::ServerExperiments;
 use crate::server::server_api::ServerApiProvider;
 use crate::server::sync_queue::SyncQueue;
-
 use crate::server::telemetry::context_provider::AppTelemetryContextProvider;
+use crate::settings::cloud_preferences_syncer::CloudPreferencesSyncer;
 use crate::settings::PrivacySettings;
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::settings_view::DisplayCount;
+use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
 use crate::system::SystemStats;
 use crate::tab_configs::tab_config::{TabConfigPaneNode, TabConfigPaneType};
+use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::history::History;
 use crate::terminal::keys::TerminalKeybindings;
+use crate::terminal::local_tty::spawner::PtySpawner;
+use crate::terminal::shared_session::{
+    SharedSessionScrollbackType, SharedSessionSource, SharedSessionStatus,
+};
+use crate::test_util::settings::initialize_settings_for_tests;
+use crate::undo_close::UndoCloseSettings;
+#[cfg(feature = "local_fs")]
+use crate::user_config::tab_configs_dir;
 #[cfg(windows)]
 use crate::util::traffic_lights::windows::RendererState;
+use crate::warp_managed_paths_watcher::WarpManagedPathsWatcher;
+use crate::workflows::local_workflows::LocalWorkflows;
 use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_profiles::UserProfiles;
 use crate::workspaces::user_workspaces::UserWorkspaces;
-
-use crate::terminal::local_tty::spawner::PtySpawner;
-use crate::terminal::shared_session::{SharedSessionScrollbackType, SharedSessionStatus};
-
-use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
-use crate::ai::agent_conversations_model::AgentConversationsModel;
-use crate::ai::ambient_agents::github_auth_notifier::GitHubAuthNotifier;
-use crate::ai::mcp::{
-    gallery::MCPGalleryManager, templatable_manager::TemplatableMCPServerManager,
-    FileBasedMCPManager, FileMCPWatcher,
+use crate::{
+    experiments, workspace, AgentNotificationsModel, GlobalResourceHandlesProvider, ObjectActions,
 };
-use crate::resource_center::Tip;
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
-use crate::test_util::settings::initialize_settings_for_tests;
-use crate::undo_close::UndoCloseSettings;
-use crate::warp_managed_paths_watcher::WarpManagedPathsWatcher;
-use crate::workflows::local_workflows::LocalWorkflows;
-use crate::{experiments, workspace, GlobalResourceHandlesProvider};
-use crate::{AgentNotificationsModel, ObjectActions};
-
-use crate::settings::cloud_preferences_syncer::CloudPreferencesSyncer;
-use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
-use ai::project_context::model::ProjectContextModel;
-use pane_group::{NotebookPane, PaneState, SplitPaneState, TerminalPaneId};
-use session_sharing_protocol::common::SessionId;
-use terminal::shared_session::permissions_manager::SessionPermissionsManager;
-use terminal::view::ActiveSessionState;
-use warp_editor::editor::NavigationKey;
-use warpui::AddSingletonModel;
-use warpui::{platform::WindowStyle, App, ViewHandle};
 
 fn initialize_app(app: &mut App) {
     initialize_settings_for_tests(app);
@@ -138,6 +138,9 @@ fn initialize_app(app: &mut App) {
         )
     });
     app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+    // QueuedQueryModel subscribes to history events; register after the
+    // history model is in place.
+    app.add_singleton_model(crate::ai::blocklist::QueuedQueryModel::new);
     app.add_singleton_model(|ctx| OrchestrationPillBarModel::new(Default::default(), ctx));
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
     app.add_singleton_model(|_| ActiveAgentViewsModel::new());
@@ -146,6 +149,7 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(SessionPermissionsManager::new);
     app.add_singleton_model(LLMPreferences::new);
     app.add_singleton_model(HarnessAvailabilityModel::new);
+    app.add_singleton_model(|ctx| AITipModel::new_for_agent_tips(ctx));
     app.add_singleton_model(|_| SettingsPaneManager::new());
     app.add_singleton_model(|_| AIFactManager::new());
 
@@ -305,7 +309,10 @@ fn test_tab_bar_traffic_light_space_regression_for_resource_center_overlap() {
 #[cfg(feature = "local_fs")]
 fn open_worktree_sidecar(workspace: &ViewHandle<Workspace>, app: &mut App) {
     workspace.update(app, |workspace, ctx| {
-        workspace.open_new_session_dropdown_menu(Vector2F::zero(), ctx);
+        workspace.open_new_session_dropdown_menu(
+            crate::workspace::action::NewSessionMenuAnchor::AddTabButton(Vector2F::zero()),
+            ctx,
+        );
 
         let worktree_index = workspace
             .new_session_dropdown_menu
@@ -403,7 +410,10 @@ fn test_worktree_sidecar_pointer_entry_does_not_select_top_repo() {
         });
 
         workspace.update(&mut app, |workspace, ctx| {
-            workspace.open_new_session_dropdown_menu(Vector2F::zero(), ctx);
+            workspace.open_new_session_dropdown_menu(
+                crate::workspace::action::NewSessionMenuAnchor::AddTabButton(Vector2F::zero()),
+                ctx,
+            );
 
             let worktree_index = workspace
                 .new_session_dropdown_menu
@@ -599,7 +609,7 @@ fn mock_workspace_with_shared_session(app: &mut App) -> ViewHandle<Workspace> {
         view.attempt_to_share_session(
             SharedSessionScrollbackType::All,
             None,
-            SessionSourceType::default(),
+            SharedSessionSource::user(None),
             false,
             ctx,
         );
@@ -698,6 +708,44 @@ fn active_session_state(
     }
 }
 
+#[test]
+fn restore_conversation_in_active_pane_enters_existing_live_conversation_without_loading() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        let terminal_view = workspace.read(&app, |workspace, ctx| {
+            workspace
+                .active_tab_pane_group()
+                .as_ref(ctx)
+                .focused_session_view(ctx)
+                .expect("workspace should start with a terminal view")
+        });
+        let terminal_view_id = terminal_view.read(&app, |view, _| view.view_id());
+        let conversation_id =
+            BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+                history.start_new_conversation(terminal_view_id, false, false, false, ctx)
+            });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            assert_eq!(workspace.tab_count(), 1);
+
+            workspace.restore_conversation_in_active_pane(conversation_id, ctx);
+
+            assert_eq!(workspace.tab_count(), 1);
+        });
+
+        terminal_view.read(&app, |view, ctx| {
+            assert_eq!(view.active_conversation_id(ctx), Some(conversation_id));
+            assert_eq!(
+                view.model.lock().conversation_transcript_viewer_status(),
+                None
+            );
+        });
+    });
+}
 fn new_session_menu_label(item: &MenuItem<WorkspaceAction>) -> String {
     match item {
         MenuItem::Item(fields) => fields.label().to_string(),
@@ -1068,7 +1116,7 @@ fn setup_session_sharing_test(workspace: &ViewHandle<Workspace>, app: &mut App) 
                     terminal.attempt_to_share_session(
                         SharedSessionScrollbackType::None,
                         None,
-                        SessionSourceType::default(),
+                        SharedSessionSource::user(None),
                         false,
                         ctx,
                     );
@@ -1161,6 +1209,61 @@ fn test_close_tab_confirmation_dialog() {
     });
 }
 
+#[test]
+fn test_close_active_horizontal_tab_activates_tab_to_right() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+            });
+        });
+
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            let tab_to_right_id = workspace.get_pane_group_view(2).unwrap().id();
+
+            workspace.activate_tab(1, ctx);
+            workspace.close_tab(1, true, true, ctx);
+
+            assert_eq!(workspace.tab_count(), 2);
+            assert_eq!(workspace.active_tab_index(), 1);
+            assert_eq!(workspace.active_tab_pane_group().id(), tab_to_right_id);
+        });
+    });
+}
+
+#[test]
+fn test_close_last_horizontal_tab_activates_tab_to_left() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+            });
+        });
+
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            let tab_to_left_id = workspace.get_pane_group_view(1).unwrap().id();
+
+            workspace.activate_tab(2, ctx);
+            workspace.close_tab(2, true, true, ctx);
+
+            assert_eq!(workspace.tab_count(), 2);
+            assert_eq!(workspace.active_tab_index(), 1);
+            assert_eq!(workspace.active_tab_pane_group().id(), tab_to_left_id);
+        });
+    });
+}
 #[test]
 fn test_close_pane_confirmation_dialog() {
     let _guard = FeatureFlag::CreatingSharedSessions.override_enabled(true);
@@ -1701,7 +1804,7 @@ fn test_stop_sharing_all_sessions_in_tab() {
                             terminal_view.attempt_to_share_session(
                                 SharedSessionScrollbackType::None,
                                 None,
-                                SessionSourceType::default(),
+                                SharedSessionSource::user(None),
                                 false,
                                 ctx,
                             );
@@ -1719,7 +1822,7 @@ fn test_stop_sharing_all_sessions_in_tab() {
                             terminal_view.attempt_to_share_session(
                                 SharedSessionScrollbackType::None,
                                 None,
-                                SessionSourceType::default(),
+                                SharedSessionSource::user(None),
                                 false,
                                 ctx,
                             );
@@ -2594,7 +2697,10 @@ fn test_pointer_opened_tab_configs_menu_does_not_select_top_item() {
         let workspace = mock_workspace(&mut app);
 
         workspace.update(&mut app, |workspace, ctx| {
-            workspace.toggle_new_session_dropdown_menu(Vector2F::zero(), ctx);
+            workspace.toggle_new_session_dropdown_menu(
+                crate::workspace::action::NewSessionMenuAnchor::Pointer(Vector2F::zero()),
+                ctx,
+            );
 
             assert!(workspace.show_new_session_dropdown_menu.is_some());
             assert_eq!(
