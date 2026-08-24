@@ -141,9 +141,7 @@ function Build-Proxy {
     $binDir = if ($Profile -eq "release") { "release" } else { "debug" }
     $proxyBin = Join-Path (Join-Path (Join-Path $RepoRoot "target") $binDir) "warp-local-proxy$ext"
 
-    if (Test-Path $proxyBin) { return }
-
-    Write-Host "warp-local: building warp_local_proxy ($Profile)..."
+    Write-Host "warp-local: updating warp_local_proxy ($Profile)..."
     $env:CARGO_FULL_PROFILE = $Profile
     Push-Location $RepoRoot
     try {
@@ -158,9 +156,8 @@ function Build-Proxy {
 function Get-WarpBin {
     $ext = if ($env:OS -eq "Windows_NT") { ".exe" } else { "" }
     $bin = Join-Path (Join-Path (Join-Path $RepoRoot "target") $Profile) "warp-oss$ext"
-    if (Test-Path $bin) { return $bin }
 
-    Write-Host "warp-local: warp-oss not found at $bin, building (profile=$Profile)..."
+    Write-Host "warp-local: updating warp-oss (profile=$Profile)..."
     $env:CARGO_FULL_PROFILE = $Profile
     Push-Location $RepoRoot
     try {

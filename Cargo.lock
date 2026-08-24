@@ -14139,6 +14139,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -15817,8 +15818,9 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "clap",
- "prost 0.14.3",
+ "prost",
  "prost-types",
  "reqwest",
  "serde",

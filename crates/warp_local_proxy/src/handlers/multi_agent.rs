@@ -14,7 +14,12 @@
 //! 5. Client sends NEW Request with ToolCallResults → goto 2
 //! 6. If LLM returns text → proxy emits AgentOutput → Finished
 
-use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    convert::Infallible,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     body::{Body, Bytes},
@@ -28,10 +33,35 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::config::{AuthStyle, Config};
 use crate::server::AppState;
 use crate::upstream::openai::apply_backend_auth;
 
 // ── OpenAI tool definitions ──────────────────────────────────────────
+
+fn current_timestamp() -> prost_types::Timestamp {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    prost_types::Timestamp {
+        seconds: duration.as_secs() as i64,
+        nanos: duration.subsec_nanos() as i32,
+    }
+}
+
+fn task_description(query: Option<&str>) -> String {
+    let query = query.unwrap_or("Local agent").trim();
+    let query = if query.is_empty() { "Local agent" } else { query };
+    query.chars().take(80).collect()
+}
+
+fn oz_harness() -> warp_multi_agent_api::Harness {
+    warp_multi_agent_api::Harness {
+        variant: Some(warp_multi_agent_api::harness::Variant::Oz(
+            warp_multi_agent_api::harness::Oz {},
+        )),
+    }
+}
 
 fn openai_tools() -> serde_json::Value {
     json!([
@@ -427,14 +457,19 @@ fn openai_tools() -> serde_json::Value {
                                     "multiple_choice": {
                                         "type": "object",
                                         "properties": {
-                                            "options": { "type": "array", "items": { "type": "string" } },
+                                            "options": {
+                                                "type": "array",
+                                                "minItems": 1,
+                                                "items": { "type": "string" }
+                                            },
                                             "is_multiselect": { "type": "boolean" },
                                             "supports_other": { "type": "boolean" },
                                             "recommended_option_index": { "type": "integer" }
-                                        }
+                                        },
+                                        "required": ["options", "is_multiselect", "supports_other"]
                                     }
                                 },
-                                "required": ["question_id", "question"]
+                                "required": ["question_id", "question", "multiple_choice"]
                             }
                         }
                     },
@@ -568,41 +603,6 @@ fn openai_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
-                "name": "subagent",
-                "description": "Spawn a subagent to work on a subtask. Use 'cli' type for shell/terminal tasks, 'research' for reading files and searching code, and 'advice' for analysis and recommendations.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": { "type": "string", "description": "A unique identifier for this subtask" },
-                        "payload": { "type": "string", "description": "The detailed prompt/instructions for the subagent" },
-                        "type": {
-                            "type": "string",
-                            "enum": ["cli", "research", "advice"],
-                            "description": "The type of subagent: 'cli' for shell commands, 'research' for code exploration, 'advice' for analysis"
-                        }
-                    },
-                    "required": ["task_id", "payload", "type"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "start_agent",
-                "description": "Start a new agent conversation to work on a task independently.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": { "type": "string", "description": "A short name for the agent" },
-                        "prompt": { "type": "string", "description": "The detailed task instructions for the agent" }
-                    },
-                    "required": ["name", "prompt"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "send_message_to_agent",
                 "description": "Send a message to one or more agents.",
                 "parameters": {
@@ -676,6 +676,76 @@ fn openai_tools() -> serde_json::Value {
     ])
 }
 
+fn tool_type_for_openai_name(name: &str) -> Option<warp_multi_agent_api::ToolType> {
+    use warp_multi_agent_api::ToolType;
+
+    Some(match name {
+        "run_shell_command" => ToolType::RunShellCommand,
+        "write_to_long_running_shell_command" => ToolType::WriteToLongRunningShellCommand,
+        "read_shell_command_output" => ToolType::ReadShellCommandOutput,
+        "transfer_shell_command_control_to_user" => ToolType::TransferShellCommandControlToUser,
+        "read_files" => ToolType::ReadFiles,
+        "read_documents" => ToolType::ReadDocuments,
+        "apply_file_diffs" => ToolType::ApplyFileDiffs,
+        "edit_documents" => ToolType::EditDocuments,
+        "create_documents" => ToolType::CreateDocuments,
+        "grep" => ToolType::Grep,
+        "file_glob" => ToolType::FileGlobV2,
+        "search_codebase" => ToolType::SearchCodebase,
+        "insert_review_comments" => ToolType::InsertReviewComments,
+        "open_code_review" => ToolType::OpenCodeReview,
+        "suggest_plan" => ToolType::SuggestPlan,
+        "suggest_create_plan" => ToolType::SuggestCreatePlan,
+        "ask_user_question" => ToolType::AskUserQuestion,
+        "suggest_prompt" => ToolType::SuggestPrompt,
+        "read_skill" => ToolType::ReadSkill,
+        "call_mcp_tool" => ToolType::CallMcpTool,
+        "read_mcp_resource" => ToolType::ReadMcpResource,
+        "init_project" => ToolType::InitProject,
+        "use_computer" => ToolType::UseComputer,
+        "request_computer_use" => ToolType::RequestComputerUse,
+        "send_message_to_agent" => ToolType::SendMessageToAgent,
+        "fetch_conversation" => ToolType::FetchConversation,
+        "upload_file_artifact" => ToolType::UploadFileArtifact,
+        "run_agents" => ToolType::RunAgents,
+        _ => return None,
+    })
+}
+
+fn openai_tools_for_request(request: &warp_multi_agent_api::Request) -> serde_json::Value {
+    let supported: HashSet<_> = request
+        .settings
+        .as_ref()
+        .map(|settings| {
+            settings
+                .supported_tools
+                .iter()
+                .filter_map(|tool| warp_multi_agent_api::ToolType::try_from(*tool).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let is_child_agent = request
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.parent_agent_id.is_empty());
+    let tools = openai_tools()
+        .as_array()
+        .expect("OpenAI tools must be an array")
+        .iter()
+        .filter(|tool| {
+            tool.pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+                .and_then(tool_type_for_openai_name)
+                .is_some_and(|tool_type| {
+                    (supported.is_empty() || supported.contains(&tool_type))
+                        && !(is_child_agent && tool_type == warp_multi_agent_api::ToolType::RunAgents)
+                })
+        })
+        .cloned()
+        .collect();
+    serde_json::Value::Array(tools)
+}
+
 // ── Protobuf SSE encoding ────────────────────────────────────────────
 
 fn sse_line(event: &warp_multi_agent_api::ResponseEvent) -> String {
@@ -739,11 +809,42 @@ fn extract_tool_results(request: &warp_multi_agent_api::Request) -> Vec<(String,
                     let text = request_tool_call_result_to_text(tcr);
                     results.push((tcr.tool_call_id.clone(), text));
                 }
+
             }
         }
     }
 
     results
+}
+
+fn register_launched_agents(request: &warp_multi_agent_api::Request, state: &AppState) {
+    use warp_multi_agent_api::request::input::tool_call_result::Result;
+    use warp_multi_agent_api::request::input::user_inputs::user_input::Input;
+    use warp_multi_agent_api::run_agents_result::Outcome;
+    use warp_multi_agent_api::run_agents_result::agent_outcome;
+
+    let Some(warp_multi_agent_api::request::input::Type::UserInputs(user_inputs)) =
+        request.input.as_ref().and_then(|input| input.r#type.as_ref())
+    else {
+        return;
+    };
+
+    for user_input in &user_inputs.inputs {
+        let Some(Input::ToolCallResult(tool_result)) = user_input.input.as_ref() else {
+            continue;
+        };
+        let Some(Result::RunAgentsResult(result)) = tool_result.result.as_ref() else {
+            continue;
+        };
+        let Some(Outcome::Launched(launched)) = result.outcome.as_ref() else {
+            continue;
+        };
+        for agent in &launched.agents {
+            if let Some(agent_outcome::Result::Launched(child)) = agent.result.as_ref() {
+                state.register_launched_agent(&agent.name, &child.agent_id);
+            }
+        }
+    }
 }
 
 /// Convert a request-level ToolCallResult to text for the LLM.
@@ -786,6 +887,24 @@ fn request_tool_call_result_to_text(
                 .map(|f| format!("=== {} ===\n{}", f.file_path, f.content))
                 .collect::<Vec<_>>()
                 .join("\n\n"),
+            Some(warp_multi_agent_api::read_files_result::Result::AnyFilesSuccess(s)) => {
+                use warp_multi_agent_api::any_file_content::Content;
+                s.files
+                    .iter()
+                    .filter_map(|file| match file.content.as_ref() {
+                        Some(Content::TextContent(text)) => {
+                            Some(format!("=== {} ===\n{}", text.file_path, text.content))
+                        }
+                        Some(Content::BinaryContent(binary)) => Some(format!(
+                            "=== {} ===\n(binary file, {} bytes)",
+                            binary.file_path,
+                            binary.data.len()
+                        )),
+                        None => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            }
             Some(warp_multi_agent_api::read_files_result::Result::Error(e)) => {
                 format!("Error: {}", e.message)
             }
@@ -857,6 +976,65 @@ fn request_tool_call_result_to_text(
                 "Plan rejected.".into()
             }
         }
+        R::RunAgentsResult(result) => {
+            use warp_multi_agent_api::run_agents_result::Outcome;
+            match result.outcome.as_ref() {
+                Some(Outcome::Launched(launched)) => {
+                    let agents = launched
+                        .agents
+                        .iter()
+                        .map(|agent| {
+                            use warp_multi_agent_api::run_agents_result::agent_outcome::Result;
+                            match agent.result.as_ref() {
+                                Some(Result::Launched(child)) => format!(
+                                    "{}: launched with conversation_id={}",
+                                    agent.name, child.agent_id
+                                ),
+                                Some(Result::Failed(failure)) => {
+                                    format!("{}: failed: {}", agent.name, failure.error)
+                                }
+                                None => format!("{}: launch status unavailable", agent.name),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        "Agents launched. Use the exact conversation_id values below for messaging and fetch_conversation:\n{agents}"
+                    )
+                }
+                Some(Outcome::Denied(denied)) => {
+                    format!("Agent launch denied: {}", denied.reason)
+                }
+                Some(Outcome::Failure(failure)) => {
+                    format!("Agent launch failed: {}", failure.error)
+                }
+                None => "Agent launch returned no outcome.".to_string(),
+            }
+        }
+        R::SendMessageToAgent(result) => {
+            use warp_multi_agent_api::send_message_to_agent_result::Result;
+            match result.result.as_ref() {
+                Some(Result::Success(success)) => {
+                    format!("Message sent with id={}", success.message_id)
+                }
+                Some(Result::Error(error)) => format!("Message failed: {}", error.message),
+                None => "Message returned no result.".to_string(),
+            }
+        }
+        R::FetchConversation(result) => {
+            use warp_multi_agent_api::fetch_conversation_result::Result;
+            match result.result.as_ref() {
+                Some(Result::Success(success)) => format!(
+                    "Conversation materialized at {}. Read the files in that directory for the child result.",
+                    success.directory_path
+                ),
+                Some(Result::Error(error)) => {
+                    format!("Failed to fetch conversation: {}", error.message)
+                }
+                None => "Fetch conversation returned no result.".to_string(),
+            }
+        }
+        R::WaitForEvents(_) => "Finished waiting for agent events.".to_string(),
         _ => "(tool result)".to_string(),
     }
 }
@@ -942,10 +1120,32 @@ fn json_to_prost_struct(value: &serde_json::Value) -> Option<prost_types::Struct
     }
 }
 
+fn wait_for_conversation_command(path: &std::path::Path) -> String {
+    if cfg!(windows) {
+        let path = path.to_string_lossy().replace('\'', "''");
+        format!(
+            "$path = '{path}'; $deadline = (Get-Date).AddSeconds(120); \
+             while (-not (Test-Path -LiteralPath $path)) {{ \
+             if ((Get-Date) -ge $deadline) {{ throw 'Timed out waiting for child conversation' }}; \
+             Start-Sleep -Milliseconds 250 }}; Get-Content -Raw -LiteralPath $path"
+        )
+    } else {
+        let path = path.to_string_lossy();
+        let path = path.replace('\'', "'\"'\"'");
+        format!(
+            "path='{path}'; deadline=$((SECONDS + 120)); \
+             while [ ! -f \"$path\" ]; do \
+             [ \"$SECONDS\" -ge \"$deadline\" ] && {{ echo 'Timed out waiting for child conversation' >&2; exit 1; }}; \
+             sleep 0.25; done; cat \"$path\""
+        )
+    }
+}
+
 // ── OpenAI tool_call → protobuf ToolCall ─────────────────────────────
 
 fn openai_tool_call_to_proto(
     tc: &serde_json::Value,
+    state: &AppState,
 ) -> Option<warp_multi_agent_api::message::ToolCall> {
     let fn_name = tc["function"]["name"].as_str()?;
     let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
@@ -970,15 +1170,15 @@ fn openai_tool_call_to_proto(
         "read_shell_command_output" => {
             let delay = if args["wait_for_completion"].as_bool().unwrap_or(false) {
                 Some(warp_multi_agent_api::message::tool_call::read_shell_command_output::Delay::OnCompletion(()))
-            } else if let Some(delay_seconds) = args["delay_seconds"].as_i64() {
-                Some(warp_multi_agent_api::message::tool_call::read_shell_command_output::Delay::Duration(
+            } else {
+                args["delay_seconds"].as_i64().map(|delay_seconds| {
+                    warp_multi_agent_api::message::tool_call::read_shell_command_output::Delay::Duration(
                     prost_types::Duration {
                         seconds: delay_seconds,
                         nanos: 0,
                     },
-                ))
-            } else {
-                None
+                    )
+                })
             };
             Tool::ReadShellCommandOutput(warp_multi_agent_api::message::tool_call::ReadShellCommandOutput {
                 command_id: args["command_id"].as_str().unwrap_or("").into(),
@@ -1252,6 +1452,19 @@ fn openai_tool_call_to_proto(
                                         supports_other: multiple_choice["supports_other"].as_bool().unwrap_or(false),
                                     },
                                 )
+                            }).or_else(|| {
+                                Some(
+                                    warp_multi_agent_api::ask_user_question::question::QuestionType::MultipleChoice(
+                                        warp_multi_agent_api::ask_user_question::MultipleChoice {
+                                            options: vec![warp_multi_agent_api::ask_user_question::Option {
+                                                label: "Enter a custom response".into(),
+                                            }],
+                                            recommended_option_index: 0,
+                                            is_multiselect: false,
+                                            supports_other: true,
+                                        },
+                                    ),
+                                )
                             });
                             Some(warp_multi_agent_api::ask_user_question::Question {
                                 question_id,
@@ -1376,7 +1589,10 @@ fn openai_tool_call_to_proto(
                                 }),
                                 _ => return None,
                             };
-                            Some(Action { r#type: Some(t) })
+                            Some(Action {
+                                target: None,
+                                r#type: Some(t),
+                            })
                         })
                         .collect()
                 })
@@ -1394,33 +1610,50 @@ fn openai_tool_call_to_proto(
             },
         ),
         "subagent" => {
-            use warp_multi_agent_api::message::tool_call::subagent::Metadata;
-            let metadata = match args["type"].as_str().unwrap_or("research") {
-                "cli" => Some(Metadata::Cli(
-                    warp_multi_agent_api::message::tool_call::subagent::CliSubagent {
-                        command_id: String::new(),
-                    },
-                )),
-                "advice" => Some(Metadata::Advice(())),
-                "computer_use" => Some(Metadata::ComputerUse(())),
-                _ => Some(Metadata::Research(())),
-            };
-            Tool::Subagent(warp_multi_agent_api::message::tool_call::Subagent {
-                task_id: args["task_id"].as_str().unwrap_or("").into(),
-                payload: args["payload"].as_str().unwrap_or("").into(),
-                metadata,
+            let name = args["task_id"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("subagent")
+                .to_string();
+            Tool::RunAgents(warp_multi_agent_api::RunAgents {
+                summary: format!("Start local subagent {name}"),
+                agent_run_configs: vec![warp_multi_agent_api::run_agents::AgentRunConfig {
+                    name: name.clone(),
+                    prompt: args["payload"].as_str().unwrap_or("").into(),
+                    title: name,
+                    agent_identity_uid: String::new(),
+                    model_id: String::new(),
+                    harness: None,
+                    execution_mode: None,
+                }],
+                execution_mode: Some(
+                    warp_multi_agent_api::run_agents::ExecutionModeOneOf::Local(
+                        warp_multi_agent_api::run_agents::Local {},
+                    ),
+                ),
+                harness: Some(oz_harness()),
+                ..Default::default()
             })
         }
         "start_agent" => {
-            let execution_mode = Some(
-                warp_multi_agent_api::start_agent::ExecutionMode {
-                    mode: Some(warp_multi_agent_api::start_agent::execution_mode::Mode::Local(())),
-                },
-            );
-            Tool::StartAgent(warp_multi_agent_api::StartAgent {
-                name: args["name"].as_str().unwrap_or("").into(),
-                prompt: args["prompt"].as_str().unwrap_or("").into(),
-                execution_mode,
+            let name = args["name"].as_str().unwrap_or("").to_owned();
+            Tool::RunAgents(warp_multi_agent_api::RunAgents {
+                summary: format!("Start agent {name}"),
+                agent_run_configs: vec![warp_multi_agent_api::run_agents::AgentRunConfig {
+                    name: name.clone(),
+                    prompt: args["prompt"].as_str().unwrap_or("").into(),
+                    title: name,
+                    agent_identity_uid: String::new(),
+                    model_id: String::new(),
+                    harness: None,
+                    execution_mode: None,
+                }],
+                execution_mode: Some(
+                    warp_multi_agent_api::run_agents::ExecutionModeOneOf::Local(
+                        warp_multi_agent_api::run_agents::Local {},
+                    ),
+                ),
+                harness: Some(oz_harness()),
                 ..Default::default()
             })
         }
@@ -1429,9 +1662,25 @@ fn openai_tool_call_to_proto(
             subject: args["subject"].as_str().unwrap_or("").into(),
             message: args["message"].as_str().unwrap_or("").into(),
         }),
-        "fetch_conversation" => Tool::FetchConversation(warp_multi_agent_api::message::tool_call::FetchConversation {
-            conversation_id: args["conversation_id"].as_str().unwrap_or("").into(),
-        }),
+        "fetch_conversation" => {
+            let conversation_id = args["conversation_id"].as_str().unwrap_or("");
+            if let Some(path) = state.conversation_cache_path(conversation_id) {
+                Tool::RunShellCommand(
+                    warp_multi_agent_api::message::tool_call::RunShellCommand {
+                        command: wait_for_conversation_command(&path),
+                        #[allow(deprecated)]
+                        is_read_only: true,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                Tool::FetchConversation(
+                    warp_multi_agent_api::message::tool_call::FetchConversation {
+                        conversation_id: conversation_id.into(),
+                    },
+                )
+            }
+        }
         "upload_file_artifact" => Tool::UploadFileArtifact(warp_multi_agent_api::UploadFileArtifact {
             file: Some(warp_multi_agent_api::FilePathReference {
                 file_path: args["file_path"].as_str().unwrap_or("").into(),
@@ -1448,6 +1697,13 @@ fn openai_tool_call_to_proto(
                                 name: agent["name"].as_str()?.into(),
                                 prompt: agent["prompt"].as_str().unwrap_or("").into(),
                                 title: agent["title"].as_str().unwrap_or("").into(),
+                                agent_identity_uid: agent["agent_identity_uid"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .into(),
+                                model_id: agent["model_id"].as_str().unwrap_or("").into(),
+                                harness: None,
+                                execution_mode: None,
                             })
                         })
                         .collect()
@@ -1457,9 +1713,12 @@ fn openai_tool_call_to_proto(
                 summary: args["summary"].as_str().unwrap_or("").into(),
                 base_prompt: args["base_prompt"].as_str().unwrap_or("").into(),
                 agent_run_configs,
-                execution_mode: Some(warp_multi_agent_api::run_agents::ExecutionMode::Local(
-                    warp_multi_agent_api::run_agents::Local {},
-                )),
+                execution_mode: Some(
+                    warp_multi_agent_api::run_agents::ExecutionModeOneOf::Local(
+                        warp_multi_agent_api::run_agents::Local {},
+                    ),
+                ),
+                harness: Some(oz_harness()),
                 ..Default::default()
             })
         }
@@ -1473,6 +1732,52 @@ fn openai_tool_call_to_proto(
 }
 
 // ── Main handler ─────────────────────────────────────────────────────
+
+fn resolve_backend(
+    request: &warp_multi_agent_api::Request,
+    selected_model: &str,
+    fallback: &Config,
+) -> anyhow::Result<(Config, String)> {
+    use warp_multi_agent_api::request::settings::custom_model_providers::CustomEndpointSchema;
+
+    let Some(providers) = request
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.custom_model_providers.as_ref())
+    else {
+        return Ok((fallback.clone(), selected_model.to_string()));
+    };
+
+    for provider in &providers.providers {
+        let Some(model) = provider
+            .models
+            .iter()
+            .find(|model| model.config_key == selected_model)
+        else {
+            continue;
+        };
+
+        let schema = CustomEndpointSchema::try_from(provider.schema)
+            .map_err(|_| anyhow::anyhow!("custom model provider has an unknown schema"))?;
+        if schema != CustomEndpointSchema::OpenaiChatCompletions {
+            anyhow::bail!(
+                "custom model '{}' uses unsupported schema {}; warp_local_proxy currently supports OpenAI Chat Completions",
+                model.slug,
+                schema.as_str_name()
+            );
+        }
+
+        let mut config = fallback.clone();
+        config.backend_base_url = provider.base_url.clone();
+        config.backend_auth_style = AuthStyle::Bearer;
+        config.backend_api_key = (!provider.api_key.is_empty()).then(|| provider.api_key.clone());
+        config.azure_api_version = None;
+        config.default_model = model.slug.clone();
+        return Ok((config, model.slug.clone()));
+    }
+
+    Ok((fallback.clone(), selected_model.to_string()))
+}
 
 pub async fn handle(
     State(state): State<Arc<AppState>>,
@@ -1488,8 +1793,10 @@ pub async fn handle(
                 .unwrap();
         }
     };
+    let available_tools = openai_tools_for_request(&request);
 
     let user_query = extract_user_query(&request);
+    register_launched_agents(&request, &state);
     let tool_results = extract_tool_results(&request);
 
     // Debug: log the input type to diagnose tool result delivery
@@ -1508,6 +1815,16 @@ pub async fn handle(
         .map(|mc| mc.base.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| state.config.default_model.clone());
+    let (backend_config, backend_model) =
+        match resolve_backend(&request, &selected_model, &state.config) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(error.to_string()))
+                    .unwrap();
+            }
+        };
 
     // Detect if this is a continuation by checking for existing tasks or tool results
     let existing_task_id = request
@@ -1523,6 +1840,7 @@ pub async fn handle(
         is_continuation,
         existing_task = existing_task_id.as_deref().unwrap_or("(none)"),
         model = %selected_model,
+        backend_model = %backend_model,
         "multi-agent request"
     );
 
@@ -1531,6 +1849,11 @@ pub async fn handle(
     let request_id = uuid::Uuid::new_v4().to_string();
     let run_id = uuid::Uuid::new_v4().to_string();
     let task_id = existing_task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    state.register_conversation_task(&conversation_id, &task_id);
+    if let Some(metadata) = request.metadata.as_ref() {
+        state.register_conversation_task(&metadata.conversation_id, &task_id);
+        state.register_agent_task(&metadata.agent_name, &task_id);
+    }
 
     // ── Server-side conversation cache ──
     // The Warp client does NOT persist ToolCallResults or follow-up user
@@ -1572,7 +1895,15 @@ pub async fn handle(
             }
         ]);
         let summary_messages: Vec<serde_json::Value> = serde_json::from_value(summary_prompt).unwrap_or_default();
-        let summary_result = call_backend_with_tools(&state, &summary_messages, false, &selected_model).await;
+        let summary_result = call_backend_with_tools(
+            &state,
+            &backend_config,
+            &summary_messages,
+            false,
+            &backend_model,
+            &available_tools,
+        )
+        .await;
         if let Ok(LlmResult { response: LlmResponse::Text(ref summary), .. }) = summary_result {
             // Replace conversation with system + summary
             openai_messages = vec![
@@ -1707,7 +2038,15 @@ pub async fn handle(
             json!({ "role": "user", "content": summary_text }),
         ];
         if let Ok(LlmResult { response: LlmResponse::Text(ref summary), .. }) =
-            call_backend_with_tools(&state, &summary_msgs, false, &selected_model).await
+            call_backend_with_tools(
+                &state,
+                &backend_config,
+                &summary_msgs,
+                false,
+                &backend_model,
+                &available_tools,
+            )
+            .await
         {
             openai_messages = vec![
                 openai_messages[0].clone(),
@@ -1768,7 +2107,15 @@ pub async fn handle(
         );
     }
 
-    let llm_result = call_backend_streaming(&state, &llm_messages, send_tools, &selected_model).await;
+    let llm_result = call_backend_streaming(
+        &state,
+        &backend_config,
+        &llm_messages,
+        send_tools,
+        &backend_model,
+        &available_tools,
+    )
+    .await;
 
     let mut sse_body = String::new();
 
@@ -1793,6 +2140,7 @@ pub async fn handle(
                             warp_multi_agent_api::client_action::CreateTask {
                                 task: Some(warp_multi_agent_api::Task {
                                     id: task_id.clone(),
+                                    description: task_description(user_query.as_deref()),
                                     ..Default::default()
                                 }),
                             },
@@ -1816,6 +2164,7 @@ pub async fn handle(
                                             id: user_msg_id,
                                             task_id: task_id.clone(),
                                             request_id: request_id.clone(),
+                                            timestamp: Some(current_timestamp()),
                                             message: Some(
                                                 warp_multi_agent_api::message::Message::UserQuery(
                                                     warp_multi_agent_api::message::UserQuery {
@@ -1930,7 +2279,7 @@ pub async fn handle(
 
             // Emit each tool call as a separate protobuf event for the client
             for tc in &tool_calls {
-                if let Some(proto_tc) = openai_tool_call_to_proto(tc) {
+                if let Some(proto_tc) = openai_tool_call_to_proto(tc, &state) {
                     let tc_msg_id = uuid::Uuid::new_v4().to_string();
                     sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
                         r#type: Some(warp_multi_agent_api::response_event::Type::ClientActions(
@@ -1944,6 +2293,7 @@ pub async fn handle(
                                                     id: tc_msg_id,
                                                     task_id: task_id.clone(),
                                                     request_id: request_id.clone(),
+                                                    timestamp: Some(current_timestamp()),
                                                     message: Some(
                                                         warp_multi_agent_api::message::Message::ToolCall(proto_tc),
                                                     ),
@@ -2000,6 +2350,7 @@ fn agent_output_placeholder_event(
                                     id: msg_id.to_string(),
                                     task_id: task_id.to_string(),
                                     request_id: request_id.to_string(),
+                                    timestamp: Some(current_timestamp()),
                                     message: Some(
                                         warp_multi_agent_api::message::Message::AgentOutput(
                                             warp_multi_agent_api::message::AgentOutput {
@@ -2036,6 +2387,7 @@ fn agent_output_append_event(
                                     id: msg_id.to_string(),
                                     task_id: task_id.to_string(),
                                     request_id: request_id.to_string(),
+                                    timestamp: Some(current_timestamp()),
                                     message: Some(
                                         warp_multi_agent_api::message::Message::AgentOutput(
                                             warp_multi_agent_api::message::AgentOutput {
@@ -2264,11 +2616,13 @@ async fn handle_backend_stream_line(
 
 async fn call_backend_streaming(
     state: &AppState,
+    config: &Config,
     messages: &[serde_json::Value],
     send_tools: bool,
     model: &str,
+    tools: &serde_json::Value,
 ) -> Result<StreamingLlmResult, anyhow::Error> {
-    let url = state.config.chat_completions_url_for_model(model);
+    let url = config.chat_completions_url_for_model(model);
 
     // Newer models (gpt-5.x, o-series) require max_completion_tokens;
     // older models (gpt-4o, DeepSeek, etc.) use max_tokens.
@@ -2286,7 +2640,7 @@ async fn call_backend_streaming(
     });
 
     if send_tools {
-        payload["tools"] = openai_tools();
+        payload["tools"] = tools.clone();
     }
 
     let mut req = state
@@ -2294,7 +2648,7 @@ async fn call_backend_streaming(
         .post(&url)
         .header("Content-Type", "application/json")
         .json(&payload);
-    req = apply_backend_auth(req, &state.config);
+    req = apply_backend_auth(req, config);
 
     let resp = req.send().await?;
 
@@ -2389,11 +2743,13 @@ async fn call_backend_streaming(
 
 async fn call_backend_with_tools(
     state: &AppState,
+    config: &Config,
     messages: &[serde_json::Value],
     send_tools: bool,
     model: &str,
+    tools: &serde_json::Value,
 ) -> Result<LlmResult, anyhow::Error> {
-    let url = state.config.chat_completions_url_for_model(model);
+    let url = config.chat_completions_url_for_model(model);
 
     let max_tokens_key = if model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
         "max_completion_tokens"
@@ -2409,7 +2765,7 @@ async fn call_backend_with_tools(
     });
 
     if send_tools {
-        payload["tools"] = openai_tools();
+        payload["tools"] = tools.clone();
     }
 
     let mut req = state
@@ -2417,7 +2773,7 @@ async fn call_backend_with_tools(
         .post(&url)
         .header("Content-Type", "application/json")
         .json(&payload);
-    req = apply_backend_auth(req, &state.config);
+    req = apply_backend_auth(req, config);
 
     let resp = req.send().await?;
 
@@ -2461,6 +2817,226 @@ async fn call_backend_with_tools(
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+
+    fn fallback_config() -> Config {
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            backend_base_url: "http://127.0.0.1:3113/v1".into(),
+            backend_auth_style: AuthStyle::Bearer,
+            backend_api_key: None,
+            azure_api_version: None,
+            default_model: "fallback-model".into(),
+        }
+    }
+
+    #[test]
+    fn generated_messages_use_current_timestamps_and_prompt_titles() {
+        assert!(current_timestamp().seconds > 1_700_000_000);
+        assert_eq!(task_description(Some("  Investigate the proxy  ")), "Investigate the proxy");
+        assert_eq!(task_description(Some("")), "Local agent");
+        assert_eq!(task_description(Some(&"x".repeat(100))).len(), 80);
+    }
+
+    #[test]
+    fn run_agents_result_preserves_child_conversation_id() {
+        use warp_multi_agent_api::request;
+        use warp_multi_agent_api::run_agents_result::agent_outcome;
+        use warp_multi_agent_api::run_agents_result::{
+            AgentOutcome, Launched, LaunchedAgent, Outcome,
+        };
+
+        let result = request::input::ToolCallResult {
+            tool_call_id: "run-agents-1".into(),
+            result: Some(request::input::tool_call_result::Result::RunAgentsResult(
+                warp_multi_agent_api::RunAgentsResult {
+                    outcome: Some(Outcome::Launched(Launched {
+                        agents: vec![AgentOutcome {
+                            name: "child".into(),
+                            result: Some(agent_outcome::Result::Launched(LaunchedAgent {
+                                agent_id: "child-conversation-id".into(),
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                },
+            )),
+        };
+
+        let text = request_tool_call_result_to_text(&result);
+        assert!(text.contains("child-conversation-id"));
+        assert!(text.contains("conversation_id"));
+    }
+
+    #[test]
+    fn any_file_read_result_preserves_text_content() {
+        use warp_multi_agent_api::any_file_content::Content;
+        use warp_multi_agent_api::read_files_result;
+        use warp_multi_agent_api::request;
+
+        let result = request::input::ToolCallResult {
+            tool_call_id: "read-child-cache".into(),
+            result: Some(request::input::tool_call_result::Result::ReadFiles(
+                warp_multi_agent_api::ReadFilesResult {
+                    result: Some(read_files_result::Result::AnyFilesSuccess(
+                        read_files_result::AnyFilesSuccess {
+                            files: vec![warp_multi_agent_api::AnyFileContent {
+                                content: Some(Content::TextContent(
+                                    warp_multi_agent_api::FileContent {
+                                        file_path: "child.json".into(),
+                                        content: r#"[{"content":"E2E_CHILD_OK"}]"#.into(),
+                                        line_range: None,
+                                    },
+                                )),
+                            }],
+                            failed_reads: vec![],
+                        },
+                    )),
+                },
+            )),
+        };
+
+        assert!(request_tool_call_result_to_text(&result).contains("E2E_CHILD_OK"));
+    }
+
+    #[test]
+    fn conversation_wait_command_reads_the_resolved_cache_file() {
+        let path = std::path::Path::new("child-conversation.json");
+        let command = wait_for_conversation_command(path);
+        assert!(command.contains("child-conversation.json"));
+        assert!(command.contains("120"));
+    }
+
+    #[test]
+    fn advertised_agent_tools_only_use_current_run_agents_contract() {
+        let tools = openai_tools();
+        let names = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(|name| name.as_str()))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"run_agents"));
+        assert!(!names.contains(&"subagent"));
+        assert!(!names.contains(&"start_agent"));
+    }
+
+    #[test]
+    fn request_capabilities_filter_the_advertised_tool_catalog() {
+        let request = warp_multi_agent_api::Request {
+            settings: Some(warp_multi_agent_api::request::Settings {
+                supported_tools: vec![warp_multi_agent_api::ToolType::RunAgents as i32],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let tools = openai_tools_for_request(&request);
+        let names = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(|name| name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["run_agents"]);
+    }
+
+    #[test]
+    fn child_requests_honor_the_client_supplied_tool_policy() {
+        let request = warp_multi_agent_api::Request {
+            settings: Some(warp_multi_agent_api::request::Settings {
+                supported_tools: vec![
+                    warp_multi_agent_api::ToolType::RunAgents as i32,
+                    warp_multi_agent_api::ToolType::RunShellCommand as i32,
+                ],
+                ..Default::default()
+            }),
+            metadata: Some(warp_multi_agent_api::request::Metadata {
+                parent_agent_id: "parent-run-id".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let tools = openai_tools_for_request(&request);
+        let names = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(|name| name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["run_shell_command"]);
+    }
+
+    #[test]
+    fn open_question_falls_back_to_freeform_capable_multiple_choice() {
+        use warp_multi_agent_api::message::tool_call::Tool;
+
+        let state = AppState::new(fallback_config(), vec![]);
+        let tool_call = json!({
+            "id": "question-1",
+            "function": {
+                "name": "ask_user_question",
+                "arguments": serde_json::to_string(&json!({
+                    "questions": [{
+                        "question_id": "topic",
+                        "question": "What should the diagram show?"
+                    }]
+                })).unwrap()
+            }
+        });
+
+        let converted = openai_tool_call_to_proto(&tool_call, &state).unwrap();
+        let Some(Tool::AskUserQuestion(question)) = converted.tool else {
+            panic!("expected AskUserQuestion");
+        };
+        assert_eq!(question.questions.len(), 1);
+        let question_type = question.questions[0].question_type.as_ref();
+        assert!(matches!(
+            question_type,
+            Some(
+                warp_multi_agent_api::ask_user_question::question::QuestionType::MultipleChoice(
+                    multiple_choice
+                )
+            ) if multiple_choice.supports_other
+        ));
+    }
+
+    #[test]
+    fn custom_model_config_key_resolves_to_provider_slug_and_endpoint() {
+        use warp_multi_agent_api::request::settings::custom_model_providers::{
+            CustomEndpointSchema, CustomModel, CustomModelProvider,
+        };
+
+        let request = warp_multi_agent_api::Request {
+            settings: Some(warp_multi_agent_api::request::Settings {
+                model_config: Some(warp_multi_agent_api::request::settings::ModelConfig {
+                    base: "custom-key".into(),
+                    ..Default::default()
+                }),
+                custom_model_providers: Some(
+                    warp_multi_agent_api::request::settings::CustomModelProviders {
+                        providers: vec![CustomModelProvider {
+                            base_url: "https://custom.example/v1".into(),
+                            api_key: "test-key".into(),
+                            models: vec![CustomModel {
+                                slug: "provider-model".into(),
+                                config_key: "custom-key".into(),
+                                reasoning_effort: String::new(),
+                            }],
+                            schema: CustomEndpointSchema::OpenaiChatCompletions as i32,
+                        }],
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (config, model) =
+            resolve_backend(&request, "custom-key", &fallback_config()).unwrap();
+        assert_eq!(model, "provider-model");
+        assert_eq!(config.backend_base_url, "https://custom.example/v1");
+        assert_eq!(config.backend_api_key.as_deref(), Some("test-key"));
+    }
 
     #[test]
     fn drain_sse_line_handles_partial_buffers() {

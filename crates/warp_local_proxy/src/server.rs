@@ -1,6 +1,7 @@
 //! Builds the axum [`Router`] and runs the HTTP server.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use axum::{
     extract::ws::{WebSocket, WebSocketUpgrade},
@@ -24,7 +25,11 @@ pub const LOCAL_FALLBACK_MODEL_ID: &str = "local-model";
 pub struct AppState {
     pub config: Arc<Config>,
     pub http: reqwest::Client,
-    pub models: Arc<Vec<String>>,
+    models: Arc<RwLock<Vec<String>>>,
+    conversation_tasks: Arc<RwLock<HashMap<String, String>>>,
+    agent_tasks: Arc<RwLock<HashMap<String, String>>>,
+    launched_agents: Arc<RwLock<HashMap<String, String>>>,
+    pub agent_api: Arc<handlers::agent_api::AgentApiState>,
     /// Directory for persisted conversation cache (one JSON file per task_id).
     pub conversation_cache_dir: std::path::PathBuf,
 }
@@ -38,7 +43,11 @@ impl AppState {
         Self {
             config: Arc::new(config),
             http,
-            models: Arc::new(models),
+            models: Arc::new(RwLock::new(models)),
+            conversation_tasks: Arc::new(RwLock::new(HashMap::new())),
+            agent_tasks: Arc::new(RwLock::new(HashMap::new())),
+            launched_agents: Arc::new(RwLock::new(HashMap::new())),
+            agent_api: Arc::new(handlers::agent_api::AgentApiState::new()),
             conversation_cache_dir: {
                 let base = std::env::var("HOME")
                     .map(std::path::PathBuf::from)
@@ -54,32 +63,128 @@ impl AppState {
         }
     }
 
-    /// Returns the model ids the proxy advertises to the Warp client. Always
-    /// non-empty: when the backend's `/v1/models` returned nothing or
-    /// errored, we fall back to a single `LOCAL_FALLBACK_MODEL_ID` entry so
-    /// the client's model picker still works.
+    /// Returns the configured model first, followed by usable models discovered
+    /// from the optional upstream backend.
     pub fn advertised_models(&self) -> Vec<String> {
-        if self.models.is_empty() {
-            vec![LOCAL_FALLBACK_MODEL_ID.to_string()]
+        let configured = self.default_model_id();
+        let mut models = vec![configured.clone()];
+        for model in self.models.read().expect("models lock poisoned").iter() {
+            if model != &configured
+                && !is_likely_embedding_model(model)
+                && !models.iter().any(|existing| existing == model)
+            {
+                models.push(model.clone());
+            }
+        }
+        models
+    }
+
+    /// Returns the explicitly configured model even when the optional
+    /// backend's model-list endpoint is unavailable or incomplete.
+    pub fn default_model_id(&self) -> String {
+        if self.config.default_model.trim().is_empty() {
+            LOCAL_FALLBACK_MODEL_ID.to_string()
         } else {
-            self.models.as_ref().clone()
+            self.config.default_model.clone()
         }
     }
 
-    /// Returns the id the proxy uses by default when an op didn't pick one.
-    /// Prefers the user's --default-model when it appears in the backend's
-    /// list (or when no list is available), otherwise falls back to the
-    /// first model the backend advertised.
-    pub fn default_model_id(&self) -> String {
-        if self.models.is_empty() || self.models.iter().any(|m| m == &self.config.default_model) {
-            self.config.default_model.clone()
-        } else {
-            self.models[0].clone()
+    /// Refresh optional backend discovery without making model exposure depend
+    /// on that endpoint. The configured model remains authoritative.
+    pub async fn refresh_models(&self) {
+        let models = openai::fetch_models(&self.http, &self.config).await;
+        *self.models.write().expect("models lock poisoned") = models;
+    }
+
+    pub fn register_conversation_task(&self, conversation_id: &str, task_id: &str) {
+        if !is_safe_cache_key(conversation_id) || !is_safe_cache_key(task_id) {
+            return;
         }
+        self.conversation_tasks
+            .write()
+            .expect("conversation task lock poisoned")
+            .insert(conversation_id.to_string(), task_id.to_string());
+
+        let task_path = self.conversation_cache_dir.join(format!("{task_id}.json"));
+        if let Ok(data) = std::fs::read_to_string(&task_path) {
+            if serde_json::from_str::<Vec<serde_json::Value>>(&data)
+                .is_ok_and(|messages| conversation_is_terminal(&messages))
+            {
+                let alias_path = self
+                    .conversation_cache_dir
+                    .join(format!("{conversation_id}.json"));
+                let _ = std::fs::write(alias_path, data);
+            }
+        }
+    }
+
+    pub fn register_agent_task(&self, agent_name: &str, task_id: &str) {
+        if agent_name.is_empty() || !is_safe_cache_key(task_id) {
+            return;
+        }
+        self.agent_tasks
+            .write()
+            .expect("agent task lock poisoned")
+            .insert(agent_name.to_string(), task_id.to_string());
+
+        if let Some(conversation_id) = self
+            .launched_agents
+            .read()
+            .expect("launched agents lock poisoned")
+            .get(agent_name)
+            .cloned()
+        {
+            self.register_conversation_task(&conversation_id, task_id);
+        }
+    }
+
+    pub fn register_launched_agent(&self, agent_name: &str, conversation_id: &str) {
+        if agent_name.is_empty() || !is_safe_cache_key(conversation_id) {
+            return;
+        }
+        self.launched_agents
+            .write()
+            .expect("launched agents lock poisoned")
+            .insert(agent_name.to_string(), conversation_id.to_string());
+
+        if let Some(task_id) = self
+            .agent_tasks
+            .read()
+            .expect("agent task lock poisoned")
+            .get(agent_name)
+            .cloned()
+        {
+            self.register_conversation_task(conversation_id, &task_id);
+        }
+    }
+
+    pub fn conversation_cache_path(&self, conversation_id: &str) -> Option<std::path::PathBuf> {
+        if !is_safe_cache_key(conversation_id) {
+            return None;
+        }
+        let has_task = self
+            .conversation_tasks
+            .read()
+            .expect("conversation task lock poisoned")
+            .contains_key(conversation_id);
+        let is_launched = self
+            .launched_agents
+            .read()
+            .expect("launched agents lock poisoned")
+            .values()
+            .any(|launched_id| launched_id == conversation_id);
+        (has_task || is_launched).then(|| {
+            self.conversation_cache_dir
+                .join(format!("{conversation_id}.json"))
+        })
     }
 
     /// Load persisted conversation history for a task.
     pub fn load_conversation(&self, task_id: &str) -> Vec<serde_json::Value> {
+        if !is_safe_cache_key(task_id) {
+            tracing::warn!(task_id, "rejecting unsafe conversation cache key");
+            return Vec::new();
+        }
         let path = self.conversation_cache_dir.join(format!("{task_id}.json"));
         match std::fs::read_to_string(&path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
@@ -89,11 +194,59 @@ impl AppState {
 
     /// Save conversation history for a task to disk.
     pub fn save_conversation(&self, task_id: &str, messages: &[serde_json::Value]) {
+        if !is_safe_cache_key(task_id) {
+            tracing::warn!(task_id, "rejecting unsafe conversation cache key");
+            return;
+        }
         let path = self.conversation_cache_dir.join(format!("{task_id}.json"));
         if let Ok(data) = serde_json::to_string(messages) {
-            std::fs::write(&path, data).ok();
+            std::fs::write(&path, &data).ok();
+            let aliases = self
+                .conversation_tasks
+                .read()
+                .expect("conversation task lock poisoned")
+                .iter()
+                .filter_map(|(conversation_id, mapped_task_id)| {
+                    (mapped_task_id == task_id).then_some(conversation_id.clone())
+                })
+                .collect::<Vec<_>>();
+            if conversation_is_terminal(messages) {
+                for conversation_id in aliases {
+                    let alias_path = self
+                        .conversation_cache_dir
+                        .join(format!("{conversation_id}.json"));
+                    std::fs::write(alias_path, &data).ok();
+                }
+            }
         }
     }
+}
+
+fn conversation_is_terminal(messages: &[serde_json::Value]) -> bool {
+    let Some(last) = messages.last() else {
+        return false;
+    };
+    last.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+        && last
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| !content.trim().is_empty())
+        && last
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|calls| calls.is_empty())
+}
+
+fn is_safe_cache_key(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn is_likely_embedding_model(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    normalized.contains("embedding") || normalized.contains("embed-text")
 }
 
 /// Accept WebSocket upgrades on `/graphql/v2` and idle silently.
@@ -151,8 +304,66 @@ pub fn router(state: AppState) -> Router {
             "/login_options/{custom_token}",
             get(handlers::browser_auth::handle_login_options),
         )
-        // Cloud-only REST: agent runs, attachments, conversation snapshots.
-        // Return 503 with structured error so the client knows it's unsupported.
+        // Local implementations of the agent REST surfaces used by run
+        // restoration, orchestration event delivery, and agent messaging.
+        .route(
+            "/api/v1/agent/events/stream",
+            get(handlers::agent_api::stream_events),
+        )
+        .route(
+            "/api/v1/agent/events/{run_id}",
+            post(handlers::agent_api::report_event),
+        )
+        .route(
+            "/api/v1/agent/runs",
+            get(handlers::agent_api::list_runs),
+        )
+        .route(
+            "/api/v1/agent/runs/{run_id}",
+            get(handlers::agent_api::get_run),
+        )
+        .route(
+            "/api/v1/agent/runs/{run_id}/event-sequence",
+            axum::routing::patch(handlers::agent_api::acknowledge),
+        )
+        .route(
+            "/api/v1/agent/runs/{run_id}/client-events",
+            post(handlers::agent_api::acknowledge),
+        )
+        .route(
+            "/api/v1/agent/runs/{run_id}/followups",
+            post(handlers::agent_api::acknowledge),
+        )
+        .route(
+            "/api/v1/agent/messages",
+            post(handlers::agent_api::send_messages),
+        )
+        .route(
+            "/api/v1/agent/messages/{run_id}",
+            get(handlers::agent_api::list_messages),
+        )
+        .route(
+            "/api/v1/agent/messages/{message_id}/delivered",
+            post(handlers::agent_api::mark_message_delivered),
+        )
+        .route(
+            "/api/v1/agent/messages/{message_id}/read",
+            post(handlers::agent_api::read_message),
+        )
+        .route(
+            "/api/v1/agent/identities",
+            get(handlers::agent_api::list_identities),
+        )
+        .route(
+            "/api/v1/agent/connected-self-hosted-workers",
+            get(handlers::agent_api::list_connected_workers),
+        )
+        .route(
+            "/api/v1/agent/tasks/{task_id}/cancel",
+            post(handlers::agent_api::cancel_task),
+        )
+        .route("/api/v1/mcp/factory", any(handlers::mcp_factory::handle))
+        // Remaining cloud-only REST operations return an explicit error.
         .route("/api/v1/agent/{*rest}", any(handlers::unsupported))
         // Multi-agent protobuf+SSE — the modern Agent Mode (Cmd+Enter).
         .route("/ai/multi-agent", post(handlers::multi_agent::handle))
@@ -226,4 +437,108 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AuthStyle;
+
+    fn config(default_model: &str) -> Config {
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            backend_base_url: "http://127.0.0.1:3113/v1".into(),
+            backend_auth_style: AuthStyle::Bearer,
+            backend_api_key: None,
+            azure_api_version: None,
+            default_model: default_model.into(),
+        }
+    }
+
+    #[test]
+    fn configured_model_is_authoritative_and_embeddings_are_filtered() {
+        let state = AppState::new(
+            config("configured-chat-model"),
+            vec![
+                "text-embedding-model".into(),
+                "discovered-chat-model".into(),
+            ],
+        );
+
+        assert_eq!(
+            state.advertised_models(),
+            vec!["configured-chat-model", "discovered-chat-model"]
+        );
+        assert_eq!(state.default_model_id(), "configured-chat-model");
+    }
+
+    #[test]
+    fn launched_agent_ids_resolve_to_child_cache_files() {
+        let state = AppState::new(config("configured-chat-model"), vec![]);
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+
+        state.register_launched_agent("child", &conversation_id);
+        state.register_agent_task("child", &task_id);
+        state.save_conversation(
+            &task_id,
+            &[serde_json::json!({"role": "assistant", "content": "CHILD_OK"})],
+        );
+
+        let path = state
+            .conversation_cache_path(&conversation_id)
+            .expect("launched conversation should resolve to its task cache");
+        assert!(path.is_file());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(
+            state
+                .conversation_cache_dir
+                .join(format!("{task_id}.json")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unsafe_cache_keys_cannot_escape_the_conversation_directory() {
+        let state = AppState::new(config("configured-chat-model"), vec![]);
+        state.register_conversation_task("../../outside", "safe-task");
+        state.register_conversation_task("safe-conversation", "../outside");
+        assert!(state.conversation_cache_path("../../outside").is_none());
+        assert!(state
+            .conversation_cache_path("safe-conversation")
+            .is_none());
+    }
+
+    #[test]
+    fn child_alias_is_published_only_after_terminal_assistant_output() {
+        let state = AppState::new(config("configured-chat-model"), vec![]);
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        state.register_conversation_task(&conversation_id, &task_id);
+
+        state.save_conversation(
+            &task_id,
+            &[serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "call-1"}]
+            })],
+        );
+        let alias = state.conversation_cache_path(&conversation_id).unwrap();
+        assert!(!alias.exists());
+
+        state.save_conversation(
+            &task_id,
+            &[serde_json::json!({"role": "assistant", "content": "done"})],
+        );
+        assert!(alias.exists());
+
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_file(
+            state
+                .conversation_cache_dir
+                .join(format!("{task_id}.json")),
+        )
+        .unwrap();
+    }
 }

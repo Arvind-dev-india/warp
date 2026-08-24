@@ -65,6 +65,16 @@ pub async fn handle(
     // get-prefixed variants all resolve to the same handler.
     let key = canonical_op(op);
 
+    if matches!(
+        key.as_str(),
+        "user"
+            | "workspacesmetadataforuser"
+            | "featuremodelchoices"
+            | "freeavailablemodels"
+    ) {
+        state.refresh_models().await;
+    }
+
     let data: Option<Value> = match key.as_str() {
         // ---- canned identity / settings / models / experiments ----
         "createanonymoususer" => Some(canned::create_anonymous_user()),
@@ -74,6 +84,7 @@ pub async fn handle(
         "featuremodelchoices" => Some(canned::get_feature_model_choices(&state)),
         "freeavailablemodels" => Some(canned::free_available_models(&state)),
         "requestlimitinfo" => Some(canned::get_request_limit_info()),
+        "aicreditavailability" => Some(canned::get_ai_credit_availability()),
         "experiments" => Some(canned::get_experiments()),
         "referralinfo" => Some(canned::get_referral_info()),
         "usergithubinfo" => Some(canned::user_github_info()),
@@ -107,6 +118,7 @@ pub async fn handle(
         }
         "cloudenvironmentsquery" => Some(cloud_stubs::get_cloud_environments()),
         "availableharnesses" => Some(cloud_stubs::get_available_harnesses()),
+        "createagenttask" => Some(cloud_stubs::create_agent_task()),
         "updateagenttask" => Some(cloud_stubs::update_agent_task()),
         "deleteaiconversation" | "deleteconversation" => {
             Some(cloud_stubs::delete_ai_conversation(&req.variables))

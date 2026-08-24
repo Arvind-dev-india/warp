@@ -1,13 +1,23 @@
 # `warp_local_proxy`
 
 Fork-owned HTTP server that the Warp client points at (via `WARP_SERVER_ROOT_URL`)
-instead of `https://app.warp.dev`. Goal: handle every operation locally so no
-traffic leaves the box.
+instead of `https://app.warp.dev`. Warp-hosted operations stay local; AI
+inference is sent only to the backend configured by the operator.
 
-> **Status:** Skeleton. v0 serves a healthz endpoint and a GraphQL stub that
-> answers every operation with a structured "not implemented yet" error.
-> Per-operation handlers (canned identity, models list, real AI inference) land
-> in subsequent commits.
+The proxy serves local identity/settings data, model choices, AI inference,
+agent run restoration, orchestration events, and local agent messaging.
+
+## Windows launcher
+
+Use the repository launcher rather than starting `warp-oss.exe` directly:
+
+```powershell
+.\scripts\warp-local.ps1 -Profile debug
+```
+
+It reads `%USERPROFILE%\.config\warp-local\config.env`, incrementally rebuilds
+both binaries, starts the proxy, waits for `/healthz`, and then launches Warp.
+Pass `-KeepProxy` to leave the proxy running after Warp exits.
 
 ## Run with default backend
 
@@ -74,6 +84,12 @@ cargo run -p warp_local_proxy -- \
 | `--azure-api-version`       | `WARP_LOCAL_PROXY_AZURE_API_VERSION` | (unset; only for Azure)       |
 | `--default-model`           | `WARP_LOCAL_PROXY_DEFAULT_MODEL`     | `gpt-5-mini`                  |
 
+The configured default model is always advertised to Warp. Backend `/models`
+discovery is optional enrichment, is refreshed when Warp requests model
+choices, and embedding-only model IDs are excluded. Custom OpenAI Chat
+Completions endpoints configured in Warp settings are also resolved by the
+proxy using their `config_key`, endpoint URL, API key, and provider model slug.
+
 ## Smoke check
 
 ```bash
@@ -83,7 +99,7 @@ curl http://localhost:8765/healthz
 curl -X POST http://localhost:8765/graphql/v2 \
   -H 'Content-Type: application/json' \
   -d '{"operationName":"GetUser","query":"query GetUser{...}","variables":{}}'
-# -> {"errors":[{"message":"... GraphQL operation 'GetUser' is not implemented yet. ...","extensions":{"code":"LOCAL_PROXY_UNIMPLEMENTED","operation":"GetUser"}}]}
+# -> local synthetic user data under {"data":{"user":...}}
 ```
 
 ## Architecture
@@ -101,10 +117,12 @@ curl -X POST http://localhost:8765/graphql/v2 \
 The proxy holds:
 1. **Stub handlers** for identity / workspace / settings / experiments / model-list ops — return canned local data.
 2. **Real handlers** for `generateCommands`, `generateDialogue`, `generate_code_review_content` — call the configured AI backend.
-3. **503 handlers** for cloud-only ops (cloud agents, Drive, attachments).
+3. **Local agent services** for run metadata, event SSE, messaging, task IDs, child-result caching, and the minimal Factory MCP protocol.
+4. **Structured unsupported responses** for remaining cloud-only operations such as attachments and transcripts.
 
-No requests reach `app.warp.dev` or any other Warp-hosted endpoint when the
-proxy is in front.
+No requests reach `app.warp.dev` when the proxy is in front. The current client
+still attempts Firebase once before using the proxy's local token fallback, and
+the proxy intentionally contacts the configured inference backend.
 
 ## See also
 

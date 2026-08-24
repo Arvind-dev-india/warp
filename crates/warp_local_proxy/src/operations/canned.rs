@@ -13,8 +13,7 @@ use serde_json::{json, Value};
 use crate::server::AppState;
 
 const LOCAL_USER_UID: &str = "local-user-uid";
-const LOCAL_WORKSPACE_UID: &str = "local-workspace-uid";
-const LOCAL_TEAM_UID: &str = "local-team-uid";
+const LOCAL_WORKSPACE_UID: &str = "local-workspace-id-001";
 
 /// Wraps a single model id into the cynic-expected `LlmInfo` shape.
 fn llm_info(id: &str, display_name: &str) -> Value {
@@ -100,6 +99,7 @@ fn workspace_settings() -> Value {
             // settings. Empty list = use defaults for everything.
             "hostConfigs": []
         },
+        "teamByo": null,
         "telemetrySettings": { "forceEnabled": false },
         "ugcCollectionSettings": { "setting": "DISABLE" },
         "cloudConversationStorageSettings": { "setting": "DISABLE" },
@@ -147,10 +147,8 @@ const FAR_FUTURE_TIME: &str = "2099-12-31T23:59:59Z";
 pub const FAR_FUTURE_TIME_PUBLIC: &str = FAR_FUTURE_TIME;
 
 fn billing_tier() -> Value {
-    // Real cynic Tier struct (crates/graphql/src/api/billing.rs:Tier) has
-    // 18 fields. The pricing / anyoneWithLinkSharing / directLinkSharing
-    // fields visible in the legacy .graphql comment are NOT in the current
-    // cynic struct, so we omit them. All Option<...> policies are null.
+    // Keep personal BYOK/BYOE enabled so custom endpoints configured in Warp
+    // settings are included in multi-agent requests to the local proxy.
     json!({
         "name": "Local",
         "description": "warp_local_proxy local-mode tier",
@@ -172,11 +170,15 @@ fn billing_tier() -> Value {
         "usageBasedPricingPolicy": null,
         "codebaseContextPolicy": null,
         "byoApiKeyPolicy": { "enabled": true },
+        "byoEndpointPolicy": { "enabled": true },
+        "managedByokByoePolicy": { "enabled": false },
         "purchaseAddOnCreditsPolicy": null,
         "enterprisePayAsYouGoPolicy": null,
         "enterpriseCreditsAutoReloadPolicy": null,
         "multiAdminPolicy": null,
-        "ambientAgentsPolicy": null
+        "nativeWorkspacesPolicy": null,
+        "ambientAgentsPolicy": null,
+        "usageVisibilityPolicy": null
     })
 }
 
@@ -204,20 +206,11 @@ fn workspace_obj(state: &AppState) -> Value {
         "name": "Local",
         "stripeCustomerId": null,
         "members": [workspace_member(LOCAL_USER_UID, "local@local")],
-        "teams": [
-            {
-                "uid": LOCAL_TEAM_UID,
-                "name": "Local",
-                "members": [{
-                    "uid": LOCAL_USER_UID,
-                    "email": "local@local",
-                    "role": "OWNER"
-                }]
-            }
-        ],
+        "teams": [],
         "billingMetadata": billing_metadata(),
         // Real shape: BonusGrantsInfo { grants: [BonusGrant], spendingInfo: BonusGrantSpendingInfo? }
         "bonusGrantsInfo": { "grants": [], "spendingInfo": null },
+        "billingCycleUsageHistory": null,
         "settings": workspace_settings(),
         "hasBillingHistory": false,
         "inviteCode": null,
@@ -306,6 +299,13 @@ pub fn get_workspaces_metadata_for_user(state: &AppState) -> Value {
         "user": {
             "__typename": "UserOutput",
             "user": {
+                "profile": { "uid": LOCAL_USER_UID },
+                "aiCreditAvailability": {
+                    "available": true,
+                    "denialReason": "NONE",
+                    "creditSource": "BASE_LIMIT"
+                },
+                "billingMetadata": null,
                 "workspaces": [workspace_obj(state)],
                 "experiments": [],
                 "discoverableTeams": []
@@ -317,7 +317,8 @@ pub fn get_workspaces_metadata_for_user(state: &AppState) -> Value {
                 "plans": [],
                 "overages": { "pricePerRequestUsdCents": 0 },
                 // Required by cynic PricingInfo fragment.
-                "addonCreditsOptions": []
+                "addonCreditsOptions": [],
+                "promotionMessage": null
             }
         }
     })
@@ -373,6 +374,21 @@ pub fn get_request_limit_info() -> Value {
                     "embeddingGenerationBatchSize": 100
                 },
                 "bonusGrants": []
+            }
+        }
+    })
+}
+
+pub fn get_ai_credit_availability() -> Value {
+    json!({
+        "user": {
+            "__typename": "UserOutput",
+            "user": {
+                "aiCreditAvailability": {
+                    "available": true,
+                    "denialReason": "NONE",
+                    "creditSource": "BASE_LIMIT"
+                }
             }
         }
     })
@@ -439,4 +455,14 @@ pub fn mint_custom_token() -> Value {
             "responseContext": response_context()
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_backed_ids_have_the_required_length() {
+        assert_eq!(LOCAL_WORKSPACE_UID.len(), 22);
+    }
 }

@@ -55,13 +55,14 @@ fn tool_call_coverage(tool: &message::tool_call::Tool) -> &'static str {
         Tool::ReadSkill(_) => "passthrough",
         Tool::RequestComputerUse(_) => "passthrough",
         Tool::FetchConversation(_) => "passthrough",
-        Tool::StartAgent(_) => "passthrough",
         Tool::SendMessageToAgent(_) => "passthrough",
         Tool::TransferShellCommandControlToUser(_) => "passthrough",
         Tool::AskUserQuestion(_) => "passthrough",
-        Tool::StartAgentV2(_) => "passthrough",
         Tool::UploadFileArtifact(_) => "passthrough",
         Tool::RunAgents(_) => "passthrough",
+        Tool::WaitForEvents(_) => "passthrough",
+        Tool::StartRecording(_) => "passthrough",
+        Tool::StopRecording(_) => "passthrough",
     }
 }
 
@@ -98,13 +99,14 @@ fn message_tool_result_coverage(result: &message::tool_call_result::Result) -> &
         R::ReadSkill(_) => "passthrough",
         R::RequestComputerUseResult(_) => "passthrough",
         R::FetchConversation(_) => "passthrough",
-        R::StartAgent(_) => "passthrough",
         R::SendMessageToAgent(_) => "passthrough",
         R::TransferShellCommandControlToUser(_) => "passthrough",
         R::AskUserQuestion(_) => "passthrough",
-        R::StartAgentV2(_) => "passthrough",
         R::UploadFileArtifact(_) => "passthrough",
         R::RunAgentsResult(_) => "passthrough",
+        R::WaitForEvents(_) => "passthrough",
+        R::StartRecording(_) => "passthrough",
+        R::StopRecording(_) => "passthrough",
     }
 }
 
@@ -140,13 +142,14 @@ fn request_tool_result_coverage(
         R::RequestComputerUse(_) => "passthrough",
         R::ReadSkill(_) => "passthrough",
         R::FetchConversation(_) => "passthrough",
-        R::StartAgent(_) => "passthrough",
         R::SendMessageToAgent(_) => "passthrough",
         R::TransferShellCommandControlToUser(_) => "passthrough",
         R::AskUserQuestion(_) => "passthrough",
-        R::StartAgentV2(_) => "passthrough",
         R::UploadFileArtifact(_) => "passthrough",
         R::RunAgentsResult(_) => "passthrough",
+        R::WaitForEvents(_) => "passthrough",
+        R::StartRecording(_) => "passthrough",
+        R::StopRecording(_) => "passthrough",
     }
 }
 
@@ -159,7 +162,7 @@ fn exhaustive_tool_call_variants() {
 
 #[test]
 fn exhaustive_message_tool_result_variants() {
-    let r = message::tool_call_result::Result::Cancel(Default::default());
+    let r = message::tool_call_result::Result::Cancel(());
     assert_eq!(message_tool_result_coverage(&r), "handled");
 }
 
@@ -290,12 +293,15 @@ fn make_tool_result_request(
                                 RunShellCommandResult {
                                     command: command.into(),
                                     result: Some(run_shell_command_result::Result::CommandFinished(
-                                        ShellCommandFinished { output: output.into(), exit_code, ..Default::default() },
+                                        ShellCommandFinished {
+                                            output: output.into(),
+                                            exit_code,
+                                            ..Default::default()
+                                        },
                                     )),
                                     ..Default::default()
                                 },
                             )),
-                            ..Default::default()
                         },
                     )),
                 }],
@@ -483,7 +489,6 @@ fn shell_command_finished_to_text() {
                 ..Default::default()
             },
         )),
-        ..Default::default()
     };
     let text = result_to_text(&tcr);
     assert!(text.contains("ls"), "should contain command");
@@ -505,7 +510,6 @@ fn permission_denied_to_text() {
                 ..Default::default()
             },
         )),
-        ..Default::default()
     };
     let text = result_to_text(&tcr);
     assert!(text.contains("Permission denied"));
@@ -527,7 +531,6 @@ fn grep_result_to_text() {
                 }],
             })),
         })),
-        ..Default::default()
     };
     let text = result_to_text(&tcr);
     assert!(text.contains("main.rs"));
@@ -540,7 +543,6 @@ fn empty_result_returns_placeholder() {
     let tcr = warp_multi_agent_api::request::input::ToolCallResult {
         tool_call_id: "empty".into(),
         result: None,
-        ..Default::default()
     };
     assert_eq!(result_to_text(&tcr), "(no result)");
 }

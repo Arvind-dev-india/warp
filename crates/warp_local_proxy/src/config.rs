@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn azure_appends_api_version() {
+    fn azure_uses_configured_model_and_appends_api_version() {
         let c = cfg(
             "https://foo.openai.azure.com/openai/deployments/gpt5",
             AuthStyle::AzureApiKey,
@@ -188,7 +188,7 @@ mod tests {
         );
         assert_eq!(
             c.chat_completions_url(),
-            "https://foo.openai.azure.com/openai/deployments/gpt5/chat/completions?api-version=2024-08-01-preview"
+            "https://foo.openai.azure.com/openai/deployments/gpt-5-mini/chat/completions?api-version=2024-08-01-preview"
         );
     }
 
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn azure_without_api_version_omits_query() {
+    fn azure_uses_configured_model_without_api_version() {
         let c = cfg(
             "https://foo.openai.azure.com/openai/deployments/gpt5",
             AuthStyle::AzureApiKey,
@@ -215,7 +215,7 @@ mod tests {
         );
         assert_eq!(
             c.chat_completions_url(),
-            "https://foo.openai.azure.com/openai/deployments/gpt5/chat/completions"
+            "https://foo.openai.azure.com/openai/deployments/gpt-5-mini/chat/completions"
         );
     }
 

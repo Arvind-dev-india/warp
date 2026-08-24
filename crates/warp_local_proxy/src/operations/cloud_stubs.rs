@@ -14,6 +14,8 @@
 //! receive the raw GraphQL variables and echo the client's input back so the
 //! client thinks the object was successfully created in the cloud.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use serde_json::{json, Value};
 
 use crate::operations::canned::FAR_FUTURE_TIME_PUBLIC;
@@ -121,6 +123,12 @@ fn object_permissions() -> Value {
     })
 }
 
+fn server_id_for(value: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:022x}", hasher.finish())
+}
+
 /// Echoes one input GenericStringObjectInput back as a
 /// CreateGenericStringObjectOutput so the client thinks the object was
 /// created in the cloud and stops retrying. The `clientId` MUST be the same
@@ -148,7 +156,7 @@ fn echo_create_output(input: &Value, fallback_uid: &str) -> Value {
         "clientId": client_id,
         "genericStringObject": {
             "format": format,
-            "metadata": object_metadata(&client_id),
+            "metadata": object_metadata(&server_id_for(&client_id)),
             "permissions": object_permissions(),
             "serializedModel": serialized
         },
@@ -178,7 +186,7 @@ pub fn bulk_create_objects(variables: &Value) -> Value {
     let echoed: Vec<Value> = inputs
         .iter()
         .enumerate()
-        .map(|(idx, obj)| echo_create_output(obj, &format!("local-bulk-{idx}")))
+        .map(|(idx, obj)| echo_create_output(obj, &format!("local-bulk-object-{idx:04}")))
         .collect();
 
     json!({
@@ -206,7 +214,7 @@ pub fn create_generic_string_object(variables: &Value) -> Value {
         })
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let echoed = echo_create_output(&input, "local-single-create");
+    let echoed = echo_create_output(&input, "local-single-object-01");
     json!({
         "createGenericStringObject": echoed
     })
@@ -224,16 +232,21 @@ pub fn get_cloud_environments() -> Value {
     })
 }
 
-/// `GetAvailableHarnesses` — returns an empty harness list.
-/// The client uses this to populate the agent harness selector (Oz, ClaudeCode, Gemini).
-/// In local mode we return an empty list so no cloud harnesses appear.
+/// `GetAvailableHarnesses` — expose the built-in Oz harness for local child
+/// agents. An empty list replaces the client's usable default with no
+/// selection and blocks `RunAgents` approval.
 pub fn get_available_harnesses() -> Value {
     json!({
         "user": {
             "__typename": "UserOutput",
             "user": {
                 "availableHarnesses": {
-                    "harnesses": []
+                    "harnesses": [{
+                        "harness": "OZ",
+                        "displayName": "Oz",
+                        "enabled": true,
+                        "availableModels": []
+                    }]
                 }
             }
         }
@@ -249,4 +262,43 @@ pub fn update_agent_task() -> Value {
             "responseContext": { "serverVersion": "warp_local_proxy/0.1.0" }
         }
     })
+}
+
+/// `CreateAgentTask` — allocate the local task ID that the headless Warp CLI
+/// carries into subsequent `/ai/multi-agent` requests.
+pub fn create_agent_task() -> Value {
+    json!({
+        "createAgentTask": {
+            "__typename": "CreateAgentTaskOutput",
+            "responseContext": { "serverVersion": "warp_local_proxy/0.1.0" },
+            "taskId": uuid::Uuid::new_v4().to_string()
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_harness_catalog_keeps_oz_selectable() {
+        let response = get_available_harnesses();
+        let harness = &response["user"]["user"]["availableHarnesses"]["harnesses"][0];
+        assert_eq!(harness["harness"], "OZ");
+        assert_eq!(harness["enabled"], true);
+    }
+
+    #[test]
+    fn create_agent_task_returns_a_valid_uuid() {
+        let response = create_agent_task();
+        let task_id = response["createAgentTask"]["taskId"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(task_id).is_ok());
+    }
+
+    #[test]
+    fn generated_object_ids_are_valid_server_ids() {
+        let id = server_id_for("Client-7f4b7959-e86c-47f1-a472-34e2a84bd122");
+        assert_eq!(id.len(), 22);
+        assert!(id.chars().all(|character| character.is_ascii_hexdigit()));
+    }
 }

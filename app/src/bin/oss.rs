@@ -24,6 +24,7 @@ fn main() -> Result<()> {
                 rtc_server_url: "ws://127.0.0.1:8765/graphql/v2".into(),
                 session_sharing_server_url: None,
                 firebase_auth_api_key: "local-mode-no-firebase".into(),
+                iap_config: None,
             },
             oz_config: OzConfig::production(),
             telemetry_config: None,

@@ -14,8 +14,10 @@
 //!   warp client with a fake refresh token.
 
 pub mod ai_rest;
+pub mod agent_api;
 pub mod browser_auth;
 pub mod graphql;
+pub mod mcp_factory;
 pub mod multi_agent;
 pub mod oauth;
 
