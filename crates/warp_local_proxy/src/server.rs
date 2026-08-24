@@ -158,6 +158,48 @@ impl AppState {
         }
     }
 
+    pub fn resolve_agent_address(&self, address: &str) -> Option<String> {
+        if address.is_empty() {
+            return None;
+        }
+        if let Some(conversation_id) = self
+            .launched_agents
+            .read()
+            .expect("launched agents lock poisoned")
+            .get(address)
+            .cloned()
+        {
+            return Some(conversation_id);
+        }
+        if let Some(task_id) = self
+            .agent_tasks
+            .read()
+            .expect("agent task lock poisoned")
+            .get(address)
+            .cloned()
+        {
+            return Some(task_id);
+        }
+        let is_known_id = self
+            .conversation_tasks
+            .read()
+            .expect("conversation task lock poisoned")
+            .contains_key(address)
+            || self
+                .agent_tasks
+                .read()
+                .expect("agent task lock poisoned")
+                .values()
+                .any(|task_id| task_id == address)
+            || self
+                .launched_agents
+                .read()
+                .expect("launched agents lock poisoned")
+                .values()
+                .any(|conversation_id| conversation_id == address);
+        is_known_id.then(|| address.to_string())
+    }
+
     pub fn conversation_cache_path(&self, conversation_id: &str) -> Option<std::path::PathBuf> {
         if !is_safe_cache_key(conversation_id) {
             return None;
@@ -507,6 +549,23 @@ mod tests {
         assert!(state
             .conversation_cache_path("safe-conversation")
             .is_none());
+    }
+
+    #[test]
+    fn agent_addresses_resolve_only_registered_agents() {
+        let state = AppState::new(config("configured-chat-model"), vec![]);
+        state.register_agent_task("known-child", "known-task-id");
+        state.register_launched_agent("launched-child", "known-conversation-id");
+
+        assert_eq!(
+            state.resolve_agent_address("known-child").as_deref(),
+            Some("known-task-id")
+        );
+        assert_eq!(
+            state.resolve_agent_address("launched-child").as_deref(),
+            Some("known-conversation-id")
+        );
+        assert!(state.resolve_agent_address("missing-child").is_none());
     }
 
     #[test]

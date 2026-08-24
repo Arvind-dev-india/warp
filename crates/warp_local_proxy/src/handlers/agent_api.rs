@@ -293,9 +293,43 @@ pub struct SendMessagesRequest {
 pub async fn send_messages(
     State(state): State<std::sync::Arc<AppState>>,
     Json(request): Json<SendMessagesRequest>,
-) -> Json<Value> {
-    let mut message_ids = Vec::with_capacity(request.to.len());
-    for recipient in &request.to {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let recipients = request
+        .to
+        .iter()
+        .map(|address| {
+            state
+                .resolve_agent_address(address)
+                .ok_or_else(|| address.clone())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|address| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "code": "LOCAL_PROXY_UNKNOWN_AGENT",
+                        "message": format!(
+                            "Unknown agent address '{address}'. Sending a message does not create an agent; multi-level orchestration is unavailable."
+                        )
+                    }
+                })),
+            )
+        })?;
+    if recipients.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "code": "LOCAL_PROXY_UNKNOWN_AGENT",
+                    "message": "At least one registered agent address is required."
+                }
+            })),
+        ));
+    }
+
+    let mut message_ids = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
         let message_id = uuid::Uuid::new_v4().to_string();
         let message = StoredMessage {
             message_id: message_id.clone(),
@@ -314,14 +348,14 @@ pub async fn send_messages(
             .expect("agent messages lock poisoned")
             .insert(message_id.clone(), message);
         state.agent_api.emit(
-            recipient.clone(),
+            recipient,
             "new_message".to_string(),
             Some(message_id.clone()),
             None,
         );
         message_ids.push(message_id);
     }
-    Json(json!({ "message_ids": message_ids }))
+    Ok(Json(json!({ "message_ids": message_ids })))
 }
 
 pub async fn list_messages(
@@ -407,6 +441,21 @@ pub async fn cancel_task(Path(_task_id): Path<String>) -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AuthStyle, Config};
+
+    fn app_state() -> std::sync::Arc<AppState> {
+        std::sync::Arc::new(AppState::new(
+            Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                backend_base_url: "http://127.0.0.1:3113/v1".into(),
+                backend_auth_style: AuthStyle::Bearer,
+                backend_api_key: None,
+                azure_api_version: None,
+                default_model: "test-model".into(),
+            },
+            vec![],
+        ))
+    }
 
     #[test]
     fn event_filter_supports_repeated_run_ids() {
@@ -438,5 +487,26 @@ mod tests {
         let child_event = state.emit("child".into(), "run_succeeded".into(), None, None);
 
         assert!(filter.matches(&state, &child_event));
+    }
+
+    #[tokio::test]
+    async fn sending_to_an_unknown_agent_is_rejected() {
+        let result = send_messages(
+            State(app_state()),
+            Json(SendMessagesRequest {
+                to: vec!["missing-child".into()],
+                subject: "work".into(),
+                body: "do work".into(),
+                sender_run_id: "parent".into(),
+            }),
+        )
+        .await;
+
+        let (status, body) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0["error"]["code"],
+            serde_json::Value::String("LOCAL_PROXY_UNKNOWN_AGENT".into())
+        );
     }
 }
