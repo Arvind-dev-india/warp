@@ -4,41 +4,50 @@ use std::fs;
 use std::time::Duration;
 
 use pathfinder_geometry::rect::RectF;
-use pathfinder_geometry::vector::{vec2f, Vector2F};
+use pathfinder_geometry::vector::{Vector2F, vec2f};
 use settings::Setting as _;
 use warp::cmd_or_ctrl_shift;
 use warp::features::FeatureFlag;
 use warp::integration_testing::clipboard::assert_clipboard_contains_string;
+use warp::integration_testing::command_palette::assert_command_palette_is_closed;
 use warp::integration_testing::pane_group::assert_focused_pane_index;
 use warp::integration_testing::step::new_step_with_default_assertions;
 use warp::integration_testing::terminal::util::{
-    current_shell_starter_and_version, ExpectedExitStatus,
+    ExpectedExitStatus, current_shell_starter_and_version,
 };
 use warp::integration_testing::terminal::{
     assert_active_session_local_path, assert_command_executed_for_single_terminal_in_tab,
-    assert_focused_editor_in_tab, assert_long_running_block_executing_for_single_terminal_in_tab,
-    execute_command, execute_command_for_single_terminal_in_tab, wait_until_bootstrapped_pane,
+    assert_focused_editor_in_tab, assert_input_editor_contents,
+    assert_long_running_block_executing_for_single_terminal_in_tab, execute_command,
+    execute_command_for_single_terminal_in_tab, wait_until_bootstrapped_pane,
     wait_until_bootstrapped_single_pane_for_tab,
 };
-use warp::integration_testing::view_getters::{terminal_view, workspace_view};
+use warp::integration_testing::view_getters::{
+    command_palette_view, terminal_view, workspace_view,
+};
 use warp::integration_testing::window::{
     add_and_save_window, assert_num_windows_open, save_active_window_id,
 };
 use warp::integration_testing::workspace::{
     assert_focused_tab_index, assert_tab_count, press_native_modal_button,
 };
+use warp::search::command_palette::mixer::CommandPaletteItemAction;
 use warp::settings::PaneSettings;
 use warp::terminal::shell::ShellType;
+use warp::themes::theme::AnsiColorIdentifier;
 use warp::workspace::tab_settings::{TabSettings, VerticalTabsDisplayGranularity};
-use warp::workspace::{WorkspaceAction, NEW_TAB_BUTTON_POSITION_ID};
-use warpui::event::{Event, ModifiersState};
-use warpui::integration::{AssertionCallback, AssertionOutcome, TestStep};
-use warpui::windowing::WindowManager;
-use warpui::{async_assert, async_assert_eq, SingletonEntity, TypedActionView, WindowId};
+use warp::workspace::{NEW_TAB_BUTTON_POSITION_ID, WorkspaceAction};
+use warpui_core::event::{Event, ModifiersState};
+use warpui_core::integration::{AssertionCallback, AssertionOutcome, StepDataMap, TestStep};
+use warpui_core::keymap::DescriptionContext;
+use warpui_core::windowing::WindowManager;
+use warpui_core::{
+    EntityId, SingletonEntity, TypedActionView, WindowId, async_assert, async_assert_eq,
+};
 
 use super::new_builder;
-use crate::util::skip_if_powershell_core_2303;
 use crate::Builder;
+use crate::util::skip_if_powershell_core_2303;
 
 const SOURCE_WINDOW_KEY: &str = "source window";
 const TARGET_WINDOW_KEY: &str = "target window";
@@ -49,12 +58,17 @@ const METADATA_CLICKED_PANE_TITLE: &str = "Integration Metadata Clicked Pane";
 const METADATA_PANE_TITLE: &str = "Integration Metadata Pane";
 const METADATA_PANE_BRANCH: &str = "pane-branch";
 const METADATA_PANE_DIRECTORY: &str = "active-pane";
+const CYCLE_TAB_COLOR_BINDING: &str = "workspace:cycle_active_tab_color";
+const CYCLE_TAB_COLOR_LABEL: &str = "Cycle current tab color";
+const CYCLE_TAB_COLOR_DISPLAY_LABEL: &str = "Cycle Current Tab Color";
+const CYCLE_TAB_COLOR_SENTINEL: &str = "cycle-color-sentinel";
+const CYCLE_TAB_COLOR_TERMINAL_ID: &str = "cycle tab color terminal id";
 
 fn tab_position_id(tab_index: usize) -> String {
     format!("tab_position_{tab_index}")
 }
 
-fn vertical_tab_pane_row_position_id(app: &mut warpui::App, window_id: WindowId) -> String {
+fn vertical_tab_pane_row_position_id(app: &mut warpui_core::App, window_id: WindowId) -> String {
     let workspace = workspace_view(app, window_id);
     let pane_group = workspace.read(app, |workspace, _ctx| {
         workspace
@@ -70,7 +84,7 @@ fn vertical_tab_pane_row_position_id(app: &mut warpui::App, window_id: WindowId)
 }
 
 fn vertical_tab_pane_row_position_id_for_pane_index(
-    app: &mut warpui::App,
+    app: &mut warpui_core::App,
     window_id: WindowId,
     pane_index: usize,
 ) -> String {
@@ -90,8 +104,77 @@ fn vertical_tab_pane_row_position_id_for_pane_index(
     })
 }
 
-fn first_vertical_tab_pane_row_position_id(app: &mut warpui::App, window_id: WindowId) -> String {
+fn first_vertical_tab_pane_row_position_id(
+    app: &mut warpui_core::App,
+    window_id: WindowId,
+) -> String {
     vertical_tab_pane_row_position_id_for_pane_index(app, window_id, 0)
+}
+
+fn assert_tab_color(expected: Option<AnsiColorIdentifier>) -> AssertionCallback {
+    Box::new(move |app, window_id| {
+        let workspace = workspace_view(app, window_id);
+        workspace.read(app, |workspace, _| {
+            async_assert_eq!(
+                workspace.get_tab_color(0),
+                expected,
+                "active tab color should match the expected cycle state"
+            )
+        })
+    })
+}
+
+fn with_cycle_tab_color_invariants(
+    step: TestStep,
+    expected: Option<AnsiColorIdentifier>,
+) -> TestStep {
+    step.add_assertion(assert_tab_color(expected))
+        .add_assertion(assert_focused_tab_index(0))
+        .add_assertion(assert_focused_pane_index(0, 0))
+        .add_assertion(assert_focused_editor_in_tab(0))
+        .add_assertion(assert_input_editor_contents(0, CYCLE_TAB_COLOR_SENTINEL))
+        .add_named_assertion_with_data_from_prior_step(
+            "Focused terminal view remains unchanged",
+            |app, window_id, data| {
+                let original_id = *data
+                    .get::<_, EntityId>(CYCLE_TAB_COLOR_TERMINAL_ID)
+                    .expect("initial terminal view id should be saved");
+                let current_id = terminal_view(app, window_id, 0, 0).id();
+                async_assert_eq!(current_id, original_id)
+            },
+        )
+}
+
+fn assert_selected_cycle_tab_color_binding() -> AssertionCallback {
+    Box::new(move |app, window_id| {
+        let palette = command_palette_view(app, window_id);
+        palette.read(app, |palette, ctx| {
+            let Some(result) = palette.selected_search_result(ctx) else {
+                return AssertionOutcome::failure(
+                    "command palette should have a selected result".to_string(),
+                );
+            };
+            let CommandPaletteItemAction::AcceptBinding { binding } = result.accept_result() else {
+                return AssertionOutcome::failure(
+                    "selected result should be an editable binding".to_string(),
+                );
+            };
+            let has_cycle_action = matches!(
+                binding
+                    .action
+                    .as_ref()
+                    .and_then(|action| action.as_any().downcast_ref::<WorkspaceAction>()),
+                Some(WorkspaceAction::CycleActiveTabColor)
+            );
+            async_assert!(
+                binding.name == CYCLE_TAB_COLOR_BINDING
+                    && binding.description.in_context(DescriptionContext::Default)
+                        == CYCLE_TAB_COLOR_DISPLAY_LABEL
+                    && has_cycle_action,
+                "selected result should be the exact cycle-tab-color binding"
+            )
+        })
+    })
 }
 
 fn should_run_tab_context_menu_metadata_test() -> bool {
@@ -332,9 +415,11 @@ fn assert_saved_positions_absent(labels: &'static [&'static str]) -> AssertionCa
         let presenter = app.presenter(window_id).expect("presenter should exist");
         let presenter = presenter.borrow();
         let position_cache = presenter.position_cache();
-        async_assert!(labels
-            .iter()
-            .all(|label| position_cache.get_position(label).is_none()))
+        async_assert!(
+            labels
+                .iter()
+                .all(|label| position_cache.get_position(label).is_none())
+        )
     })
 }
 
@@ -368,7 +453,7 @@ fn focus_other_window(other_window_key: &'static str, known_window_key: &'static
     })
 }
 
-fn dispatch_mouse_event(app: &mut warpui::App, window_id: WindowId, event: Event) {
+fn dispatch_mouse_event(app: &mut warpui_core::App, window_id: WindowId, event: Event) {
     let window = app.read(|ctx| {
         ctx.windows()
             .platform_window(window_id)
@@ -379,22 +464,22 @@ fn dispatch_mouse_event(app: &mut warpui::App, window_id: WindowId, event: Event
     });
 }
 
-fn tab_bounds(app: &mut warpui::App, window_id: WindowId, tab_index: usize) -> RectF {
+fn tab_bounds(app: &mut warpui_core::App, window_id: WindowId, tab_index: usize) -> RectF {
     let presenter = app.presenter(window_id).expect("presenter should exist");
-    let bounds = presenter
+
+    presenter
         .borrow()
         .position_cache()
         .get_position(tab_position_id(tab_index))
-        .unwrap_or_else(|| panic!("tab_position_{tab_index} should exist for {window_id:?}"));
-    bounds
+        .unwrap_or_else(|| panic!("tab_position_{tab_index} should exist for {window_id:?}"))
 }
 
-fn tab_center(app: &mut warpui::App, window_id: WindowId, tab_index: usize) -> Vector2F {
+fn tab_center(app: &mut warpui_core::App, window_id: WindowId, tab_index: usize) -> Vector2F {
     tab_bounds(app, window_id, tab_index).center()
 }
 
 fn source_local_point_for_screen_point(
-    app: &mut warpui::App,
+    app: &mut warpui_core::App,
     source_window_id: WindowId,
     screen_point: Vector2F,
 ) -> Vector2F {
@@ -405,7 +490,7 @@ fn source_local_point_for_screen_point(
 }
 
 fn tab_screen_point(
-    app: &mut warpui::App,
+    app: &mut warpui_core::App,
     window_id: WindowId,
     tab_index: usize,
     x_offset: f32,
@@ -446,7 +531,7 @@ fn set_saved_window_origin(window_key: &'static str, origin: Vector2F) -> TestSt
 
 fn assert_total_tab_count(
     expected_total_tab_count: usize,
-) -> impl FnMut(&mut warpui::App, WindowId) -> AssertionOutcome {
+) -> impl FnMut(&mut warpui_core::App, WindowId) -> AssertionOutcome {
     move |app, _| {
         let total_tab_count = app
             .window_ids()
@@ -462,6 +547,54 @@ fn assert_total_tab_count(
 
 fn drag_tabs_feature_enabled() -> bool {
     cfg!(feature = "drag_tabs_to_windows")
+}
+
+pub fn test_cycle_active_tab_color_with_keybinding() -> Builder {
+    new_builder()
+        .with_setup(|_utils| {
+            warp::integration_testing::create_file_with_contents(
+                format!(r#""{CYCLE_TAB_COLOR_BINDING}": ctrl-alt-shift-U"#).as_bytes(),
+                &warp::integration_testing::keybindings::keybinding_file_path(),
+            );
+        })
+        .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
+        .with_step(with_cycle_tab_color_invariants(
+            new_step_with_default_assertions("Seed terminal input and capture focused terminal")
+                .with_typed_characters(&[CYCLE_TAB_COLOR_SENTINEL])
+                .with_action(|app, window_id, data| {
+                    data.insert(
+                        CYCLE_TAB_COLOR_TERMINAL_ID,
+                        terminal_view(app, window_id, 0, 0).id(),
+                    );
+                }),
+            None,
+        ))
+        .with_step(with_cycle_tab_color_invariants(
+            new_step_with_default_assertions("Cycle active tab from no color to red")
+                .with_keystrokes(&["ctrl-alt-shift-U"]),
+            Some(AnsiColorIdentifier::Red),
+        ))
+        .with_step(with_cycle_tab_color_invariants(
+            new_step_with_default_assertions("Cycle active tab from red to green")
+                .with_keystrokes(&["ctrl-alt-shift-U"]),
+            Some(AnsiColorIdentifier::Green),
+        ))
+        .with_step(
+            TestStep::new("Select exact cycle color action in Command Palette")
+                .with_keystrokes(&[cmd_or_ctrl_shift("p")])
+                .with_typed_characters(&[CYCLE_TAB_COLOR_LABEL])
+                .add_assertion(assert_selected_cycle_tab_color_binding())
+                .add_assertion(assert_tab_color(Some(AnsiColorIdentifier::Green)))
+                .add_assertion(assert_focused_tab_index(0))
+                .add_assertion(assert_focused_pane_index(0, 0))
+                .add_assertion(assert_input_editor_contents(0, CYCLE_TAB_COLOR_SENTINEL)),
+        )
+        .with_step(with_cycle_tab_color_invariants(
+            TestStep::new("Run cycle color action from Command Palette")
+                .with_keystrokes(&["enter"])
+                .add_assertion(assert_command_palette_is_closed()),
+            Some(AnsiColorIdentifier::Yellow),
+        ))
 }
 
 pub fn test_active_session_follows_focus() -> Builder {
@@ -553,6 +686,17 @@ pub fn test_focus_panes_on_hover() -> Builder {
                     })
                 },
             ),
+        )
+        .with_step(
+            // Hover the already-focused second pane first to clear the divider overlay's
+            // hovered state. Otherwise, in debug builds the divider's hover-out swallows the
+            // next mouse move and the following hover into pane 0 never reaches the pane.
+            new_step_with_default_assertions("Move mouse off the pane divider")
+                .with_hover_on_saved_position_fn(|app, window_id| {
+                    let terminal_view = terminal_view(app, window_id, 0, 1);
+                    terminal_view.read(app, |terminal, _| terminal.terminal_position_id())
+                })
+                .add_assertion(assert_focused_pane_index(0, 1)),
         )
         .with_step(
             new_step_with_default_assertions("Hover over the initial pane's terminal")
@@ -992,6 +1136,215 @@ pub fn test_attach_tab_to_other_window_and_continue_drag() -> Builder {
                 .add_assertion(assert_focused_editor_in_tab(1)),
         )
         .with_step(focus_saved_window(SOURCE_WINDOW_KEY).add_assertion(assert_tab_count(1)))
+}
+
+/// Regression test for a cross-window tab drag that re-enters the source
+/// window's own tab bar (a "put-back") and then drags back out again, all
+/// within one continuous gesture. Previously the put-back performed a live
+/// view-tree transfer back into the source and dragging out reversed it via
+/// `reverse_handoff`, which cancelled the drag's shared `DraggableState` —
+/// orphaning the gesture so no further drag events were processed (no preview
+/// followed the cursor and no window was brought to the foreground). The drop
+/// would then never transfer the tab, leaving the preview window stranded.
+///
+/// Now the source's tab bar is treated like any other target (`GhostInTarget`),
+/// so the gesture survives the oscillation and the final drop on the target
+/// window transfers the tab as expected (two windows, not a stranded third).
+pub fn test_multi_tab_drag_back_to_source_and_out_again() -> Builder {
+    new_builder()
+        .set_should_run_test(drag_tabs_feature_enabled)
+        .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
+        .with_step(
+            execute_command_for_single_terminal_in_tab(
+                0,
+                "echo source-zero".to_string(),
+                ExpectedExitStatus::Success,
+                (),
+            )
+            .add_assertion(save_active_window_id(SOURCE_WINDOW_KEY)),
+        )
+        .with_step(
+            new_step_with_default_assertions("Open a new tab")
+                .with_keystrokes(&[cmd_or_ctrl_shift("t")]),
+        )
+        .with_step(wait_until_bootstrapped_single_pane_for_tab(1))
+        .with_step(execute_command_for_single_terminal_in_tab(
+            1,
+            "echo source-one".to_string(),
+            ExpectedExitStatus::Success,
+            (),
+        ))
+        .with_step(add_and_save_window(TARGET_WINDOW_KEY))
+        .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
+        .with_step(execute_command_for_single_terminal_in_tab(
+            0,
+            "echo target-only".to_string(),
+            ExpectedExitStatus::Success,
+            (),
+        ))
+        .with_step(set_saved_window_origin(
+            SOURCE_WINDOW_KEY,
+            vec2f(100.0, 100.0),
+        ))
+        .with_step(set_saved_window_origin(
+            TARGET_WINDOW_KEY,
+            vec2f(900.0, 100.0),
+        ))
+        .with_step(focus_saved_window(SOURCE_WINDOW_KEY))
+        .with_step(
+            TestStep::new("Detach, hover target, return to source, leave again, drop on target")
+                .with_action(|app, _, data| {
+                    let source_window_id = *data
+                        .get::<_, WindowId>(SOURCE_WINDOW_KEY)
+                        .expect("saved source window id should exist");
+                    let start = tab_center(app, source_window_id, 1);
+                    dispatch_mouse_event(
+                        app,
+                        source_window_id,
+                        Event::LeftMouseDown {
+                            position: start,
+                            modifiers: ModifiersState::default(),
+                            click_count: 1,
+                            is_first_mouse: false,
+                        },
+                    );
+                })
+                .with_action(|app, _, data| {
+                    let source_window_id = *data
+                        .get::<_, WindowId>(SOURCE_WINDOW_KEY)
+                        .expect("saved source window id should exist");
+                    let start = tab_center(app, source_window_id, 1);
+                    dispatch_mouse_event(
+                        app,
+                        source_window_id,
+                        Event::LeftMouseDragged {
+                            position: start + vec2f(12.0, 0.0),
+                            modifiers: ModifiersState::default(),
+                        },
+                    );
+                })
+                .with_action(|app, _, data| {
+                    let source_window_id = *data
+                        .get::<_, WindowId>(SOURCE_WINDOW_KEY)
+                        .expect("saved source window id should exist");
+                    let start = tab_center(app, source_window_id, 1);
+                    dispatch_mouse_event(
+                        app,
+                        source_window_id,
+                        Event::LeftMouseDragged {
+                            position: start + vec2f(0.0, 140.0),
+                            modifiers: ModifiersState::default(),
+                        },
+                    );
+                })
+                // Hover the target window's tab bar (GhostInTarget on target).
+                .with_action(drag_over_target_tab_bar)
+                .with_action(drag_over_target_tab_bar)
+                // Return to the source window's own tab bar. In the buggy
+                // version this performed a live put-back; now it is a ghost.
+                .with_action(drag_over_source_tab_bar)
+                .with_action(drag_over_source_tab_bar)
+                // Leave the source again and hover the target once more. In
+                // the buggy version this reverse-handoff cancelled the drag.
+                .with_action(drag_over_target_tab_bar)
+                .with_action(drag_over_target_tab_bar)
+                // Release over the target: the tab should transfer there.
+                .with_action(|app, _, data| {
+                    let source_window_id = *data
+                        .get::<_, WindowId>(SOURCE_WINDOW_KEY)
+                        .expect("saved source window id should exist");
+                    let target_window_id = *data
+                        .get::<_, WindowId>(TARGET_WINDOW_KEY)
+                        .expect("saved target window id should exist");
+                    let target_tab_bounds = tab_bounds(app, target_window_id, 0);
+                    let drop_point = tab_screen_point(
+                        app,
+                        target_window_id,
+                        0,
+                        8.0,
+                        target_tab_bounds.height() / 2.0,
+                    );
+                    let source_local_target =
+                        source_local_point_for_screen_point(app, source_window_id, drop_point);
+                    dispatch_mouse_event(
+                        app,
+                        source_window_id,
+                        Event::LeftMouseUp {
+                            position: source_local_target,
+                            modifiers: ModifiersState::default(),
+                        },
+                    );
+                })
+                // Two windows (not a stranded preview) and the tab moved out
+                // of the source and into the target.
+                .add_assertion(assert_num_windows_open(2))
+                .add_assertion(assert_total_tab_count(3)),
+        )
+        .with_step(focus_saved_window(TARGET_WINDOW_KEY).add_assertion(assert_tab_count(2)))
+        .with_step(focus_saved_window(SOURCE_WINDOW_KEY).add_assertion(assert_tab_count(1)))
+}
+
+/// Dispatches a drag event whose cursor lands on the target window's tab bar,
+/// addressed to the source window (which owns the active drag gesture).
+fn drag_over_target_tab_bar(
+    app: &mut warpui_core::App,
+    _window_id: WindowId,
+    data: &mut StepDataMap,
+) {
+    let source_window_id = *data
+        .get::<_, WindowId>(SOURCE_WINDOW_KEY)
+        .expect("saved source window id should exist");
+    let target_window_id = *data
+        .get::<_, WindowId>(TARGET_WINDOW_KEY)
+        .expect("saved target window id should exist");
+    let target_tab_bounds = tab_bounds(app, target_window_id, 0);
+    let over_target = tab_screen_point(
+        app,
+        target_window_id,
+        0,
+        8.0,
+        target_tab_bounds.height() / 2.0,
+    );
+    let source_local_target =
+        source_local_point_for_screen_point(app, source_window_id, over_target);
+    dispatch_mouse_event(
+        app,
+        source_window_id,
+        Event::LeftMouseDragged {
+            position: source_local_target,
+            modifiers: ModifiersState::default(),
+        },
+    );
+}
+
+/// Dispatches a drag event whose cursor lands back on the source window's own
+/// tab bar (the put-back case), addressed to the source window.
+fn drag_over_source_tab_bar(
+    app: &mut warpui_core::App,
+    _window_id: WindowId,
+    data: &mut StepDataMap,
+) {
+    let source_window_id = *data
+        .get::<_, WindowId>(SOURCE_WINDOW_KEY)
+        .expect("saved source window id should exist");
+    let source_tab_bounds = tab_bounds(app, source_window_id, 0);
+    let over_source = tab_screen_point(
+        app,
+        source_window_id,
+        0,
+        8.0,
+        source_tab_bounds.height() / 2.0,
+    );
+    let source_local_target =
+        source_local_point_for_screen_point(app, source_window_id, over_source);
+    dispatch_mouse_event(
+        app,
+        source_window_id,
+        Event::LeftMouseDragged {
+            position: source_local_target,
+            modifiers: ModifiersState::default(),
+        },
+    );
 }
 
 pub fn test_single_tab_handoff_continues_drag() -> Builder {

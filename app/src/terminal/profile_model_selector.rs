@@ -8,17 +8,17 @@ use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use warpui::elements::{
     Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
-    DropShadow, Empty, Expanded, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement as _, ParentOffsetBounds,
-    Percentage, PositionedElementAnchor, PositionedElementOffsetBounds, Radius, Rect, SavePosition,
-    Stack, Text, DEFAULT_UI_LINE_HEIGHT_RATIO,
+    DEFAULT_UI_LINE_HEIGHT_RATIO, DropShadow, Empty, Expanded, Flex, Hoverable, MainAxisAlignment,
+    MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement as _,
+    ParentOffsetBounds, Percentage, PositionedElementAnchor, PositionedElementOffsetBounds, Radius,
+    Rect, SavePosition, Stack, Text,
 };
 use warpui::platform::Cursor;
 use warpui::text_layout::ClipConfig;
 use warpui::ui_components::components::UiComponent;
 use warpui::{
     AppContext, Element, Entity, EntityId, ModelHandle, SingletonEntity as _, TypedActionView,
-    View, ViewContext, ViewHandle,
+    View, ViewContext, ViewHandle, WeakViewHandle,
 };
 
 const SIDECAR_HORIZONTAL_GAP: f32 = 8.;
@@ -26,27 +26,30 @@ const SIDECAR_POSITION_ID: &str = "model_sidecar_panel";
 
 use warp_cli::agent::Harness;
 use warp_core::features::FeatureFlag;
-use warp_core::ui::color::{coloru_with_opacity, Opacity};
-use warp_core::ui::theme::color::internal_colors;
+use warp_core::ui::color::{Opacity, coloru_with_opacity};
 use warp_core::ui::theme::Fill;
+use warp_core::ui::theme::color::internal_colors;
 
 use crate::ai::blocklist::prompt::PromptIconButtonTheme;
 use crate::ai::blocklist::{
     BlocklistAIController, BlocklistAIControllerEvent, BlocklistAIInputEvent, BlocklistAIInputModel,
 };
 use crate::ai::cloud_agent_settings::CloudAgentSettings;
+use crate::ai::custom_model_routers::is_custom_router_id;
+use crate::ai::execution_profiles::ExecutionProfileId;
 use crate::ai::execution_profiles::model_menu_items::{
-    available_model_menu_items, has_reasoning_variants, is_auto,
+    CollapsedModelVariants, available_model_menu_items, has_reasoning_variants, is_auto,
 };
 use crate::ai::execution_profiles::profiles::{
-    AIExecutionProfilesModel, AIExecutionProfilesModelEvent, ClientProfileId,
+    AIExecutionProfilesModel, AIExecutionProfilesModelEvent,
 };
 use crate::ai::harness_availability::{
     HarnessAvailabilityEvent, HarnessAvailabilityModel, HarnessModelInfo,
 };
 use crate::ai::llms::{
-    dedupe_model_display_names, is_using_api_key_for_provider, LLMId, LLMInfo, LLMPreferences,
-    LLMPreferencesEvent, LLMSpec,
+    ByoKeySource, LLMId, LLMInfo, LLMPreferences, LLMPreferencesEvent, LLMSpec,
+    byo_key_source_for_model, dedupe_model_display_names, is_model_allowed_for_scope,
+    should_show_key_icon_for_model,
 };
 use crate::appearance::Appearance;
 use crate::cloud_object::model::generic_string_model::StringModel;
@@ -54,15 +57,16 @@ use crate::context_chips::display_chip::{udi_font_size, udi_icon_size};
 use crate::context_chips::spacing;
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
 use crate::settings_view::SettingsSection;
-use crate::terminal::input::{MenuPositioning, MenuPositioningProvider};
-use crate::terminal::view::ambient_agent::AmbientAgentViewModel;
 use crate::terminal::TerminalModel;
+use crate::terminal::input::{MenuPositioning, MenuPositioningProvider};
+use crate::terminal::view::ambient_agent::{AmbientAgentViewModel, AmbientAgentViewModelEvent};
 use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, ButtonSize, SecondaryTheme,
 };
 use crate::view_components::{FeaturePopup, NewFeaturePopupEvent, NewFeaturePopupLabel};
 use crate::workspace::WorkspaceAction;
+use crate::workspaces::user_workspaces::{TeamContext, UserWorkspaces};
 
 const MENU_WIDTH: f32 = 280.;
 const NEW_MODEL_CHOICES_POPUP_DELAY: Duration = Duration::from_millis(500);
@@ -160,6 +164,7 @@ impl ActionButtonTheme for SelectorChipTheme {
 /// A unified profile and model selector component that combines both selectors
 /// into a single component.
 pub struct ProfileModelSelector {
+    self_handle: WeakViewHandle<Self>,
     profile_button: ViewHandle<ActionButton>,
     model_button: ViewHandle<ActionButton>,
     profile_compact_button: ViewHandle<ActionButton>,
@@ -192,7 +197,7 @@ pub enum ProfileModelSelectorEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileModelSelectorAction {
-    SelectProfile(ClientProfileId),
+    SelectProfile(ExecutionProfileId),
     SelectModel(LLMId),
     SelectAutoModel,
     SelectReasoningModel(String),
@@ -514,22 +519,6 @@ impl ProfileModelSelector {
             },
         );
 
-        if let Some(ref ambient_model) = ambient_agent_view_model {
-            ctx.subscribe_to_model(ambient_model, |me, _, event, ctx| {
-                use crate::terminal::view::ambient_agent::AmbientAgentViewModelEvent;
-                if matches!(
-                    event,
-                    AmbientAgentViewModelEvent::HarnessSelected
-                        | AmbientAgentViewModelEvent::HarnessModelSelected
-                        | AmbientAgentViewModelEvent::RunLifecycleChanged
-                        | AmbientAgentViewModelEvent::SessionReady { .. }
-                        | AmbientAgentViewModelEvent::FollowupDispatched
-                ) {
-                    me.refresh_state(ctx);
-                }
-            });
-        }
-
         ctx.subscribe_to_model(
             &HarnessAvailabilityModel::handle(ctx),
             |me, _, event, ctx| {
@@ -552,6 +541,7 @@ impl ProfileModelSelector {
         });
 
         let mut me = Self {
+            self_handle: ctx.handle(),
             profile_button,
             model_button,
             profile_compact_button,
@@ -572,15 +562,55 @@ impl ProfileModelSelector {
             is_blurred: false,
             new_model_popup,
             input_model,
-            ambient_agent_view_model,
+            ambient_agent_view_model: None,
             render_compact: false,
             hovered_llm_info: None,
             manage_api_key_button,
             terminal_model,
             all_model_choices: Vec::new(),
         };
-        me.refresh_state(ctx);
+        // Route ambient wiring through the setter so construction and the lazy shared-session
+        // viewer path share one implementation.
+        if let Some(ambient_agent_view_model) = ambient_agent_view_model {
+            me.set_ambient_agent_view_model(ambient_agent_view_model, ctx);
+        } else {
+            me.refresh_state(ctx);
+        }
         me
+    }
+
+    /// Attaches an ambient agent view model to an already-constructed selector. Used on the
+    /// shared-session viewer path where the model is created lazily at `SessionJoined`, after the
+    /// selector was built with `None`. Without this, the model / harness chip reflects the local
+    /// default instead of the viewed cloud run. Mirrors the ambient subscription in [`Self::new`].
+    /// Idempotent: a no-op when a model is already set.
+    pub fn set_ambient_agent_view_model(
+        &mut self,
+        ambient_agent_view_model: ModelHandle<AmbientAgentViewModel>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.ambient_agent_view_model.is_some() {
+            return;
+        }
+        ctx.subscribe_to_model(&ambient_agent_view_model, |me, _, event, ctx| {
+            if matches!(
+                event,
+                AmbientAgentViewModelEvent::HarnessSelected
+                    | AmbientAgentViewModelEvent::HarnessModelSelected
+                    | AmbientAgentViewModelEvent::RunLifecycleChanged
+                    | AmbientAgentViewModelEvent::SessionReady { .. }
+                    | AmbientAgentViewModelEvent::FollowupDispatched
+            ) {
+                me.refresh_state(ctx);
+            }
+        });
+        self.ambient_agent_view_model = Some(ambient_agent_view_model);
+        self.refresh_state(ctx);
+        ctx.notify();
+    }
+
+    fn team_scope<'a>(&self, app: &'a AppContext) -> TeamContext<'a> {
+        UserWorkspaces::as_ref(app).team_context(&self.self_handle, app)
     }
 
     pub fn set_profile_menu_visibility(&mut self, is_open: bool, ctx: &mut ViewContext<Self>) {
@@ -697,8 +727,14 @@ impl ProfileModelSelector {
                 llm_preferences.get_active_base_model(ctx, Some(self.terminal_view_id))
             };
 
-            if let Some(description) = &active_llm.description {
-                format!("{} ({})", active_llm.display_name, description)
+            // Don't append description for custom model routers — it would add a
+            // redundant "(Custom auto · Local)" suffix to the button label.
+            if !is_custom_router_id(active_llm.id.as_str()) {
+                if let Some(description) = &active_llm.description {
+                    format!("{} ({})", active_llm.display_name, description)
+                } else {
+                    active_llm.display_name.clone()
+                }
             } else {
                 active_llm.display_name.clone()
             }
@@ -826,9 +862,9 @@ impl ProfileModelSelector {
         ];
 
         for profile_id in all_profile_ids {
-            if let Some(profile_info) = profiles_model.get_profile_by_id(profile_id, ctx) {
+            if let Some(profile_info) = profiles_model.get_profile_by_id(&profile_id, ctx) {
                 let profile = profile_info.data();
-                let is_active = *active_profile.id() == profile_id;
+                let is_active = active_profile.id() == &profile_id;
 
                 let mut fields = MenuItemFields::new(profile.display_name());
                 if is_active {
@@ -851,7 +887,8 @@ impl ProfileModelSelector {
 
         self.profile_dropdown.update(ctx, |menu, ctx| {
             menu.set_items(menu_items, ctx);
-            let active_action = ProfileModelSelectorAction::SelectProfile(*active_profile.id());
+            let active_action =
+                ProfileModelSelectorAction::SelectProfile(active_profile.id().clone());
             menu.set_selected_by_action(&active_action, ctx);
         });
     }
@@ -969,7 +1006,7 @@ impl ProfileModelSelector {
                     .get_llm_info(&id)
                     .map(|info| info.id.clone())
             })
-            .unwrap_or_else(|| llm_preferences.get_default_base_model().id.clone());
+            .unwrap_or_else(|| llm_preferences.get_default_base_model(ctx).id.clone());
 
         let model_id_to_add_profile_default_label_to = Some(&profile_base_model_id);
 
@@ -1025,6 +1062,7 @@ impl ProfileModelSelector {
             }
         }
 
+        let scope = self.team_scope(ctx);
         let mut items = available_model_menu_items(
             auto_choices,
             |llm| {
@@ -1041,8 +1079,8 @@ impl ProfileModelSelector {
             },
             model_id_to_add_profile_default_label_to,
             Some(&|llm_id| self.model_menu_item_position_id(llm_id)),
-            true,
-            true,
+            CollapsedModelVariants::all(),
+            &scope,
             ctx,
         );
 
@@ -1064,10 +1102,15 @@ impl ProfileModelSelector {
                 clickable: false,
                 right_side_fields: None,
             });
-            for llm in &custom_choices {
-                let fields = MenuItemFields::new(llm.menu_display_name())
-                    .with_right_side_icon(Icon::Key)
+            for llm in custom_choices
+                .iter()
+                .filter(|llm| is_model_allowed_for_scope(llm_preferences, llm, &scope, ctx))
+            {
+                let mut fields = MenuItemFields::new(llm.menu_display_name())
                     .with_on_select_action(ProfileModelSelectorAction::SelectModel(llm.id.clone()));
+                if should_show_key_icon_for_model(llm, &scope, ctx) {
+                    fields = fields.with_right_side_icon(Icon::Key);
+                }
                 items.push(MenuItem::Item(fields));
             }
         }
@@ -1092,8 +1135,8 @@ impl ProfileModelSelector {
                 },
                 model_id_to_add_profile_default_label_to,
                 Some(&|llm_id| self.model_menu_item_position_id(llm_id)),
-                true,
-                true,
+                CollapsedModelVariants::all(),
+                &scope,
                 ctx,
             ));
         }
@@ -1925,7 +1968,11 @@ impl ProfileModelSelector {
         .finish()
     }
 
-    fn render_model_spec_api_key(&self, app: &AppContext) -> Box<dyn Element> {
+    fn render_model_spec_api_key(
+        &self,
+        byo_key_source: ByoKeySource,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
 
@@ -1944,7 +1991,7 @@ impl ProfileModelSelector {
                             .with_child(
                                 Container::new(
                                     Text::new(
-                                        "Billed to API".to_string(),
+                                        byo_key_source.inference_label().to_string(),
                                         appearance.ui_font_family(),
                                         14.,
                                     )
@@ -1953,7 +2000,13 @@ impl ProfileModelSelector {
                                 )
                                 .finish(),
                             )
-                            .with_child(ChildView::new(&self.manage_api_key_button).finish())
+                            .with_child(
+                                Container::new(
+                                    ChildView::new(&self.manage_api_key_button).finish(),
+                                )
+                                .with_margin_left(8.)
+                                .finish(),
+                            )
                             .finish(),
                     )
                     .finish(),
@@ -1968,7 +2021,7 @@ impl ProfileModelSelector {
     fn render_all_model_spec_values(
         &self,
         spec: &LLMSpec,
-        is_using_api_key: bool,
+        byo_key_source: Option<ByoKeySource>,
         bg_bar_color: ColorU,
         app: &AppContext,
     ) -> Box<dyn Element> {
@@ -1981,8 +2034,8 @@ impl ProfileModelSelector {
             ),
             self.render_model_spec_value("Speed".to_string(), spec.speed, bg_bar_color, app),
         ];
-        if is_using_api_key {
-            spec_values.push(self.render_model_spec_api_key(app));
+        if let Some(byo_key_source) = byo_key_source {
+            spec_values.push(self.render_model_spec_api_key(byo_key_source, app));
         } else {
             spec_values.push(self.render_model_spec_value(
                 "Cost".to_string(),
@@ -1998,7 +2051,7 @@ impl ProfileModelSelector {
     fn render_model_spec(
         &self,
         spec: &LLMSpec,
-        is_using_api_key: bool,
+        byo_key_source: Option<ByoKeySource>,
         app: &AppContext,
     ) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
@@ -2010,7 +2063,7 @@ impl ProfileModelSelector {
         );
         let spec = self.render_all_model_spec_values(
             spec,
-            is_using_api_key,
+            byo_key_source,
             internal_colors::neutral_3(theme),
             app,
         );
@@ -2057,7 +2110,7 @@ impl ProfileModelSelector {
         let sidecar_menu = ChildView::new(&self.model_spec_sidecar.dropdown).finish();
         let spec_values = self.render_all_model_spec_values(
             &spec.clone().unwrap_or_default(),
-            false,
+            None,
             internal_colors::neutral_5(theme),
             app,
         );
@@ -2100,7 +2153,11 @@ impl TypedActionView for ProfileModelSelector {
         match action {
             ProfileModelSelectorAction::SelectProfile(profile_id) => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_active_profile(self.terminal_view_id, *profile_id, ctx);
+                    profiles_model.set_active_profile(
+                        self.terminal_view_id,
+                        profile_id.clone(),
+                        ctx,
+                    );
                 });
 
                 // Remove any LLM override when switching profiles
@@ -2284,8 +2341,8 @@ impl View for ProfileModelSelector {
                         .cloned();
                     Some(self.render_sidecar_spec_panel(&kind, &sidecar_spec, app))
                 } else if let Some(spec) = info.spec.as_ref() {
-                    let is_using_api_key = is_using_api_key_for_provider(&info.provider, app);
-                    Some(self.render_model_spec(spec, is_using_api_key, app))
+                    let byo_key_source = byo_key_source_for_model(info, &self.team_scope(app), app);
+                    Some(self.render_model_spec(spec, byo_key_source, app))
                 } else {
                     None
                 };

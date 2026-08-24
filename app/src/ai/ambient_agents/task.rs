@@ -1,116 +1,24 @@
 //! Ambient agent task types and utilities.
 
-use anyhow::anyhow;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+#[cfg(not(target_family = "wasm"))]
+pub use cloud_object_models::HarnessModelConfig;
+pub use cloud_object_models::{AgentConfigSnapshot, HarnessAuthSecretsConfig, HarnessConfig};
 use iso8601_duration::Duration as Iso8601Duration;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use session_sharing_protocol::common::SessionId;
 use url::Url;
-use warp_cli::agent::Harness;
-use warp_core::report_error;
 use warp_core::ui::theme::WarpTheme;
+use warp_errors::report_error;
 use warpui::color::ColorU;
 use warpui::{SingletonEntity, View, ViewContext};
 
 use super::AmbientAgentTaskId;
-use crate::ai::artifacts::{deserialize_artifacts, Artifact};
+use crate::ai::artifacts::{Artifact, deserialize_artifacts};
 use crate::server::server_api::ServerApiProvider;
 use crate::ui_components::icons::Icon;
 use crate::view_components::DismissibleToast;
 use crate::workspace::ToastStack;
-
-/// Runtime configuration snapshot for agent execution.
-///
-/// This is the merged/resolved config used when spawning or running an agent.
-/// It combines settings from config files and CLI args.
-/// Unlike `AgentConfig` (the cloud model), field names here use the runtime format
-/// (e.g. `model_id` instead of `base_model_id`).
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct AgentConfigSnapshot {
-    /// Config name for searchability/traceability.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_prompt: Option<String>,
-    /// MCP server configuration map (unwrapped; no `mcpServers` wrapper).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_servers: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Profile ID for local agent runs. This configures the terminal session
-    /// with the specified execution profile. Only used for local runs, not cloud runs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
-    /// Self-hosted worker ID that should execute this task.
-    /// If None or Some("warp"), the task will be dispatched to Warp-hosted (Namespace) workers.
-    /// Otherwise, the task will only be assigned to a connected self-hosted worker with matching ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_host: Option<String>,
-    /// Skill spec to use as the base prompt for the agent.
-    /// Format: "skill_name", "repo:skill_name", or "org/repo:skill_name".
-    /// The skill is resolved at runtime in the agent environment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill_spec: Option<String>,
-    /// Whether computer use is enabled for this agent run.
-    /// If None, the default behavior is used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub computer_use_enabled: Option<bool>,
-    /// Execution harness for the agent run.
-    /// If None, we use Warp's default ("oz").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub harness: Option<HarnessConfig>,
-    /// Authentication secrets for third-party harnesses.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub harness_auth_secrets: Option<HarnessAuthSecretsConfig>,
-}
-
-/// Configuration for a third-party execution harness.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct HarnessConfig {
-    /// The harness type, e.g. [`Harness::Claude`].
-    #[serde(
-        rename = "type",
-        serialize_with = "serialize_harness",
-        deserialize_with = "deserialize_harness"
-    )]
-    pub harness_type: Harness,
-    /// The model to use with this harness. None means use the harness default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-    /// Optional reasoning level for harnesses that support it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_level: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HarnessModelConfig {
-    pub model_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_level: Option<String>,
-}
-
-impl HarnessConfig {
-    /// Builds a harness config from just the harness type.
-    pub fn from_harness_type(harness_type: Harness) -> Self {
-        Self {
-            harness_type,
-            model_id: None,
-            reasoning_level: None,
-        }
-    }
-
-    pub fn model_config(&self) -> Option<HarnessModelConfig> {
-        self.model_id
-            .as_ref()
-            .filter(|id| !id.is_empty())
-            .map(|model_id| HarnessModelConfig {
-                model_id: model_id.clone(),
-                reasoning_level: self.reasoning_level.clone(),
-            })
-    }
-}
 
 fn parse_session_id_from_link(session_link: &str) -> Option<SessionId> {
     Url::parse(session_link).ok().and_then(|url| {
@@ -128,61 +36,6 @@ fn parse_execution_session_id(execution: RunExecution<'_>) -> Option<SessionId> 
         .and_then(|id| id.parse().ok())
         .or_else(|| execution.session_link.and_then(parse_session_id_from_link))
 }
-
-fn serialize_harness<S: Serializer>(harness: &Harness, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(harness.config_name())
-}
-
-fn deserialize_harness<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Harness, D::Error> {
-    let name = String::deserialize(deserializer)?;
-    Ok(Harness::from_config_name(&name).unwrap_or_else(|| {
-        log::warn!("Unknown harness config name: {name:?}; treating as Unknown");
-        Harness::Unknown
-    }))
-}
-
-/// Authentication secrets for third-party harnesses.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct HarnessAuthSecretsConfig {
-    /// Name of a managed secret for Claude Code harness authentication.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claude_auth_secret_name: Option<String>,
-    /// Name of a managed secret for Codex harness authentication.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_auth_secret_name: Option<String>,
-}
-
-impl AgentConfigSnapshot {
-    /// Returns true if this config is empty (no options are set).
-    pub fn is_empty(&self) -> bool {
-        let Self {
-            name,
-            environment_id,
-            model_id,
-            base_prompt,
-            mcp_servers,
-            profile_id,
-            worker_host,
-            skill_spec,
-            computer_use_enabled,
-            harness,
-            harness_auth_secrets,
-        } = self;
-
-        name.is_none()
-            && environment_id.is_none()
-            && model_id.is_none()
-            && base_prompt.is_none()
-            && mcp_servers.is_none()
-            && profile_id.is_none()
-            && worker_host.is_none()
-            && skill_spec.is_none()
-            && computer_use_enabled.is_none()
-            && harness.is_none()
-            && harness_auth_secrets.is_none()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentSource {
     Linear,
@@ -193,7 +46,14 @@ pub enum AgentSource {
     Interactive,
     WebApp,
     GitHubAction,
+    GitHubWebhook,
     CloudMode,
+    Orchestration,
+    Jira,
+    GitLabWebhook,
+    RunScorer,
+    Autofix,
+    BenchmarkTrial,
 }
 
 impl AgentSource {
@@ -209,7 +69,16 @@ impl AgentSource {
             AgentSource::Interactive => "LOCAL",
             AgentSource::WebApp => "WEB_APP",
             AgentSource::GitHubAction => "GITHUB_ACTION",
+            AgentSource::GitHubWebhook => "GITHUB_WEBHOOK",
             AgentSource::CloudMode => "CLOUD_MODE",
+            AgentSource::Orchestration => "ORCHESTRATION",
+            AgentSource::Jira => "JIRA",
+            AgentSource::GitLabWebhook => "GITLAB_WEBHOOK",
+            AgentSource::RunScorer => "RUN_SCORER",
+            // The server surfaces the internal AUTOFIX task source under the public
+            // name SELF_IMPROVEMENT (mirrors AgentWebhook/"API" above).
+            AgentSource::Autofix => "SELF_IMPROVEMENT",
+            AgentSource::BenchmarkTrial => "BENCHMARK_TRIAL",
         }
     }
 
@@ -223,6 +92,35 @@ impl AgentSource {
             AgentSource::Interactive | AgentSource::CloudMode => "Warp App",
             AgentSource::WebApp => "Oz Web",
             AgentSource::GitHubAction => "GitHub Action",
+            AgentSource::GitHubWebhook => "GitHub",
+            AgentSource::Orchestration => "Orchestration",
+            AgentSource::Jira => "Jira",
+            AgentSource::GitLabWebhook => "GitLab",
+            AgentSource::RunScorer => "Scorer",
+            AgentSource::Autofix => "Self-improvement",
+            AgentSource::BenchmarkTrial => "Benchmark",
+        }
+    }
+
+    /// Returns true when tasks from this source must not accept user-triggered cloud follow-ups.
+    pub fn blocks_cloud_followups(&self) -> bool {
+        match self {
+            AgentSource::GitHubAction
+            | AgentSource::GitHubWebhook
+            | AgentSource::GitLabWebhook
+            | AgentSource::RunScorer
+            | AgentSource::Autofix
+            | AgentSource::BenchmarkTrial => true,
+            AgentSource::Linear
+            | AgentSource::AgentWebhook
+            | AgentSource::Slack
+            | AgentSource::Cli
+            | AgentSource::ScheduledAgent
+            | AgentSource::Interactive
+            | AgentSource::WebApp
+            | AgentSource::CloudMode
+            | AgentSource::Orchestration
+            | AgentSource::Jira => false,
         }
     }
 
@@ -234,11 +132,35 @@ impl AgentSource {
             | AgentSource::Slack
             | AgentSource::Interactive
             | AgentSource::WebApp
-            | AgentSource::CloudMode => true,
+            | AgentSource::CloudMode
+            | AgentSource::Jira => true,
             AgentSource::Cli
             | AgentSource::ScheduledAgent
             | AgentSource::AgentWebhook
-            | AgentSource::GitHubAction => false,
+            | AgentSource::GitHubAction
+            | AgentSource::GitHubWebhook
+            | AgentSource::Orchestration
+            | AgentSource::GitLabWebhook
+            | AgentSource::RunScorer
+            | AgentSource::Autofix
+            | AgentSource::BenchmarkTrial => false,
+        }
+    }
+}
+
+/// Where the server executed an agent run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ExecutionLocation {
+    Local,
+    Remote,
+}
+
+impl ExecutionLocation {
+    pub(crate) fn as_query_param(self) -> &'static str {
+        match self {
+            ExecutionLocation::Local => "LOCAL",
+            ExecutionLocation::Remote => "REMOTE",
         }
     }
 }
@@ -260,9 +182,18 @@ where
             "SCHEDULED_AGENT" => Some(AgentSource::ScheduledAgent),
             "WEB_APP" => Some(AgentSource::WebApp),
             "GITHUB_ACTION" => Some(AgentSource::GitHubAction),
+            "GITHUB_WEBHOOK" => Some(AgentSource::GitHubWebhook),
             "CLOUD_MODE" => Some(AgentSource::CloudMode),
+            "ORCHESTRATION" => Some(AgentSource::Orchestration),
+            "JIRA" => Some(AgentSource::Jira),
+            "GITLAB_WEBHOOK" => Some(AgentSource::GitLabWebhook),
+            "RUN_SCORER" => Some(AgentSource::RunScorer),
+            // The server surfaces the internal AUTOFIX task source under the public
+            // name SELF_IMPROVEMENT; accept both spellings.
+            "AUTOFIX" | "SELF_IMPROVEMENT" => Some(AgentSource::Autofix),
+            "BENCHMARK_TRIAL" => Some(AgentSource::BenchmarkTrial),
             _ => {
-                report_error!(anyhow!("Unknown AmbientAgentSource: {}", s));
+                log::warn!("Unknown AmbientAgentSource: {s}");
                 None
             }
         },
@@ -286,6 +217,8 @@ pub struct AmbientAgentTask {
     pub status_message: Option<TaskStatusMessage>,
     #[serde(default, deserialize_with = "deserialize_ambient_agent_source")]
     pub source: Option<AgentSource>,
+    #[serde(default)]
+    pub execution_location: Option<ExecutionLocation>,
     pub session_id: Option<String>,
     pub session_link: Option<String>,
     pub creator: Option<TaskPrincipalInfo>,
@@ -397,6 +330,13 @@ impl AmbientAgentTask {
         self.conversation_id.as_deref()
     }
 
+    /// Returns true when this task's source must not accept user-triggered cloud follow-ups.
+    pub fn blocks_cloud_followups(&self) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(AgentSource::blocks_cloud_followups)
+    }
+
     pub fn active_run_execution(&self) -> RunExecution<'_> {
         RunExecution {
             session_id: self.session_id.as_deref(),
@@ -408,7 +348,7 @@ impl AmbientAgentTask {
 
     pub fn active_execution_session_id(&self) -> Option<&str> {
         let execution = self.active_run_execution();
-        if self.state == AmbientAgentTaskState::InProgress && execution.is_active() {
+        if self.supports_live_session() && execution.is_active() {
             execution.session_id
         } else {
             None
@@ -418,11 +358,12 @@ impl AmbientAgentTask {
     /// Returns the canonical live-session state for this task from the client's perspective.
     ///
     /// This separates task liveness from attachability: an in-progress task can have an active
-    /// execution without a usable shared-session id, and callers should not treat that as a
-    /// completed transcript/follow-up state.
+    /// execution without a usable shared-session id. FAILED/ERROR tasks may also remain live while
+    /// their sandbox is retained for debugging. Callers should not treat either case as a completed
+    /// transcript/follow-up state.
     pub fn active_live_session_state(&self) -> AmbientAgentLiveSessionState {
         let execution = self.active_run_execution();
-        if self.state != AmbientAgentTaskState::InProgress || !execution.is_active() {
+        if !self.supports_live_session() || !execution.is_active() {
             return AmbientAgentLiveSessionState::Inactive;
         }
 
@@ -441,7 +382,7 @@ impl AmbientAgentTask {
     }
 
     pub fn has_active_execution(&self) -> bool {
-        self.state == AmbientAgentTaskState::InProgress && self.active_run_execution().is_active()
+        self.supports_live_session() && self.active_run_execution().is_active()
     }
 
     pub fn is_terminal_run_state(&self) -> bool {
@@ -479,6 +420,15 @@ impl AmbientAgentTask {
     /// Returns true if the underlying session for the ambient agent is no longer running.
     pub fn is_no_longer_running(&self) -> bool {
         !self.active_run_execution().is_sandbox_running && !self.state.is_working()
+    }
+
+    fn supports_live_session(&self) -> bool {
+        matches!(
+            self.state,
+            AmbientAgentTaskState::InProgress
+                | AmbientAgentTaskState::Failed
+                | AmbientAgentTaskState::Error
+        )
     }
 }
 
@@ -658,7 +608,7 @@ pub fn cancel_task_with_toast<V: View>(task_id: AmbientAgentTaskId, ctx: &mut Vi
             let message = match result {
                 Ok(()) => "Task cancelled".to_string(),
                 Err(e) => {
-                    log::error!("Failed to cancel task: {e}");
+                    report_error!(&e);
                     format!("Failed to cancel task: {e}")
                 }
             };
@@ -677,7 +627,7 @@ pub fn cancel_task_silently<V: View>(task_id: AmbientAgentTaskId, ctx: &mut View
         async move { ai_client.cancel_ambient_agent_task(&task_id).await },
         move |_view, result, _| {
             if let Err(e) = result {
-                log::error!("Failed to cancel task: {e}");
+                report_error!(e.context("Failed to cancel task"));
             }
         },
     );

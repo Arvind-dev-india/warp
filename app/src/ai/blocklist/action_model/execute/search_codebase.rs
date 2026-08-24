@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use futures::FutureExt;
 use itertools::Itertools;
+use warp_errors::report_error;
 use warpui::{AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
 
 use super::{
-    read_local_file_context, ActionExecution, AnyActionExecution, ExecuteActionInput,
-    PreprocessActionInput,
+    ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput,
+    describe_failed_files, read_local_file_context,
 };
 use crate::ai::agent::{
     AIAgentAction, AIAgentActionId, AIAgentActionResultType, AIAgentActionType,
@@ -23,7 +24,8 @@ use crate::ai::get_relevant_files::controller::{
 };
 use crate::features::FeatureFlag;
 use crate::terminal::model::session::active_session::ActiveSession;
-use crate::{send_telemetry_from_ctx, TelemetryEvent};
+use crate::workspaces::user_workspaces::TeamContext;
+use crate::{TelemetryEvent, send_telemetry_from_ctx};
 
 pub struct SearchCodebaseExecutor {
     active_session: ModelHandle<ActiveSession>,
@@ -44,7 +46,7 @@ impl SearchCodebaseExecutor {
         terminal_view_id: EntityId,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        ctx.subscribe_to_model(&get_relevant_files_controller, |me, event, ctx| {
+        ctx.subscribe_to_model(&get_relevant_files_controller, |me, _, event, ctx| {
             if !me.active_searches.contains_key(event.action_id()) {
                 return;
             }
@@ -88,11 +90,12 @@ impl SearchCodebaseExecutor {
                             .await
                             {
                                 Ok(result) => {
-                                    if !result.missing_files.is_empty() {
-                                        let missing_files = result.missing_files.join(", ");
+                                    if !result.failed_files.is_empty() {
+                                        let failed_files =
+                                            describe_failed_files(&result.failed_files);
                                         SearchCodebaseResult::Failed {
                                             message: format!(
-                                                "These files do not exist: {missing_files}"
+                                                "Failed to read files: {failed_files}"
                                             ),
                                             reason: SearchCodebaseFailureReason::InvalidFilePaths,
                                         }
@@ -147,7 +150,8 @@ impl SearchCodebaseExecutor {
     pub(super) fn should_autoexecute(
         &self,
         input: ExecuteActionInput,
-        ctx: &mut ModelContext<Self>,
+        scope: &TeamContext<'_>,
+        ctx: &ModelContext<Self>,
     ) -> bool {
         let ExecuteActionInput {
             action:
@@ -169,6 +173,7 @@ impl SearchCodebaseExecutor {
                     &conversation_id,
                     vec![root_repo_path.to_owned()],
                     Some(self.terminal_view_id),
+                    scope,
                     ctx,
                 )
                 .is_allowed()
@@ -179,7 +184,7 @@ impl SearchCodebaseExecutor {
         &mut self,
         input: ExecuteActionInput,
         ctx: &mut ModelContext<Self>,
-    ) -> impl Into<AnyActionExecution> {
+    ) -> impl Into<AnyActionExecution> + use<> {
         let ExecuteActionInput {
             action,
             conversation_id,
@@ -484,7 +489,7 @@ impl SearchCodebaseExecutor {
             ..
         } = input.action
         else {
-            log::error!("Expected a SearchCodebase action when preprocessing action");
+            report_error!("Expected a SearchCodebase action when preprocessing action");
             return futures::future::ready(()).boxed();
         };
 

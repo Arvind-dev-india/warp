@@ -142,9 +142,27 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
         (Get-Variable | Select-Object -ExpandProperty Name) -join ' '
         $aliasesRaw = Get-Command -CommandType Alias | Select-Object -ExpandProperty DisplayName
         $aliases = $aliasesRaw -join [Environment]::NewLine
-        $functionNamesRaw = Get-Command -CommandType Function | Where-Object { -not $_.Name.StartsWith('Warp') } | Select-Object -ExpandProperty Name
+        # Only query modules that ship with PowerShell itself. This keeps bootstrap fast by
+        # avoiding Windows system modules and third-party modules from the Gallery. The rest are
+        # loaded asynchronously later.
+        $corePsModules = @(
+            'Microsoft.PowerShell.*', # All built-in PS modules (cross-platform)
+            'Microsoft.WSMan.*', # WS-Management (Windows PS)
+            'CimCmdlets', # CIM/WMI (Windows)
+            'PackageManagement', # Package management
+            'PowerShellGet', # Package get
+            'PSReadLine', # Line editor bundled with PS
+            'ThreadJob', # Thread jobs (PS 7)
+            'PSDiagnostics', # PS diagnostics
+            'PSDesiredStateConfiguration', # DSC (Windows PS)
+            'PSWorkflow', # Legacy workflow (Windows PS 5)
+            'PSWorkflowUtility'        # Legacy workflow utility (Windows PS 5)
+        )
+        $functionNamesRaw = Get-Command -CommandType Function -Module $corePsModules |
+            Where-Object { -not $_.Name.StartsWith('Warp') } |
+            Select-Object -ExpandProperty Name
         $functionNames = $functionNamesRaw -join [Environment]::NewLine
-        $builtinsRaw = Get-Command -CommandType Cmdlet | Select-Object -ExpandProperty Name
+        $builtinsRaw = Get-Command -CommandType Cmdlet -Module $corePsModules | Select-Object -ExpandProperty Name
         $builtins = $builtinsRaw -join [Environment]::NewLine
         $shellVersion = $PSVersionTable.PSVersion.ToString()
         # PowerShell wasn't cross-platform until version 6. Anything before that is definitely on Windows.
@@ -200,6 +218,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
         $bootstrappedMsg = @{
             hook = 'Bootstrapped'
             value = @{
+                session_id = $global:_warpSessionId
                 histfile = $(Get-PSReadLineOption).HistorySavePath
                 shell = 'pwsh'
                 home_dir = "$HOME"
@@ -216,6 +235,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
                 rcfiles_start_time = "$rcStartTime"
                 rcfiles_end_time = "$rcEndTime"
                 shell_plugins = ''
+                vi_mode_enabled = $(if ($script:viEditModeOverridden) { '1' } else { '' })
                 os_category = $osCategory
                 linux_distribution = "$linuxDistribution"
                 shell_path = (Get-Process -Id $PID).Path
@@ -230,6 +250,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
         $preexecMsg = @{
             hook = 'Preexec'
             value = @{
+                session_id = $global:_warpSessionId
                 command = $command
             }
         }
@@ -254,6 +275,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
         $updateMsg = @{
             hook = 'FinishUpdate'
             value = @{
+                session_id = $global:_warpSessionId
                 update_id = $updateId
             }
         }
@@ -329,7 +351,14 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
     # it is set to $false.
     $script:commandNotFound = $false
 
+    $script:viEditModeOverridden = $false
+
     function Warp-Configure-PSReadLine {
+        if ((Get-PSReadLineOption).EditMode -eq 'Vi') {
+            $script:viEditModeOverridden = $true
+            Set-PSReadLineOption -EditMode Emacs
+        }
+
         # Set-PSReadLineKeyHandler is the PowerShell equivalent of zsh's bindkey.
         Set-PSReadLineKeyHandler -Chord 'Alt+2' -Function BackwardDeleteLine
 
@@ -344,6 +373,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
             $inputBufferMsg = @{
                 hook = 'InputBuffer'
                 value = @{
+                    session_id = $global:_warpSessionId
                     buffer = $inputBuffer
                 }
             }
@@ -426,7 +456,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
             $code
         }
 
-        $newTitle = (Get-Location).Path
+        $newTitle = $PWD.Path
         # Replace the literal home dir with a tilde.
         if ($newTitle.StartsWith($HOME)) {
             $newTitle = '~' + $newTitle.Substring($HOME.length)
@@ -434,11 +464,13 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
         $HOST.UI.RawUI.WindowTitle = $newTitle
 
         $blockId = $script:nextBlockId++
+        $nextBlockId = "precmd-${global:_warpSessionId}-$blockId"
         $commandFinishedMsg = @{
             hook = 'CommandFinished'
             value = @{
+                session_id = $global:_warpSessionId
                 exit_code = $exitCode
-                next_block_id = "precmd-${global:_warpSessionId}-$blockId"
+                next_block_id = $nextBlockId
             }
         }
         Warp-Send-JsonMessage $commandFinishedMsg
@@ -457,6 +489,8 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
             $precmdMsg = @{
                 hook = 'Precmd'
                 value = @{
+                    exit_code = $exitCode
+                    next_block_id = $nextBlockId
                     pwd = ''
                     ps1 = ''
                     git_head = ''
@@ -493,39 +527,52 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
                     $kubeConfig = $env:KUBECONFIG
                 }
 
-                # Compute Node.js version if node is available and we're in a Node project within a Git repo.
-                $hasNodeCommand = Get-Command -CommandType Application node 2>$null
+                # Compute the Node.js version only when the Node.js Version chip is enabled
+                # (WARP_PROMPT_NODE_VERSION_ENABLED is '0' when the chip is not shown; default
+                # enabled when unset) and node is available. Cache the result keyed on the
+                # current location + PATH so we only spawn node when the directory or PATH
+                # changes (PATH changes on version-manager switches like `nvm use`).
+                $nodeChipEnabled = "$env:WARP_PROMPT_NODE_VERSION_ENABLED" -ne '0'
+                $hasNodeCommand = if ($nodeChipEnabled) { Get-Command -CommandType Application node 2>$null } else { $null }
                 if ($hasNodeCommand) {
                     try {
-                        # Walk up from the current directory to find a package.json
-                        $dir = Get-Item -LiteralPath (Get-Location).Path
-                        $foundPackageJson = $false
-                        $packageJsonDir = $null
-                        while ($null -ne $dir) {
-                            $candidate = Join-Path $dir.FullName 'package.json'
-                            if (Test-Path -LiteralPath $candidate) {
-                                $foundPackageJson = $true
-                                $packageJsonDir = $dir.FullName
-                                break
-                            }
-                            $dir = $dir.Parent
-                        }
-
-                        if ($foundPackageJson) {
-                            # Verify package.json resides within a Git repository by walking up to find a .git directory
-                            $probe = Get-Item -LiteralPath $packageJsonDir
-                            $inGitRepo = $false
-                            while ($null -ne $probe) {
-                                if (Test-Path -LiteralPath (Join-Path $probe.FullName '.git')) {
-                                    $inGitRepo = $true
+                        $nodeCacheKey = "$($PWD.Path)|$env:PATH"
+                        if ($nodeCacheKey -eq $script:warpNodeVersionCacheKey) {
+                            $nodeVersion = $script:warpNodeVersionCacheValue
+                        } else {
+                            # Walk up from the current directory to find a package.json
+                            $dir = Get-Item -LiteralPath $PWD.Path
+                            $foundPackageJson = $false
+                            $packageJsonDir = $null
+                            while ($null -ne $dir) {
+                                $candidate = Join-Path $dir.FullName 'package.json'
+                                if (Test-Path -LiteralPath $candidate) {
+                                    $foundPackageJson = $true
+                                    $packageJsonDir = $dir.FullName
                                     break
                                 }
-                                $probe = $probe.Parent
+                                $dir = $dir.Parent
                             }
 
-                            if ($inGitRepo) {
-                                $nodeVersion = Warp-TryGet-NodeVersion
+                            if ($foundPackageJson) {
+                                # Verify package.json resides within a Git repository by walking up to find a .git directory
+                                $probe = Get-Item -LiteralPath $packageJsonDir
+                                $inGitRepo = $false
+                                while ($null -ne $probe) {
+                                    if (Test-Path -LiteralPath (Join-Path $probe.FullName '.git')) {
+                                        $inGitRepo = $true
+                                        break
+                                    }
+                                    $probe = $probe.Parent
+                                }
+
+                                if ($inGitRepo) {
+                                    $nodeVersion = Warp-TryGet-NodeVersion
+                                }
                             }
+
+                            $script:warpNodeVersionCacheKey = $nodeCacheKey
+                            $script:warpNodeVersionCacheValue = $nodeVersion
                         }
                     } catch {
                         # Log at verbose level so the catch block is not empty and diagnostics are available when needed.
@@ -558,7 +605,9 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
             $precmdMsg = @{
                 hook = 'Precmd'
                 value = @{
-                    pwd = (Get-Location).Path
+                    exit_code = $exitCode
+                    next_block_id = $nextBlockId
+                    pwd = $PWD.Path
                     # TODO(PLAT-687) - honor the PS1
                     ps1 = ''
                     honor_ps1 = $honor_ps1
@@ -896,7 +945,9 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
     function Clear-Host() {
         $inputBufferMsg = @{
             hook = 'Clear'
-            value = @{}
+            value = @{
+                session_id = $global:_warpSessionId
+            }
         }
         Warp-Send-JsonMessage $inputBufferMsg
     }
@@ -904,13 +955,17 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
     function clear() {
         $inputBufferMsg = @{
             hook = 'Clear'
-            value = @{}
+            value = @{
+                session_id = $global:_warpSessionId
+            }
         }
         Warp-Send-JsonMessage $inputBufferMsg
     }
 
     function Warp-Finish-Bootstrap {
         param([decimal]$rcStartTime, [decimal]$rcEndTime)
+        Warp-Configure-PSReadLine
+
         # This is the closest we can get in PowerShell to a proper preexec hook. We wrap the
         # invocation of PSConsoleHostReadline, and call our preexec hook before returning the
         # returned value. This allows us to preserve the any custom implementations of

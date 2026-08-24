@@ -1,20 +1,24 @@
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 pub use ai::api_keys::AwsCredentials;
 use ai::api_keys::{ApiKeyManager, AwsCredentialsRefreshStrategy, AwsCredentialsState};
 use anyhow::Context;
-use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::ProvideCredentials;
+use aws_credential_types::provider::error::CredentialsError;
 use futures::channel::oneshot::channel;
 use futures::future::BoxFuture;
+use parking_lot::FairMutex;
 use tokio::sync::Mutex;
 use vec1::vec1;
-use warp_managed_secrets::client::IdentityTokenOptions;
+use warp_errors::report_error;
 use warp_managed_secrets::ManagedSecretManager;
+use warp_managed_secrets::client::IdentityTokenOptions;
 use warpui::{ModelContext, ModelHandle, SingletonEntity};
 
 use crate::settings::{AISettings, AISettingsChangedEvent};
-use crate::terminal::event::{AfterBlockCompletedEvent, BlockType, UserBlockCompleted};
+use crate::terminal::event::{AfterBlockCompletedEvent, BlockType};
+use crate::terminal::model::terminal_model::TerminalModel;
 use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
 use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 
@@ -84,8 +88,8 @@ fn user_facing_aws_credentials_error_message(err: &CredentialsError, profile: &s
 
 impl std::error::Error for LoadAwsCredentialsError {}
 
-const AWS_BEDROCK_STS_AUDIENCE: &str = "sts.amazonaws.com";
-const BEDROCK_IDENTITY_TOKEN_DURATION: Duration = Duration::from_secs(60 * 60);
+pub(crate) const AWS_BEDROCK_STS_AUDIENCE: &str = "sts.amazonaws.com";
+pub(crate) const BEDROCK_IDENTITY_TOKEN_DURATION: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) fn aws_role_session_name(run_id: &str) -> String {
     format!("Oz_Run_{run_id}")
@@ -99,12 +103,12 @@ pub(crate) fn aws_role_session_name(run_id: &str) -> String {
 /// and reuse a single client across refreshes.
 static STS_CLIENT_CACHE: Mutex<Option<(String, aws_sdk_sts::Client)>> = Mutex::const_new(None);
 
-async fn sts_client(region: &str) -> aws_sdk_sts::Client {
+pub(crate) async fn sts_client(region: &str) -> aws_sdk_sts::Client {
     let mut cache = STS_CLIENT_CACHE.lock().await;
-    if let Some((cached_region, client)) = cache.as_ref() {
-        if cached_region == region {
-            return client.clone();
-        }
+    if let Some((cached_region, client)) = cache.as_ref()
+        && cached_region == region
+    {
+        return client.clone();
     }
 
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -175,6 +179,7 @@ pub trait AwsCredentialRefresher {
     fn register_model_event_dispatcher(
         &mut self,
         model_events: &ModelHandle<ModelEventDispatcher>,
+        terminal_model: Arc<FairMutex<TerminalModel>>,
         ctx: &mut ModelContext<Self>,
     ) where
         Self: Sized;
@@ -190,14 +195,25 @@ impl AwsCredentialRefresher for ApiKeyManager {
     fn register_model_event_dispatcher(
         &mut self,
         model_events: &ModelHandle<ModelEventDispatcher>,
+        terminal_model: Arc<FairMutex<TerminalModel>>,
         ctx: &mut ModelContext<Self>,
     ) {
-        ctx.subscribe_to_model(model_events, |manager, event, ctx| {
+        // we cannot simply capture the strong references, or we risk having a reference cycle.
+        let terminal_model_weak = Arc::downgrade(&terminal_model);
+        ctx.subscribe_to_model(model_events, move |manager, _, event, ctx| {
+            let Some(terminal_model) = terminal_model_weak.upgrade() else {
+                return;
+            };
+
             if let ModelEvent::AfterBlockCompleted(AfterBlockCompletedEvent {
-                block_type: BlockType::User(UserBlockCompleted { command, .. }),
+                block_type: BlockType::User(user_block_completed),
                 ..
             }) = event
             {
+                let command = user_block_completed.command.get_with(|compute| {
+                    let model = terminal_model.lock();
+                    compute(model.block_list())
+                });
                 let auth_command = &AISettings::as_ref(ctx).aws_bedrock_auth_refresh_command;
                 if command.trim().starts_with(auth_command.trim()) {
                     log::debug!("Detected AWS auth command completion, refreshing credentials");
@@ -210,7 +226,7 @@ impl AwsCredentialRefresher for ApiKeyManager {
     fn subscribe_to_settings_changes(&mut self, ctx: &mut ModelContext<Self>) {
         // Subscribe to UserWorkspaces events to refresh AWS credentials when workspace settings change
         // (this also initializes AWS credentials on app startup via TeamsChanged)
-        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |manager, event, ctx| {
+        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |manager, _, event, ctx| {
             if matches!(
                 event,
                 UserWorkspacesEvent::UpdateWorkspaceSettingsSuccess
@@ -221,7 +237,7 @@ impl AwsCredentialRefresher for ApiKeyManager {
         });
 
         // Subscribe to AISettings changes to refresh AWS credentials when AWS Bedrock settings change
-        ctx.subscribe_to_model(&AISettings::handle(ctx), |manager, event, ctx| {
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |manager, _, event, ctx| {
             if matches!(
                 event,
                 AISettingsChangedEvent::AwsBedrockProfile { .. }
@@ -359,12 +375,15 @@ fn refresh_aws_credentials_oidc(
                 .send()
                 .await
                 .map_err(|err| {
-                    log::error!("Bedrock OIDC: STS AssumeRoleWithWebIdentity SDK error: {err:#?}");
                     // Surface the AWS service error message for a user-friendly error.
                     let detail = err
                         .as_service_error()
                         .map(|e| e.to_string())
                         .unwrap_or_else(|| err.to_string());
+                    report_error!(
+                        anyhow::Error::new(err)
+                            .context("Bedrock OIDC: STS AssumeRoleWithWebIdentity SDK error")
+                    );
                     anyhow::anyhow!("STS AssumeRoleWithWebIdentity failed: {detail}")
                 })?
                 .credentials
@@ -390,8 +409,8 @@ fn refresh_aws_credentials_oidc(
                     )
                 }
                 Err(e) => {
-                    log::error!("Bedrock OIDC: failed to load credentials: {e:#}");
                     let message = e.to_string();
+                    report_error!(e.context("Bedrock OIDC: failed to load credentials"));
                     (
                         AwsCredentialsState::Failed {
                             message: message.clone(),

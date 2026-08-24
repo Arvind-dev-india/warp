@@ -9,17 +9,18 @@ use ordered_float::Float;
 use pathfinder_geometry::vector::vec2f;
 use serde::{Deserialize, Serialize};
 mod package_installers;
-pub(crate) use history::UpArrowHistoryConfig;
-pub use history::{History, HistoryEntry, HistoryEvent, ShellHost};
+pub use history::{
+    History, HistoryEntry, HistoryEvent, LinkedWorkflowData, ShellHost, UpArrowHistoryConfig,
+};
 pub use view::{Event, TerminalView};
 pub use warp_terminal::shell::{self, ShellLaunchData};
 use warpui::geometry::vector::Vector2F;
 use warpui::units::{IntoPixels, Lines, Pixels};
-use warpui::{AppContext, WindowId};
+use warpui::{AppContext, SingletonEntity, WindowId};
 mod block_list_settings;
 
 mod alias;
-mod alt_screen;
+pub(crate) mod alt_screen;
 pub mod alt_screen_reporting;
 mod audible_bell;
 pub use audible_bell::AudibleBell;
@@ -34,6 +35,7 @@ mod bootstrap;
 mod buy_credits_banner;
 pub mod color;
 mod command_corrections_denylist;
+pub mod conversation_restoration;
 pub mod dynamic_enum_suggestions;
 pub mod enable_auto_reload_modal;
 pub mod event;
@@ -82,6 +84,8 @@ pub mod view;
 pub mod warpify;
 mod waterfall_gap_element;
 mod writeable_pty;
+#[cfg(feature = "tui")]
+pub use writeable_pty::{PtyIntent, PtyIntentEvent, TerminalSurface};
 #[cfg(windows)]
 pub mod wsl;
 
@@ -100,6 +104,8 @@ pub use view::{
     CANCEL_COMMAND_KEYBINDING, TOGGLE_AUTOEXECUTE_MODE_KEYBINDING,
     TOGGLE_HIDE_CLI_RESPONSES_KEYBINDING, TOGGLE_QUEUE_NEXT_PROMPT_KEYBINDING,
 };
+
+use crate::settings::SelectionSettings;
 
 /// Minimum number of visible lines.
 const MIN_ROWS: usize = 1;
@@ -122,6 +128,10 @@ pub const PTY_READS_BROADCAST_CHANNEL_SIZE: usize = 1024;
 pub fn init(app: &mut AppContext) {
     share_block_modal::init(app);
     view::init(app);
+}
+
+pub fn should_right_click_paste(shift: bool, ctx: &AppContext) -> bool {
+    !shift && SelectionSettings::as_ref(ctx).right_click_pastes()
 }
 
 /// Treat rounding errors for heights within this amount as equal.
@@ -228,6 +238,24 @@ pub struct SizeUpdate {
 }
 
 impl SizeUpdate {
+    /// Creates a size update for a layout measured directly in terminal cells.
+    pub fn from_cell_dimensions(last_size: SizeInfo, rows: usize, columns: usize) -> Self {
+        let new_size = SizeInfo::new_without_font_metrics(rows, columns);
+        Self {
+            update_reason: SizeUpdateReason::AfterLayout,
+            last_size,
+            new_size,
+            new_gap_height: None,
+            natural_rows: new_size.rows(),
+            natural_cols: new_size.columns(),
+        }
+    }
+
+    /// Returns the resulting terminal size.
+    pub fn new_size(&self) -> SizeInfo {
+        self.new_size
+    }
+
     /// Whether the reason for the update is a refresh.
     pub fn is_refresh(&self) -> bool {
         matches!(self.update_reason, SizeUpdateReason::Refresh)
@@ -494,3 +522,7 @@ impl BlockPadding {
 
 #[cfg(test)]
 mod ref_tests;
+
+#[cfg(test)]
+#[path = "size_update_tests.rs"]
+mod size_update_tests;

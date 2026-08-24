@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fuzzy_match::match_indices_case_insensitive;
-use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
+use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
 
 use crate::launch_configs::launch_config::LaunchConfig;
 use crate::search::command_palette::launch_config::search_item::SearchItem;
@@ -48,7 +48,12 @@ impl DataSource {
         Self { searcher }
     }
 
-    fn handle_config_event(&mut self, event: &WarpConfigUpdateEvent, ctx: &mut ModelContext<Self>) {
+    fn handle_config_event(
+        &mut self,
+        _: ModelHandle<WarpConfig>,
+        event: &WarpConfigUpdateEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
         if matches!(event, WarpConfigUpdateEvent::LaunchConfigs) {
             self.searcher.refresh_search_index(ctx);
         }
@@ -188,7 +193,9 @@ mod full_text_searcher {
                 .map(|config| (config.name.to_lowercase(), config.clone()))
                 .collect();
             if self.rebuild_search_index().is_err() {
-                log::error!("Failed to create search index writer for launch configs");
+                warp_errors::report_error!(
+                    "Failed to create search index writer for launch configs"
+                );
                 self.clear_search_index();
             }
         }
@@ -205,12 +212,11 @@ mod full_text_searcher {
         }
 
         fn rebuild_search_index(&mut self) -> Result<(), anyhow::Error> {
-            self.clear_search_index();
             let documents = self.configs.keys().map(|name| LaunchConfigDocument {
                 name: name.clone(),
                 name_id: name.clone(),
             });
-            self.searcher.build_index_async(documents)
+            self.searcher.rebuild_index_async(documents)
         }
 
         fn clear_search_index(&mut self) {

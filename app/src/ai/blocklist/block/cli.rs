@@ -11,26 +11,27 @@ use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use settings::Setting as _;
 use warp_core::features::FeatureFlag;
-use warp_core::report_error;
 use warp_core::semantic_selection::SemanticSelection;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::color::internal_colors;
 use warp_editor::content::buffer::InitialBufferState;
 use warp_editor::render::element::VerticalExpansionBehavior;
+use warp_errors::report_error;
+use warpui::r#async::{SpawnedFutureHandle, Timer};
 use warpui::clipboard::ClipboardContent;
 use warpui::elements::new_scrollable::SingleAxisConfig;
 use warpui::elements::{
     Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ConstrainedBox, Container,
-    CornerRadius, CrossAxisAlignment, DropShadow, Empty, Expanded, Fill, Flex,
+    CornerRadius, CrossAxisAlignment, DragBarSide, DropShadow, Empty, Expanded, Fill, Flex,
     FormattedTextElement, Highlight, HighlightedHyperlink, Hoverable, MainAxisAlignment,
     MainAxisSize, MouseStateHandle, NewScrollable, OffsetPositioning, ParentElement,
-    PositionedElementAnchor, PositionedElementOffsetBounds, Radius, SavePosition, SelectableArea,
-    SelectionHandle, Shrinkable, SizeConstraintCondition, SizeConstraintSwitch, Stack, Text,
+    PositionedElementAnchor, PositionedElementOffsetBounds, Radius, Resizable,
+    ResizableStateHandle, SavePosition, SelectableArea, SelectionHandle, Shrinkable,
+    SizeConstraintCondition, SizeConstraintSwitch, Stack, Text, resizable_state_handle,
 };
 use warpui::fonts::{Properties, Style, Weight};
 use warpui::keymap::{EditableBinding, Keystroke};
 use warpui::platform::{Cursor, OperatingSystem};
-use warpui::r#async::{SpawnedFutureHandle, Timer};
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
     AppContext, Element, Entity, EntityId, ModelHandle, SingletonEntity, TypedActionView, View,
@@ -40,8 +41,8 @@ use warpui::{
 use super::cli_controller::{CLISubagentController, CLISubagentEvent, UserTakeOverReason};
 use super::model::{AIBlockModel, AIBlockModelHelper, AIBlockModelImpl, AIBlockOutputStatus};
 use super::view_impl::common::{
-    render_debug_footer, render_failed_output, render_informational_footer, render_text_sections,
-    DebugFooterProps, FailedOutputProps, TextSectionsProps,
+    DebugFooterProps, FailedOutputProps, TextSectionsProps, render_debug_footer,
+    render_failed_output, render_informational_footer, render_text_sections,
 };
 use super::view_impl::output::are_all_text_sections_empty;
 use super::{EmbeddedCodeEditorView, SecretRedactionState, TableSectionHandles};
@@ -52,22 +53,22 @@ use crate::ai::agent::{
     AIAgentActionType, AIAgentInput, AIAgentOutput, AIAgentOutputMessageType, AIAgentPtyWriteMode,
     AIAgentText, AIAgentTextSection, CancellationReason, ProgrammingLanguage, WebSearchStatus,
 };
+use crate::ai::blocklist::block::TextLocation;
 use crate::ai::blocklist::block::view_impl::common::{
-    render_query_text, UserQueryProps, BLOCKED_ACTION_MESSAGE_FOR_GREP_OR_FILE_GLOB,
-    BLOCKED_ACTION_MESSAGE_FOR_READING_FILES, BLOCKED_ACTION_MESSAGE_FOR_SEARCHING_CODEBASE,
+    BLOCKED_ACTION_MESSAGE_FOR_GREP_OR_FILE_GLOB, BLOCKED_ACTION_MESSAGE_FOR_READING_FILES,
+    BLOCKED_ACTION_MESSAGE_FOR_SEARCHING_CODEBASE,
     BLOCKED_ACTION_MESSAGE_FOR_WRITE_TO_LONG_RUNNING_SHELL_COMMAND,
     LOAD_OUTPUT_MESSAGE_FOR_FILE_GLOB, LOAD_OUTPUT_MESSAGE_FOR_GREP,
     LOAD_OUTPUT_MESSAGE_FOR_READING_FILES, LOAD_OUTPUT_MESSAGE_FOR_SEARCH_CODEBASE,
-    LOAD_OUTPUT_MESSAGE_FOR_WEB_SEARCH,
+    LOAD_OUTPUT_MESSAGE_FOR_WEB_SEARCH, UserQueryProps, render_query_text,
 };
-use crate::ai::blocklist::block::TextLocation;
 use crate::ai::blocklist::code_block::CodeSnippetButtonHandles;
 use crate::ai::blocklist::inline_action::inline_action_icons::icon_size;
 use crate::ai::blocklist::permissions::is_agent_mode_autonomy_allowed;
 use crate::ai::blocklist::{
     BlocklistAIActionModel, BlocklistAIHistoryEvent, BlocklistAIPermissions,
 };
-use crate::ai::control_code_parser::{parse_control_codes_from_bytes, ParsedControlCodeOutput};
+use crate::ai::control_code_parser::{ParsedControlCodeOutput, parse_control_codes_from_bytes};
 use crate::ai::execution_profiles::profiles::{
     AIExecutionProfilesModel, AIExecutionProfilesModelEvent,
 };
@@ -84,19 +85,23 @@ use crate::terminal::safe_mode_settings::get_secret_obfuscation_mode;
 use crate::terminal::{ShellLaunchData, TerminalModel};
 use crate::ui_components::blended_colors;
 use crate::ui_components::icons::Icon;
-use crate::util::link_detection::{detect_links, DetectedLinksState};
+use crate::util::link_detection::{DetectedLinksState, detect_links};
+use crate::view_components::DismissibleToast;
 use crate::view_components::action_button::{
     ButtonSize, KeystrokeSource, NakedTheme, PrimaryTheme,
 };
 use crate::view_components::compactible_action_button::{
-    render_compact_and_regular_button_rows, CompactibleActionButton, RenderCompactibleActionButton,
+    CompactibleActionButton, RenderCompactibleActionButton, render_compact_and_regular_button_rows,
 };
 use crate::view_components::compactible_split_action_button::CompactibleSplitActionButton;
-use crate::view_components::DismissibleToast;
 use crate::workspace::WorkspaceAction;
-use crate::{send_telemetry_from_ctx, BlocklistAIHistoryModel, ToastStack};
+use crate::{BlocklistAIHistoryModel, ToastStack, send_telemetry_from_ctx};
 const MENU_WIDTH: f32 = 200.0;
 const MAX_HEIGHT: f32 = 320.0;
+const MIN_RESIZABLE_WIDTH: f32 = 360.0;
+const MIN_RESIZABLE_HEIGHT: f32 = 40.0;
+const MIN_REMAINING_WINDOW_WIDTH: f32 = 200.0;
+const MIN_REMAINING_WINDOW_HEIGHT: f32 = 100.0;
 const AVATAR_RIGHT_MARGIN: f32 = 8.;
 const CONTENT_PADDING: f32 = 12.;
 const ALLOW_ACTION_POSITION_ID: &str = "allow-action-position-id";
@@ -125,8 +130,8 @@ const HAS_PENDING_NON_TRANSFER_CONTROL_ACTION_CONTEXT_KEY: &str =
 const BLOCKED_ACTION_MESSAGE_FOR_TRANSFER_CONTROL: &str = "Agent is asking you to take control.";
 
 pub fn init(app: &mut AppContext) {
-    use warpui::keymap::macros::*;
     use warpui::keymap::FixedBinding;
+    use warpui::keymap::macros::*;
 
     app.register_fixed_bindings([
         FixedBinding::new(
@@ -171,6 +176,7 @@ pub fn init(app: &mut AppContext) {
 #[derive(Default)]
 struct StateHandles {
     invalid_api_key_button_handle: MouseStateHandle,
+    subscribe_button_handle: MouseStateHandle,
     debug_copy_button_handle: MouseStateHandle,
     submit_issue_button_handle: MouseStateHandle,
     query_selection_handle: SelectionHandle,
@@ -215,6 +221,8 @@ pub struct CLISubagentView {
 
     is_input_dismissed: bool,
     input_dismiss_timer_handle: Option<SpawnedFutureHandle>,
+    resizable_width: ResizableStateHandle,
+    resizable_height: ResizableStateHandle,
 
     current_working_directory: Option<String>,
     shell_launch_data: Option<ShellLaunchData>,
@@ -315,21 +323,29 @@ impl CLISubagentView {
 
         // We want to default the checkbox to true when rendering the speedbump for the first time.
         // Otherwise, update it when the permission changes.
-        let always_allow_write_to_pty_checked = if should_show_write_to_pty_speedbump(ctx) {
-            true
-        } else {
-            BlocklistAIPermissions::as_ref(ctx)
-                .can_write_to_pty(&conversation_id, Some(ctx.view_id()), ctx)
-                .is_always_allow()
-        };
-
-        let always_allow_read_files_checked = if should_show_read_files_speedbump(ctx) {
-            true
-        } else {
-            BlocklistAIPermissions::as_ref(ctx)
-                .can_read_files(Some(&conversation_id), Vec::new(), Some(ctx.view_id()), ctx)
-                .is_allowed()
-        };
+        let scope = subagent_controller.as_ref(ctx).team_context(ctx);
+        let always_allow_write_to_pty_checked =
+            if should_show_write_to_pty_speedbump(&subagent_controller, ctx) {
+                true
+            } else {
+                BlocklistAIPermissions::as_ref(ctx)
+                    .can_write_to_pty(&conversation_id, Some(ctx.view_id()), &scope, ctx)
+                    .is_always_allow()
+            };
+        let always_allow_read_files_checked =
+            if should_show_read_files_speedbump(&subagent_controller, ctx) {
+                true
+            } else {
+                BlocklistAIPermissions::as_ref(ctx)
+                    .can_read_files(
+                        Some(&conversation_id),
+                        Vec::new(),
+                        Some(ctx.view_id()),
+                        &scope,
+                        ctx,
+                    )
+                    .is_allowed()
+            };
 
         let history_model = BlocklistAIHistoryModel::handle(ctx);
         let mut task_id_clone = task_id.clone();
@@ -394,15 +410,21 @@ impl CLISubagentView {
                     _ => false,
                 };
                 if should_update_permissions {
+                    let scope = me.subagent_controller.as_ref(ctx).team_context(ctx);
                     let ai_permission = BlocklistAIPermissions::as_ref(ctx);
-                    if should_show_write_to_pty_speedbump(ctx) {
+                    if should_show_write_to_pty_speedbump(&me.subagent_controller, ctx) {
                         me.always_allow_write_to_pty_checked = ai_permission
-                            .can_write_to_pty(&me.conversation_id, Some(me.terminal_view_id), ctx)
+                            .can_write_to_pty(
+                                &me.conversation_id,
+                                Some(me.terminal_view_id),
+                                &scope,
+                                ctx,
+                            )
                             .is_always_allow();
                     }
-                    if should_show_read_files_speedbump(ctx) {
+                    if should_show_read_files_speedbump(&me.subagent_controller, ctx) {
                         me.always_allow_read_files_checked = ai_permission
-                            .get_read_files_setting(ctx, Some(me.terminal_view_id))
+                            .get_read_files_setting(Some(me.terminal_view_id), &scope, ctx)
                             .is_always_allow();
                     }
                     ctx.notify();
@@ -469,6 +491,8 @@ impl CLISubagentView {
             always_allow_read_files_checked,
             is_input_dismissed: false,
             input_dismiss_timer_handle: None,
+            resizable_width: resizable_state_handle(MIN_RESIZABLE_WIDTH),
+            resizable_height: resizable_state_handle(MAX_HEIGHT),
             current_working_directory,
             shell_launch_data,
             selected_text: Arc::new(RwLock::new(None)),
@@ -597,7 +621,7 @@ impl CLISubagentView {
     fn maybe_update_speedbump(&mut self, action: &AIAgentActionType, ctx: &mut ViewContext<Self>) {
         match action {
             AIAgentActionType::WriteToLongRunningShellCommand { .. }
-                if should_show_write_to_pty_speedbump(ctx) =>
+                if should_show_write_to_pty_speedbump(&self.subagent_controller, ctx) =>
             {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     let _ = settings
@@ -620,7 +644,7 @@ impl CLISubagentView {
             | AIAgentActionType::ReadFiles(_)
             | AIAgentActionType::Grep { .. }
             | AIAgentActionType::FileGlobV2 { .. } => {
-                if should_show_read_files_speedbump(ctx) {
+                if should_show_read_files_speedbump(&self.subagent_controller, ctx) {
                     AISettings::handle(ctx).update(ctx, |settings, ctx| {
                         let _ = settings
                             .should_show_agent_mode_autoread_files_speedbump
@@ -957,6 +981,11 @@ impl View for CLISubagentView {
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
         let semantic_selection = SemanticSelection::handle(app).as_ref(app);
+        let resizable_height = self
+            .resizable_height
+            .lock()
+            .map(|g| g.size())
+            .unwrap_or(MAX_HEIGHT);
 
         let mut result = Flex::column()
             .with_main_axis_size(MainAxisSize::Min)
@@ -1015,6 +1044,7 @@ impl View for CLISubagentView {
                         child: selectable_text.finish(),
                         background_color: internal_colors::accent_bg(theme).into(),
                         border: Some(Border::all(1.).with_border_fill(theme.accent())),
+                        max_height: resizable_height,
                     },
                     app,
                 )
@@ -1111,30 +1141,34 @@ impl View for CLISubagentView {
                             .as_ref(app)
                             .get_action_status(&action.id)
                             .is_some_and(|status| status.is_cancelled());
-                        if blocked_action.is_none() && !is_cancelled && !should_hide_responses {
-                            if let Some(rendered_action) = render_action(action.action.clone(), app)
-                            {
-                                result.add_child(
-                                    render_scrollable_container(
-                                        ScrollableContainerProps {
-                                            scroll_state: self
-                                                .state_handles
-                                                .action_scroll_state
-                                                .clone(),
-                                            child: rendered_action,
-                                            background_color: internal_colors::neutral_2(
-                                                appearance.theme(),
-                                            ),
-                                            border: Some(Border::all(1.).with_border_fill(
+                        if blocked_action.is_none()
+                            && !is_cancelled
+                            && !should_hide_responses
+                            && let Some(rendered_action) = render_action(action.action.clone(), app)
+                        {
+                            result.add_child(
+                                render_scrollable_container(
+                                    ScrollableContainerProps {
+                                        scroll_state: self
+                                            .state_handles
+                                            .action_scroll_state
+                                            .clone(),
+                                        child: rendered_action,
+                                        background_color: internal_colors::neutral_2(
+                                            appearance.theme(),
+                                        ),
+                                        border: Some(
+                                            Border::all(1.).with_border_fill(
                                                 internal_colors::neutral_3(theme),
-                                            )),
-                                        },
-                                        app,
-                                    )
-                                    .with_margin_bottom(8.)
-                                    .finish(),
-                                );
-                            }
+                                            ),
+                                        ),
+                                        max_height: resizable_height,
+                                    },
+                                    app,
+                                )
+                                .with_margin_bottom(8.)
+                                .finish(),
+                            );
                         }
                     }
                     AIAgentOutputMessageType::WebSearch(WebSearchStatus::Searching { query }) => {
@@ -1155,6 +1189,7 @@ impl View for CLISubagentView {
                                                 internal_colors::neutral_3(theme),
                                             ),
                                         ),
+                                        max_height: resizable_height,
                                     },
                                     app,
                                 )
@@ -1170,57 +1205,66 @@ impl View for CLISubagentView {
 
         let mut output_border = Border::all(1.).with_border_fill(internal_colors::neutral_3(theme));
         if let AIBlockOutputStatus::Failed { error, .. } = &status {
-            output_border = Border::all(1.).with_border_color(theme.ui_error_color());
-            output_items.add_child(render_failed_output(
-                FailedOutputProps {
-                    error,
-                    is_ai_input_enabled: false,
-                    invalid_api_key_button_handle: &self
-                        .state_handles
-                        .invalid_api_key_button_handle,
-                    aws_bedrock_credentials_error_view: None,
-                    icon_right_margin: AVATAR_RIGHT_MARGIN,
-                },
-                app,
-            ));
+            // While an automatic resume is still in flight, keep the failed exchange
+            // quiet: don't switch to the error border, and skip the banner, the "won't
+            // count towards usage" notice, and the debug footer. The full failure UI is
+            // surfaced only once recovery has actually failed. Dogfood builds (Local/Dev)
+            // opt out so developers still see every transport failure aggressively.
+            if !error.should_suppress_during_recovery() {
+                output_border = Border::all(1.).with_border_color(theme.ui_error_color());
+                output_items.add_child(render_failed_output(
+                    FailedOutputProps {
+                        error,
+                        is_ai_input_enabled: false,
+                        invalid_api_key_button_handle: &self
+                            .state_handles
+                            .invalid_api_key_button_handle,
+                        subscribe_button_handle: &self.state_handles.subscribe_button_handle,
+                        aws_bedrock_credentials_error_view: None,
+                        gemini_enterprise_credentials_error_view: None,
+                        icon_right_margin: AVATAR_RIGHT_MARGIN,
+                    },
+                    app,
+                ));
 
-            if !self.model.is_restored() && !error.is_invalid_api_key() {
-                output_items.add_child(
-                    Container::new(render_informational_footer(
-                        app,
-                        "This response won't count towards your usage. \"Take over\" to continue."
-                            .to_string(),
-                    ))
-                    .with_margin_top(8.)
-                    .with_margin_left(icon_size(app) + AVATAR_RIGHT_MARGIN)
-                    .finish(),
-                );
+                if !self.model.is_restored() && !error.is_invalid_api_key() {
+                    output_items.add_child(
+                        Container::new(render_informational_footer(
+                            app,
+                            "This response won't count towards your usage. \"Take over\" to continue."
+                                .to_string(),
+                        ))
+                        .with_margin_top(8.)
+                        .with_margin_left(icon_size(app) + AVATAR_RIGHT_MARGIN)
+                        .finish(),
+                    );
 
-                output_items.add_child(
-                    Container::new(render_debug_footer(
-                        DebugFooterProps {
-                            conversation: self.model.conversation(app),
-                            model: self.model.as_ref(),
-                            debug_copy_button_handle: self
-                                .state_handles
-                                .debug_copy_button_handle
-                                .clone(),
-                            submit_issue_button_handle: self
-                                .state_handles
-                                .submit_issue_button_handle
-                                .clone(),
-                            should_render_feedback_below: true,
-                        },
-                        |debug_id, ctx| {
-                            ctx.dispatch_typed_action(CLISubagentAction::CopyDebugId(debug_id))
-                        },
-                        |ctx| ctx.dispatch_typed_action(CLISubagentAction::OpenFeedbackDocs),
-                        app,
-                    ))
-                    .with_margin_top(8.)
-                    .with_margin_left(icon_size(app) + AVATAR_RIGHT_MARGIN)
-                    .finish(),
-                );
+                    output_items.add_child(
+                        Container::new(render_debug_footer(
+                            DebugFooterProps {
+                                conversation: self.model.conversation(app),
+                                model: self.model.as_ref(),
+                                debug_copy_button_handle: self
+                                    .state_handles
+                                    .debug_copy_button_handle
+                                    .clone(),
+                                submit_issue_button_handle: self
+                                    .state_handles
+                                    .submit_issue_button_handle
+                                    .clone(),
+                                should_render_feedback_below: true,
+                            },
+                            |debug_id, ctx| {
+                                ctx.dispatch_typed_action(CLISubagentAction::CopyDebugId(debug_id))
+                            },
+                            |ctx| ctx.dispatch_typed_action(CLISubagentAction::OpenFeedbackDocs),
+                            app,
+                        ))
+                        .with_margin_top(8.)
+                        .with_margin_left(icon_size(app) + AVATAR_RIGHT_MARGIN)
+                        .finish(),
+                    );
+                }
             }
         }
 
@@ -1257,6 +1301,7 @@ impl View for CLISubagentView {
                         child: output.finish(),
                         background_color: internal_colors::neutral_2(appearance.theme()),
                         border: Some(output_border),
+                        max_height: resizable_height,
                     },
                     app,
                 )
@@ -1276,6 +1321,7 @@ impl View for CLISubagentView {
                                 input: input.clone(),
                                 mode,
                                 scroll_state: self.state_handles.input_scroll_state.clone(),
+                                max_height: resizable_height,
                             },
                             app,
                         )),
@@ -1286,17 +1332,19 @@ impl View for CLISubagentView {
                             &self.reject_button,
                             &self.take_over_button,
                         ],
-                        speedbump: should_show_write_to_pty_speedbump(app).then_some(
-                            PermissionsSpeedbumpProps {
-                                always_allow_checked: self.always_allow_write_to_pty_checked,
-                                speedbump_checkbox_handle: &self
-                                    .state_handles
-                                    .speedbump_checkbox_handle,
-                                speedbump_checkbox_action:
-                                    CLISubagentAction::ToggleAlwaysAllowWriteToPty,
-                                ai_settings_link: &self.state_handles.ai_settings_link,
-                            },
-                        ),
+                        speedbump: should_show_write_to_pty_speedbump(
+                            &self.subagent_controller,
+                            app,
+                        )
+                        .then_some(PermissionsSpeedbumpProps {
+                            always_allow_checked: self.always_allow_write_to_pty_checked,
+                            speedbump_checkbox_handle: &self
+                                .state_handles
+                                .speedbump_checkbox_handle,
+                            speedbump_checkbox_action:
+                                CLISubagentAction::ToggleAlwaysAllowWriteToPty,
+                            ai_settings_link: &self.state_handles.ai_settings_link,
+                        }),
                     },
                     app,
                 ))
@@ -1328,8 +1376,8 @@ impl View for CLISubagentView {
                         &self.reject_button,
                         &self.take_over_button,
                     ],
-                    speedbump: should_show_read_files_speedbump(app).then_some(
-                        PermissionsSpeedbumpProps {
+                    speedbump: should_show_read_files_speedbump(&self.subagent_controller, app)
+                        .then_some(PermissionsSpeedbumpProps {
                             always_allow_checked: self.always_allow_read_files_checked,
                             speedbump_checkbox_handle: &self
                                 .state_handles
@@ -1337,8 +1385,7 @@ impl View for CLISubagentView {
                             speedbump_checkbox_action:
                                 CLISubagentAction::ToggleAlwaysAllowReadFiles,
                             ai_settings_link: &self.state_handles.ai_settings_link,
-                        },
-                    ),
+                        }),
                 },
                 app,
             )),
@@ -1376,7 +1423,24 @@ impl View for CLISubagentView {
             );
         }
 
-        result.finish()
+        let content = result.finish();
+        let width_resizable = Resizable::new(self.resizable_width.clone(), content)
+            .with_dragbar_side(DragBarSide::Left)
+            .on_resize(|ctx, _| ctx.notify())
+            .with_bounds_callback(Box::new(|window_size| {
+                let max = (window_size.x() - MIN_REMAINING_WINDOW_WIDTH).max(MIN_RESIZABLE_WIDTH);
+                (MIN_RESIZABLE_WIDTH, max)
+            }))
+            .finish();
+
+        Resizable::new(self.resizable_height.clone(), width_resizable)
+            .with_dragbar_side(DragBarSide::Top)
+            .on_resize(|ctx, _| ctx.notify())
+            .with_bounds_callback(Box::new(|window_size| {
+                let max = (window_size.y() - MIN_REMAINING_WINDOW_HEIGHT).max(MIN_RESIZABLE_HEIGHT);
+                (MIN_RESIZABLE_HEIGHT, max)
+            }))
+            .finish()
     }
 
     fn keymap_context(&self, app: &AppContext) -> warpui::keymap::Context {
@@ -1508,13 +1572,20 @@ impl TypedActionView for CLISubagentView {
     }
 }
 
-fn should_show_write_to_pty_speedbump(app: &AppContext) -> bool {
-    is_agent_mode_autonomy_allowed(app)
+fn should_show_write_to_pty_speedbump(
+    subagent_controller: &ModelHandle<CLISubagentController>,
+    app: &AppContext,
+) -> bool {
+    let scope = subagent_controller.as_ref(app).team_context(app);
+    is_agent_mode_autonomy_allowed(&scope, app)
         && *AISettings::as_ref(app).should_show_agent_mode_write_to_pty_speedbump
 }
-
-fn should_show_read_files_speedbump(app: &AppContext) -> bool {
-    is_agent_mode_autonomy_allowed(app)
+fn should_show_read_files_speedbump(
+    subagent_controller: &ModelHandle<CLISubagentController>,
+    app: &AppContext,
+) -> bool {
+    let scope = subagent_controller.as_ref(app).team_context(app);
+    is_agent_mode_autonomy_allowed(&scope, app)
         && *AISettings::as_ref(app).should_show_agent_mode_autoread_files_speedbump
 }
 
@@ -1688,6 +1759,7 @@ struct ScrollableContainerProps {
     child: Box<dyn Element>,
     background_color: ColorU,
     border: Option<Border>,
+    max_height: f32,
 }
 
 fn render_scrollable_container(props: ScrollableContainerProps, _app: &AppContext) -> Container {
@@ -1696,6 +1768,7 @@ fn render_scrollable_container(props: ScrollableContainerProps, _app: &AppContex
         child,
         background_color,
         border,
+        max_height,
     } = props;
 
     let scrollable = NewScrollable::vertical(
@@ -1711,7 +1784,7 @@ fn render_scrollable_container(props: ScrollableContainerProps, _app: &AppContex
     .finish();
 
     let clipped = ConstrainedBox::new(scrollable)
-        .with_max_height(MAX_HEIGHT)
+        .with_max_height(max_height)
         .finish();
 
     let mut container = Container::new(clipped)
@@ -1895,6 +1968,7 @@ struct WriteToPtyInputProps {
     input: bytes::Bytes,
     mode: AIAgentPtyWriteMode,
     scroll_state: ClippedScrollStateHandle,
+    max_height: f32,
 }
 
 fn render_write_to_pty_input(props: WriteToPtyInputProps, app: &AppContext) -> Box<dyn Element> {
@@ -1902,6 +1976,7 @@ fn render_write_to_pty_input(props: WriteToPtyInputProps, app: &AppContext) -> B
         input,
         mode,
         scroll_state,
+        max_height,
     } = props;
 
     let appearance = Appearance::as_ref(app);
@@ -1947,7 +2022,7 @@ fn render_write_to_pty_input(props: WriteToPtyInputProps, app: &AppContext) -> B
     .finish();
 
     let clipped = ConstrainedBox::new(scrollable)
-        .with_max_height(MAX_HEIGHT)
+        .with_max_height(max_height)
         .finish();
 
     Container::new(clipped)
@@ -2103,19 +2178,19 @@ fn render_blocked_action(props: BlockedActionProps<'_>, app: &AppContext) -> Box
             .finish(),
     );
 
-    if props.is_allow_menu_open {
-        if let Some(allow_menu) = props.allow_menu {
-            stack.add_positioned_child(
-                ChildView::new(allow_menu).finish(),
-                OffsetPositioning::offset_from_save_position_element(
-                    ALLOW_ACTION_POSITION_ID.to_string(),
-                    vec2f(0., 8.),
-                    PositionedElementOffsetBounds::WindowByPosition,
-                    PositionedElementAnchor::BottomRight,
-                    ChildAnchor::TopRight,
-                ),
-            );
-        }
+    if props.is_allow_menu_open
+        && let Some(allow_menu) = props.allow_menu
+    {
+        stack.add_positioned_child(
+            ChildView::new(allow_menu).finish(),
+            OffsetPositioning::offset_from_save_position_element(
+                ALLOW_ACTION_POSITION_ID.to_string(),
+                vec2f(0., 8.),
+                PositionedElementOffsetBounds::WindowByPosition,
+                PositionedElementAnchor::BottomRight,
+                ChildAnchor::TopRight,
+            ),
+        );
     }
 
     Expanded::new(

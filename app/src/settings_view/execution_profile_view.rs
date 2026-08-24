@@ -9,14 +9,16 @@ use warpui::elements::{
 use warpui::fonts::{Properties, Weight};
 use warpui::{
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
+    WeakViewHandle,
 };
 
 use crate::ai::blocklist::BlocklistAIPermissions;
 use crate::ai::execution_profiles::profiles::{
-    AIExecutionProfilesModel, AIExecutionProfilesModelEvent, ClientProfileId,
+    AIExecutionProfilesModel, AIExecutionProfilesModelEvent,
 };
 use crate::ai::execution_profiles::{
-    ActionPermission, AskUserQuestionPermission, RunAgentsPermission, WriteToPtyPermission,
+    ActionPermission, AskUserQuestionPermission, ExecutionProfileId, RunAgentsPermission,
+    WriteToPtyPermission,
 };
 use crate::ai::llms::LLMPreferences;
 use crate::appearance::Appearance;
@@ -24,7 +26,7 @@ use crate::cloud_object::model::generic_string_model::StringModel;
 use crate::settings::AISettings;
 use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{ActionButton, ButtonSize, SecondaryTheme};
-use crate::TemplatableMCPServerManager;
+use crate::{TemplatableMCPServerManager, UserWorkspaces};
 
 #[derive(Debug, Clone)]
 pub enum ExecutionProfileViewAction {
@@ -36,14 +38,16 @@ pub enum ExecutionProfileViewEvent {
 }
 
 pub struct ExecutionProfileView {
-    profile_id: ClientProfileId,
+    profile_id: ExecutionProfileId,
+    self_handle: WeakViewHandle<Self>,
     edit_button: ViewHandle<ActionButton>,
 }
 
 impl ExecutionProfileView {
-    pub fn new(profile_id: ClientProfileId, ctx: &mut ViewContext<Self>) -> Self {
+    pub fn new(profile_id: ExecutionProfileId, ctx: &mut ViewContext<Self>) -> Self {
+        let self_handle = ctx.handle();
         ctx.subscribe_to_model(&AIExecutionProfilesModel::handle(ctx), |me, _, event, ctx| {
-            if matches!(event, AIExecutionProfilesModelEvent::ProfileUpdated(profile_id) if *profile_id == me.profile_id) {
+            if matches!(event, AIExecutionProfilesModelEvent::ProfileUpdated(profile_id) if profile_id == &me.profile_id) {
                 ctx.notify();
             }
         });
@@ -77,6 +81,7 @@ impl ExecutionProfileView {
 
         Self {
             profile_id,
+            self_handle,
             edit_button,
         }
     }
@@ -96,7 +101,8 @@ impl View for ExecutionProfileView {
         let is_any_ai_enabled = AISettings::as_ref(app).is_any_ai_enabled(app);
 
         let permissions = BlocklistAIPermissions::as_ref(app);
-        let profile = permissions.permissions_profile_for_id(app, self.profile_id);
+        let scope = UserWorkspaces::as_ref(app).team_context(&self.self_handle, app);
+        let profile = permissions.permissions_profile_for_id(&self.profile_id, &scope, app);
 
         let llm_preferences = LLMPreferences::as_ref(app);
 
@@ -107,7 +113,7 @@ impl View for ExecutionProfileView {
             .map(|info| info.display_name.clone())
             .unwrap_or_else(|| {
                 llm_preferences
-                    .get_default_base_model()
+                    .get_default_base_model(app)
                     .display_name
                     .clone()
             });
@@ -117,14 +123,24 @@ impl View for ExecutionProfileView {
             .as_ref()
             .and_then(|id| llm_preferences.get_llm_info(id))
             .map(|info| info.display_name.clone())
-            .unwrap_or_else(|| "Auto".to_string());
+            .unwrap_or_else(|| {
+                llm_preferences
+                    .get_default_cli_agent_model(app)
+                    .display_name
+                    .clone()
+            });
 
         let computer_use_model = profile
             .computer_use_model
             .as_ref()
             .and_then(|id| llm_preferences.get_llm_info(id))
             .map(|info| info.display_name.clone())
-            .unwrap_or_else(|| "Auto".to_string());
+            .unwrap_or_else(|| {
+                llm_preferences
+                    .get_default_computer_use_model(app)
+                    .display_name
+                    .clone()
+            });
 
         Container::new(
             Flex::column()
