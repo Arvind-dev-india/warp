@@ -55,6 +55,25 @@ fn task_description(query: Option<&str>) -> String {
     query.chars().take(80).collect()
 }
 
+fn system_prompt(is_child_agent: bool) -> String {
+    let mut prompt = "You are a helpful AI assistant integrated into the Warp terminal. You have \
+                      access to tools that let you run shell commands, read files, edit files, \
+                      search code, and more. Use tools when needed to help the user. \
+                      When providing code changes, use the apply_file_diffs tool. \
+                      When you need to understand existing code, use read_files or grep. \
+                      Be concise but thorough."
+        .to_string();
+    if is_child_agent {
+        prompt.push_str(
+            " You are already a child agent. Multi-level orchestration is unavailable, so you \
+             cannot create another agent. send_message_to_agent only contacts already-registered \
+             agents and never creates one. If asked to spawn a child, state that nested delegation \
+             is unavailable once, complete any remaining work yourself, and finish.",
+        );
+    }
+    prompt
+}
+
 fn oz_harness() -> warp_multi_agent_api::Harness {
     warp_multi_agent_api::Harness {
         variant: Some(warp_multi_agent_api::harness::Variant::Oz(
@@ -1866,14 +1885,13 @@ pub async fn handle(
 
     // If this is a brand new conversation, add the system prompt
     if openai_messages.is_empty() {
+        let is_child_agent = request
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.parent_agent_id.is_empty());
         openai_messages.push(json!({
             "role": "system",
-            "content": "You are a helpful AI assistant integrated into the Warp terminal. You have \
-                        access to tools that let you run shell commands, read files, edit files, \
-                        search code, and more. Use tools when needed to help the user. \
-                        When providing code changes, use the apply_file_diffs tool. \
-                        When you need to understand existing code, use read_files or grep. \
-                        Be concise but thorough."
+            "content": system_prompt(is_child_agent)
         }));
     }
 
@@ -2835,6 +2853,9 @@ mod streaming_tests {
         assert_eq!(task_description(Some("  Investigate the proxy  ")), "Investigate the proxy");
         assert_eq!(task_description(Some("")), "Local agent");
         assert_eq!(task_description(Some(&"x".repeat(100))).len(), 80);
+        let child_prompt = system_prompt(true);
+        assert!(child_prompt.contains("Multi-level orchestration is unavailable"));
+        assert!(child_prompt.contains("never creates one"));
     }
 
     #[test]
