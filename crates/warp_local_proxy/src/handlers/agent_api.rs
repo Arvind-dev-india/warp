@@ -300,6 +300,7 @@ pub async fn send_messages(
         .map(|address| {
             state
                 .resolve_agent_address(address)
+                .map(|run_id| (address.clone(), run_id))
                 .ok_or_else(|| address.clone())
         })
         .collect::<Result<Vec<_>, _>>()
@@ -329,7 +330,8 @@ pub async fn send_messages(
     }
 
     let mut message_ids = Vec::with_capacity(recipients.len());
-    for recipient in recipients {
+    for (address, recipient_run_id) in recipients {
+        state.mark_agent_message_sent(&address);
         let message_id = uuid::Uuid::new_v4().to_string();
         let message = StoredMessage {
             message_id: message_id.clone(),
@@ -339,7 +341,7 @@ pub async fn send_messages(
             sent_at: now_rfc3339(),
             delivered_at: None,
             read_at: None,
-            recipients: vec![recipient.clone()],
+            recipients: vec![recipient_run_id.clone()],
         };
         state
             .agent_api
@@ -348,7 +350,7 @@ pub async fn send_messages(
             .expect("agent messages lock poisoned")
             .insert(message_id.clone(), message);
         state.agent_api.emit(
-            recipient,
+            recipient_run_id,
             "new_message".to_string(),
             Some(message_id.clone()),
             None,
@@ -507,6 +509,40 @@ mod tests {
         assert_eq!(
             body.0["error"]["code"],
             serde_json::Value::String("LOCAL_PROXY_UNKNOWN_AGENT".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn sending_to_a_conversation_alias_notifies_the_stable_run() {
+        let state = app_state();
+        state.register_conversation_task("child-conversation", "child-run");
+
+        let _ = send_messages(
+            State(state.clone()),
+            Json(SendMessagesRequest {
+                to: vec!["child-conversation".into()],
+                subject: "work".into(),
+                body: "do work".into(),
+                sender_run_id: "parent".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let events = state
+            .agent_api
+            .events
+            .read()
+            .expect("agent events lock poisoned");
+        assert_eq!(events.last().unwrap().event_type, "new_message");
+        assert_eq!(events.last().unwrap().run_id, "child-run");
+        drop(events);
+        assert!(
+            state
+                .conversation_cache_target("child-conversation")
+                .unwrap()
+                .1
+                > 0
         );
     }
 }

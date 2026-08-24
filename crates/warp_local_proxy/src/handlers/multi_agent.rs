@@ -55,7 +55,21 @@ fn task_description(query: Option<&str>) -> String {
     query.chars().take(80).collect()
 }
 
-fn system_prompt(is_child_agent: bool) -> String {
+fn stream_identity(
+    request: &warp_multi_agent_api::Request,
+    task_id: &str,
+) -> (String, String) {
+    let conversation_id = request
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.conversation_id.as_str())
+        .filter(|conversation_id| !conversation_id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    (conversation_id, task_id.to_string())
+}
+
+fn system_prompt(parent_agent_id: Option<&str>) -> String {
     let mut prompt = "You are a helpful AI assistant integrated into the Warp terminal. You have \
                       access to tools that let you run shell commands, read files, edit files, \
                       search code, and more. Use tools when needed to help the user. \
@@ -63,13 +77,16 @@ fn system_prompt(is_child_agent: bool) -> String {
                       When you need to understand existing code, use read_files or grep. \
                       Be concise but thorough."
         .to_string();
-    if is_child_agent {
-        prompt.push_str(
-            " You are already a child agent. Multi-level orchestration is unavailable, so you \
-             cannot create another agent. send_message_to_agent only contacts already-registered \
-             agents and never creates one. If asked to spawn a child, state that nested delegation \
-             is unavailable once, complete any remaining work yourself, and finish.",
-        );
+    if let Some(parent_agent_id) = parent_agent_id {
+        prompt.push_str(&format!(
+            " You are already a child agent. Your parent agent address is '{parent_agent_id}'. \
+             Multi-level orchestration is unavailable, so you cannot create another agent. \
+             send_message_to_agent only contacts already-registered agents and never creates one. \
+             For ongoing coordination, send replies to the parent address above and then use \
+             wait_for_events; replies arrive as agent messages, not through fetch_conversation. \
+             If asked to spawn a child, state that nested delegation is unavailable once, complete \
+             any remaining work yourself, and finish."
+        ));
     }
     prompt
 }
@@ -638,6 +655,24 @@ fn openai_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
+                "name": "wait_for_events",
+                "description": "Wait for replies or lifecycle events from already-running agents after sending them a message.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "idle_timeout_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 300,
+                            "description": "Maximum idle time to wait for new agent events"
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "fetch_conversation",
                 "description": "Fetch conversation data.",
                 "parameters": {
@@ -724,6 +759,7 @@ fn tool_type_for_openai_name(name: &str) -> Option<warp_multi_agent_api::ToolTyp
         "use_computer" => ToolType::UseComputer,
         "request_computer_use" => ToolType::RequestComputerUse,
         "send_message_to_agent" => ToolType::SendMessageToAgent,
+        "wait_for_events" => ToolType::WaitForEvents,
         "fetch_conversation" => ToolType::FetchConversation,
         "upload_file_artifact" => ToolType::UploadFileArtifact,
         "run_agents" => ToolType::RunAgents,
@@ -828,12 +864,47 @@ fn extract_tool_results(request: &warp_multi_agent_api::Request) -> Vec<(String,
                     let text = request_tool_call_result_to_text(tcr);
                     results.push((tcr.tool_call_id.clone(), text));
                 }
-
             }
         }
     }
 
     results
+}
+
+fn extract_received_agent_messages(request: &warp_multi_agent_api::Request) -> Vec<String> {
+    use warp_multi_agent_api::request::input::user_inputs::user_input::Input;
+
+    let Some(warp_multi_agent_api::request::input::Type::UserInputs(user_inputs)) =
+        request.input.as_ref().and_then(|input| input.r#type.as_ref())
+    else {
+        return Vec::new();
+    };
+
+    user_inputs
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let Input::MessagesReceivedFromAgents(received) = input.input.as_ref()? else {
+                return None;
+            };
+            Some(
+                received
+                    .messages
+                    .iter()
+                    .map(|message| {
+                        format!(
+                            "[Agent message {} from {}]\nSubject: {}\n{}",
+                            message.message_id,
+                            message.sender_agent_id,
+                            message.subject,
+                            message.message_body
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect()
 }
 
 fn register_launched_agents(request: &warp_multi_agent_api::Request, state: &AppState) {
@@ -1139,12 +1210,16 @@ fn json_to_prost_struct(value: &serde_json::Value) -> Option<prost_types::Struct
     }
 }
 
-fn wait_for_conversation_command(path: &std::path::Path) -> String {
+fn wait_for_conversation_command(path: &std::path::Path, required_version: u64) -> String {
     if cfg!(windows) {
         let path = path.to_string_lossy().replace('\'', "''");
         format!(
-            "$path = '{path}'; $deadline = (Get-Date).AddSeconds(120); \
-             while (-not (Test-Path -LiteralPath $path)) {{ \
+            "$path = '{path}'; $versionPath = \"$path.version\"; \
+             $deadline = (Get-Date).AddSeconds(120); while ($true) {{ \
+             $ready = $false; if ((Test-Path -LiteralPath $path) -and \
+             (Test-Path -LiteralPath $versionPath)) {{ try {{ \
+             $ready = ([uint64](Get-Content -Raw -LiteralPath $versionPath)) -ge {required_version} \
+             }} catch {{ $ready = $false }} }}; if ($ready) {{ break }}; \
              if ((Get-Date) -ge $deadline) {{ throw 'Timed out waiting for child conversation' }}; \
              Start-Sleep -Milliseconds 250 }}; Get-Content -Raw -LiteralPath $path"
         )
@@ -1152,8 +1227,9 @@ fn wait_for_conversation_command(path: &std::path::Path) -> String {
         let path = path.to_string_lossy();
         let path = path.replace('\'', "'\"'\"'");
         format!(
-            "path='{path}'; deadline=$((SECONDS + 120)); \
-             while [ ! -f \"$path\" ]; do \
+            "path='{path}'; version_path=\"$path.version\"; deadline=$((SECONDS + 120)); \
+             while true; do version=-1; [ -f \"$version_path\" ] && version=$(cat \"$version_path\" 2>/dev/null || echo -1); \
+             [ -f \"$path\" ] && [ \"$version\" -ge {required_version} ] && break; \
              [ \"$SECONDS\" -ge \"$deadline\" ] && {{ echo 'Timed out waiting for child conversation' >&2; exit 1; }}; \
              sleep 0.25; done; cat \"$path\""
         )
@@ -1681,12 +1757,22 @@ fn openai_tool_call_to_proto(
             subject: args["subject"].as_str().unwrap_or("").into(),
             message: args["message"].as_str().unwrap_or("").into(),
         }),
+        "wait_for_events" => Tool::WaitForEvents(
+            warp_multi_agent_api::message::tool_call::WaitForEvents {
+                idle_timeout_seconds: args["idle_timeout_seconds"]
+                    .as_i64()
+                    .unwrap_or(30)
+                    .clamp(1, 300) as i32,
+            },
+        ),
         "fetch_conversation" => {
             let conversation_id = args["conversation_id"].as_str().unwrap_or("");
-            if let Some(path) = state.conversation_cache_path(conversation_id) {
+            if let Some((path, required_version)) =
+                state.conversation_cache_target(conversation_id)
+            {
                 Tool::RunShellCommand(
                     warp_multi_agent_api::message::tool_call::RunShellCommand {
-                        command: wait_for_conversation_command(&path),
+                        command: wait_for_conversation_command(&path, required_version),
                         #[allow(deprecated)]
                         is_read_only: true,
                         ..Default::default()
@@ -1817,6 +1903,7 @@ pub async fn handle(
     let user_query = extract_user_query(&request);
     register_launched_agents(&request, &state);
     let tool_results = extract_tool_results(&request);
+    let received_agent_messages = extract_received_agent_messages(&request);
 
     // Debug: log the input type to diagnose tool result delivery
     if let Some(input) = request.input.as_ref() {
@@ -1856,6 +1943,7 @@ pub async fn handle(
     tracing::info!(
         query = user_query.as_deref().unwrap_or("(none)"),
         tool_results = tool_results.len(),
+        received_agent_messages = received_agent_messages.len(),
         is_continuation,
         existing_task = existing_task_id.as_deref().unwrap_or("(none)"),
         model = %selected_model,
@@ -1863,15 +1951,17 @@ pub async fn handle(
         "multi-agent request"
     );
 
-    // Reuse existing IDs when continuing a conversation, generate new ones otherwise
-    let conversation_id = uuid::Uuid::new_v4().to_string();
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let run_id = uuid::Uuid::new_v4().to_string();
+    // Task/run identity is stable across every turn. Agent messaging and event
+    // streams address runs, so changing this per request silently disconnects
+    // parent and child streams.
     let task_id = existing_task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let (conversation_id, run_id) = stream_identity(&request, &task_id);
+    let request_id = uuid::Uuid::new_v4().to_string();
     state.register_conversation_task(&conversation_id, &task_id);
     if let Some(metadata) = request.metadata.as_ref() {
         state.register_conversation_task(&metadata.conversation_id, &task_id);
         state.register_agent_task(&metadata.agent_name, &task_id);
+        state.register_agent_address(&metadata.parent_agent_id);
     }
 
     // ── Server-side conversation cache ──
@@ -1885,13 +1975,14 @@ pub async fn handle(
 
     // If this is a brand new conversation, add the system prompt
     if openai_messages.is_empty() {
-        let is_child_agent = request
+        let parent_agent_id = request
             .metadata
             .as_ref()
-            .is_some_and(|metadata| !metadata.parent_agent_id.is_empty());
+            .map(|metadata| metadata.parent_agent_id.as_str())
+            .filter(|parent_agent_id| !parent_agent_id.is_empty());
         openai_messages.push(json!({
             "role": "system",
-            "content": system_prompt(is_child_agent)
+            "content": system_prompt(parent_agent_id)
         }));
     }
 
@@ -1985,9 +2076,19 @@ pub async fn handle(
             "content": result_text
         }));
     }
+    for message in &received_agent_messages {
+        openai_messages.push(json!({
+            "role": "user",
+            "content": message
+        }));
+    }
 
     // Handle other input types as user messages
-    if user_query.is_none() && tool_results.is_empty() && !is_summarize_request(&request) {
+    if user_query.is_none()
+        && tool_results.is_empty()
+        && received_agent_messages.is_empty()
+        && !is_summarize_request(&request)
+    {
         if let Some(input) = request.input.as_ref().and_then(|i| i.r#type.as_ref()) {
             let extra_input = match input {
                 warp_multi_agent_api::request::input::Type::ResumeConversation(_) => {
@@ -2853,9 +2954,24 @@ mod streaming_tests {
         assert_eq!(task_description(Some("  Investigate the proxy  ")), "Investigate the proxy");
         assert_eq!(task_description(Some("")), "Local agent");
         assert_eq!(task_description(Some(&"x".repeat(100))).len(), 80);
-        let child_prompt = system_prompt(true);
+        let child_prompt = system_prompt(Some("parent-run-id"));
         assert!(child_prompt.contains("Multi-level orchestration is unavailable"));
         assert!(child_prompt.contains("never creates one"));
+        assert!(child_prompt.contains("parent-run-id"));
+    }
+
+    #[test]
+    fn stream_identity_reuses_conversation_and_task_run_ids() {
+        let request = warp_multi_agent_api::Request {
+            metadata: Some(warp_multi_agent_api::request::Metadata {
+                conversation_id: "conversation-1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (conversation_id, run_id) = stream_identity(&request, "task-1");
+        assert_eq!(conversation_id, "conversation-1");
+        assert_eq!(run_id, "task-1");
     }
 
     #[test]
@@ -2923,9 +3039,10 @@ mod streaming_tests {
     #[test]
     fn conversation_wait_command_reads_the_resolved_cache_file() {
         let path = std::path::Path::new("child-conversation.json");
-        let command = wait_for_conversation_command(path);
+        let command = wait_for_conversation_command(path, 7);
         assert!(command.contains("child-conversation.json"));
         assert!(command.contains("120"));
+        assert!(command.contains('7'));
     }
 
     #[test]
@@ -2959,6 +3076,25 @@ mod streaming_tests {
             .filter_map(|tool| tool.pointer("/function/name").and_then(|name| name.as_str()))
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["run_agents"]);
+    }
+
+    #[test]
+    fn wait_for_events_is_advertised_when_supported() {
+        let request = warp_multi_agent_api::Request {
+            settings: Some(warp_multi_agent_api::request::Settings {
+                supported_tools: vec![warp_multi_agent_api::ToolType::WaitForEvents as i32],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let tools = openai_tools_for_request(&request);
+        let names = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(|name| name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["wait_for_events"]);
     }
 
     #[test]
@@ -3019,6 +3155,43 @@ mod streaming_tests {
                 )
             ) if multiple_choice.supports_other
         ));
+    }
+
+    #[test]
+    fn received_agent_messages_are_forwarded_to_model_context() {
+        use warp_multi_agent_api::request;
+        use warp_multi_agent_api::request::input::user_inputs::user_input::Input;
+
+        let request = warp_multi_agent_api::Request {
+            input: Some(request::Input {
+                r#type: Some(request::input::Type::UserInputs(
+                    request::input::UserInputs {
+                        inputs: vec![request::input::user_inputs::UserInput {
+                            input: Some(Input::MessagesReceivedFromAgents(
+                                request::input::user_inputs::MessagesReceivedFromAgents {
+                                    messages: vec![
+                                        request::input::user_inputs::messages_received_from_agents::ReceivedMessage {
+                                            message_id: "message-1".into(),
+                                            sender_agent_id: "child-1".into(),
+                                            addresses: vec!["parent-1".into()],
+                                            subject: "Done".into(),
+                                            message_body: "CHILD_REPLY_OK".into(),
+                                        },
+                                    ],
+                                },
+                            )),
+                        }],
+                    },
+                )),
+                context: None,
+            }),
+            ..Default::default()
+        };
+
+        let messages = extract_received_agent_messages(&request);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("child-1"));
+        assert!(messages[0].contains("CHILD_REPLY_OK"));
     }
 
     #[test]

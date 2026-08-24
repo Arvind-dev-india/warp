@@ -1,6 +1,7 @@
 //! Builds the axum [`Router`] and runs the HTTP server.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use axum::{
@@ -29,6 +30,9 @@ pub struct AppState {
     conversation_tasks: Arc<RwLock<HashMap<String, String>>>,
     agent_tasks: Arc<RwLock<HashMap<String, String>>>,
     launched_agents: Arc<RwLock<HashMap<String, String>>>,
+    known_agent_addresses: Arc<RwLock<HashSet<String>>>,
+    required_conversation_versions: Arc<RwLock<HashMap<String, u64>>>,
+    next_message_version: Arc<AtomicU64>,
     pub agent_api: Arc<handlers::agent_api::AgentApiState>,
     /// Directory for persisted conversation cache (one JSON file per task_id).
     pub conversation_cache_dir: std::path::PathBuf,
@@ -47,6 +51,9 @@ impl AppState {
             conversation_tasks: Arc::new(RwLock::new(HashMap::new())),
             agent_tasks: Arc::new(RwLock::new(HashMap::new())),
             launched_agents: Arc::new(RwLock::new(HashMap::new())),
+            known_agent_addresses: Arc::new(RwLock::new(HashSet::new())),
+            required_conversation_versions: Arc::new(RwLock::new(HashMap::new())),
+            next_message_version: Arc::new(AtomicU64::new(1)),
             agent_api: Arc::new(handlers::agent_api::AgentApiState::new()),
             conversation_cache_dir: {
                 let base = std::env::var("HOME")
@@ -104,6 +111,8 @@ impl AppState {
             .write()
             .expect("conversation task lock poisoned")
             .insert(conversation_id.to_string(), task_id.to_string());
+        self.register_agent_address(conversation_id);
+        self.register_agent_address(task_id);
 
         let task_path = self.conversation_cache_dir.join(format!("{task_id}.json"));
         if let Ok(data) = std::fs::read_to_string(&task_path) {
@@ -113,7 +122,8 @@ impl AppState {
                 let alias_path = self
                     .conversation_cache_dir
                     .join(format!("{conversation_id}.json"));
-                let _ = std::fs::write(alias_path, data);
+                let _ = std::fs::write(&alias_path, data);
+                self.write_alias_version(conversation_id, &alias_path);
             }
         }
     }
@@ -126,6 +136,8 @@ impl AppState {
             .write()
             .expect("agent task lock poisoned")
             .insert(agent_name.to_string(), task_id.to_string());
+        self.register_agent_address(agent_name);
+        self.register_agent_address(task_id);
 
         if let Some(conversation_id) = self
             .launched_agents
@@ -146,6 +158,8 @@ impl AppState {
             .write()
             .expect("launched agents lock poisoned")
             .insert(agent_name.to_string(), conversation_id.to_string());
+        self.register_agent_address(agent_name);
+        self.register_agent_address(conversation_id);
 
         if let Some(task_id) = self
             .agent_tasks
@@ -169,7 +183,14 @@ impl AppState {
             .get(address)
             .cloned()
         {
-            return Some(conversation_id);
+            return Some(
+                self.conversation_tasks
+                    .read()
+                    .expect("conversation task lock poisoned")
+                    .get(&conversation_id)
+                    .cloned()
+                    .unwrap_or(conversation_id),
+            );
         }
         if let Some(task_id) = self
             .agent_tasks
@@ -180,13 +201,17 @@ impl AppState {
         {
             return Some(task_id);
         }
-        let is_known_id = self
+        if let Some(task_id) = self
             .conversation_tasks
             .read()
             .expect("conversation task lock poisoned")
-            .contains_key(address)
-            || self
-                .agent_tasks
+            .get(address)
+            .cloned()
+        {
+            return Some(task_id);
+        }
+        let is_known_id = self
+            .agent_tasks
                 .read()
                 .expect("agent task lock poisoned")
                 .values()
@@ -197,10 +222,41 @@ impl AppState {
                 .expect("launched agents lock poisoned")
                 .values()
                 .any(|conversation_id| conversation_id == address);
-        is_known_id.then(|| address.to_string())
+        let is_registered = self
+            .known_agent_addresses
+            .read()
+            .expect("known agent addresses lock poisoned")
+            .contains(address);
+        (is_known_id || is_registered).then(|| address.to_string())
+    }
+
+    pub fn register_agent_address(&self, address: &str) {
+        if is_safe_cache_key(address) {
+            self.known_agent_addresses
+                .write()
+                .expect("known agent addresses lock poisoned")
+                .insert(address.to_string());
+        }
+    }
+
+    pub fn mark_agent_message_sent(&self, conversation_id: &str) -> u64 {
+        let version = self.next_message_version.fetch_add(1, Ordering::Relaxed);
+        self.required_conversation_versions
+            .write()
+            .expect("conversation versions lock poisoned")
+            .insert(conversation_id.to_string(), version);
+        version
     }
 
     pub fn conversation_cache_path(&self, conversation_id: &str) -> Option<std::path::PathBuf> {
+        self.conversation_cache_target(conversation_id)
+            .map(|(path, _)| path)
+    }
+
+    pub fn conversation_cache_target(
+        &self,
+        conversation_id: &str,
+    ) -> Option<(std::path::PathBuf, u64)> {
         if !is_safe_cache_key(conversation_id) {
             return None;
         }
@@ -216,8 +272,18 @@ impl AppState {
             .values()
             .any(|launched_id| launched_id == conversation_id);
         (has_task || is_launched).then(|| {
-            self.conversation_cache_dir
-                .join(format!("{conversation_id}.json"))
+            let required_version = self
+                .required_conversation_versions
+                .read()
+                .expect("conversation versions lock poisoned")
+                .get(conversation_id)
+                .copied()
+                .unwrap_or_default();
+            (
+                self.conversation_cache_dir
+                    .join(format!("{conversation_id}.json")),
+                required_version,
+            )
         })
     }
 
@@ -257,11 +323,27 @@ impl AppState {
                     let alias_path = self
                         .conversation_cache_dir
                         .join(format!("{conversation_id}.json"));
-                    std::fs::write(alias_path, &data).ok();
+                    std::fs::write(&alias_path, &data).ok();
+                    self.write_alias_version(&conversation_id, &alias_path);
                 }
             }
         }
     }
+
+    fn write_alias_version(&self, conversation_id: &str, alias_path: &std::path::Path) {
+        let version = self
+            .required_conversation_versions
+            .read()
+            .expect("conversation versions lock poisoned")
+            .get(conversation_id)
+            .copied()
+            .unwrap_or_default();
+        std::fs::write(alias_version_path(alias_path), version.to_string()).ok();
+    }
+}
+
+fn alias_version_path(alias_path: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.version", alias_path.to_string_lossy()))
 }
 
 fn conversation_is_terminal(messages: &[serde_json::Value]) -> bool {
@@ -532,6 +614,12 @@ mod tests {
             .expect("launched conversation should resolve to its task cache");
         assert!(path.is_file());
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(alias_version_path(
+            &state
+                .conversation_cache_dir
+                .join(format!("{conversation_id}.json")),
+        ))
+        .unwrap();
         std::fs::remove_file(
             state
                 .conversation_cache_dir
@@ -565,7 +653,29 @@ mod tests {
             state.resolve_agent_address("launched-child").as_deref(),
             Some("known-conversation-id")
         );
+
+        state.register_agent_task("launched-child", "launched-task-id");
+        assert_eq!(
+            state.resolve_agent_address("launched-child").as_deref(),
+            Some("launched-task-id")
+        );
+        assert_eq!(
+            state
+                .resolve_agent_address("known-conversation-id")
+                .as_deref(),
+            Some("launched-task-id")
+        );
         assert!(state.resolve_agent_address("missing-child").is_none());
+    }
+
+    #[test]
+    fn explicit_parent_run_ids_are_valid_message_addresses() {
+        let state = AppState::new(config("configured-chat-model"), vec![]);
+        state.register_agent_address("parent-run-id");
+        assert_eq!(
+            state.resolve_agent_address("parent-run-id").as_deref(),
+            Some("parent-run-id")
+        );
     }
 
     #[test]
@@ -593,6 +703,52 @@ mod tests {
         assert!(alias.exists());
 
         std::fs::remove_file(alias).unwrap();
+        std::fs::remove_file(alias_version_path(
+            &state
+                .conversation_cache_dir
+                .join(format!("{conversation_id}.json")),
+        ))
+        .unwrap();
+        std::fs::remove_file(
+            state
+                .conversation_cache_dir
+                .join(format!("{task_id}.json")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn followup_message_requires_a_new_alias_version() {
+        let state = AppState::new(config("configured-chat-model"), vec![]);
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        state.register_conversation_task(&conversation_id, &task_id);
+        state.save_conversation(
+            &task_id,
+            &[serde_json::json!({"role": "assistant", "content": "first"})],
+        );
+        let (alias, initial_required) = state
+            .conversation_cache_target(&conversation_id)
+            .unwrap();
+        assert_eq!(initial_required, 0);
+        assert_eq!(
+            std::fs::read_to_string(alias_version_path(&alias)).unwrap(),
+            "0"
+        );
+
+        let followup_version = state.mark_agent_message_sent(&conversation_id);
+        assert!(followup_version > initial_required);
+        state.save_conversation(
+            &task_id,
+            &[serde_json::json!({"role": "assistant", "content": "followup"})],
+        );
+        assert_eq!(
+            std::fs::read_to_string(alias_version_path(&alias)).unwrap(),
+            followup_version.to_string()
+        );
+
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::remove_file(alias_version_path(&alias)).unwrap();
         std::fs::remove_file(
             state
                 .conversation_cache_dir
