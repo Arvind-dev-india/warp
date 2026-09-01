@@ -1,14 +1,23 @@
 <#
 .SYNOPSIS
-    warp-local.ps1 — Windows launcher for warp_local_proxy + warp-oss.
+    warp-local.ps1 — Windows launcher for warp_local_proxy + Warp GUI or TUI.
 
 .DESCRIPTION
-    Single-command wrapper that runs warp_local_proxy and warp-oss together.
+    Single-command wrapper that runs warp_local_proxy with warp-oss or warp-tui-oss.
     Equivalent of scripts/warp-local (bash) for Windows / PowerShell.
 
 .EXAMPLE
     # default — start proxy + warp-oss
     .\scripts\warp-local.ps1
+
+    # reuse existing release binaries without invoking Cargo
+    .\scripts\warp-local.ps1 -SkipBuild
+
+    # use faster debug binaries when release behavior is not required
+    .\scripts\warp-local.ps1 -Profile debug
+
+    # build and run the interactive terminal UI
+    .\scripts\warp-local.ps1 -Tui -Profile debug
 
     # point at Azure OpenAI
     .\scripts\warp-local.ps1 -Backend "https://myres.openai.azure.com/openai/deployments/gpt-4o" `
@@ -37,6 +46,8 @@ param(
     [string]$Model         = "",
     [ValidateSet("release","debug")]
     [string]$Profile       = "release",
+    [switch]$Tui,
+    [switch]$SkipBuild,
     [switch]$KeepProxy,
     [switch]$StopProxy,
     [Parameter(ValueFromRemainingArguments)]
@@ -53,6 +64,9 @@ $ProxyLog  = if ($env:WARP_LOCAL_PROXY_LOG)     { $env:WARP_LOCAL_PROXY_LOG }
              else { Join-Path $env:TEMP "warp-local-proxy.log" }
 $ProxyPidFile = if ($env:WARP_LOCAL_PROXY_PIDFILE) { $env:WARP_LOCAL_PROXY_PIDFILE }
                 else { Join-Path $env:TEMP "warp-local-proxy.pid" }
+$ClientBinaryName = if ($Tui) { "warp-tui-oss" } else { "warp-oss" }
+$ClientDescription = if ($Tui) { "interactive TUI" } else { "GUI" }
+$ProxyStartedByLauncher = $false
 
 # ---- config file ------------------------------------------------------------
 # Reads KEY=VALUE lines from ~/.config/warp-local/config.env (same file as Linux).
@@ -136,38 +150,88 @@ function Stop-ProxyProcess {
     }
 }
 
-function Build-Proxy {
+function Get-LocalBinaryPath([string]$Name) {
     $ext = if ($env:OS -eq "Windows_NT") { ".exe" } else { "" }
     $binDir = if ($Profile -eq "release") { "release" } else { "debug" }
-    $proxyBin = Join-Path (Join-Path (Join-Path $RepoRoot "target") $binDir) "warp-local-proxy$ext"
-
-    Write-Host "warp-local: updating warp_local_proxy ($Profile)..."
-    $env:CARGO_FULL_PROFILE = $Profile
-    Push-Location $RepoRoot
-    try {
-        if ($Profile -eq "release") {
-            cargo build --quiet --release -p warp_local_proxy
-        } else {
-            cargo build --quiet -p warp_local_proxy
-        }
-    } finally { Pop-Location }
+return Join-Path (Join-Path (Join-Path $RepoRoot "target") $binDir) "$Name$ext"
 }
 
-function Get-WarpBin {
-    $ext = if ($env:OS -eq "Windows_NT") { ".exe" } else { "" }
-    $bin = Join-Path (Join-Path (Join-Path $RepoRoot "target") $Profile) "warp-oss$ext"
+function Build-LocalBinaries {
+$buildProxy = -not (Test-ProxyAlive)
+$targets = if ($Tui) {
+    @(
+        "-p", "warp_tui",
+        "--bin", "warp-tui-oss",
+        "--features", "warp_tui/standalone"
+    )
+} else {
+    @(
+        "-p", "warp",
+        "--bin", "warp-oss"
+    )
+}
+if ($buildProxy) {
+    $targets = @(
+        "-p", "warp_local_proxy",
+        "--bin", "warp-local-proxy"
+    ) + $targets
+}
 
-    Write-Host "warp-local: updating warp-oss (profile=$Profile)..."
-    $env:CARGO_FULL_PROFILE = $Profile
-    Push-Location $RepoRoot
-    try {
-        if ($Profile -eq "release") {
-            cargo build --release --bin warp-oss
-        } else {
-            cargo build --bin warp-oss
-        }
-    } finally { Pop-Location }
-    return $bin
+$cargoArgs = @("build")
+if ($Profile -eq "release") {
+    $cargoArgs += "--release"
+}
+$cargoArgs += $targets
+$description = if ($buildProxy) {
+    "proxy + $ClientBinaryName"
+} else {
+    $ClientBinaryName
+}
+$warpBin = Get-LocalBinaryPath $ClientBinaryName
+if ($Profile -eq "release" -and -not (Test-Path $warpBin)) {
+    Write-Host "warp-local: first release build; the optimized $ClientDescription build can take a long time." -ForegroundColor Yellow
+    Write-Host "warp-local: compilation progress will be shown below. Later launches can use -SkipBuild." -ForegroundColor Yellow
+}
+Write-Host "warp-local: incremental $Profile build ($description)..."
+$env:CARGO_FULL_PROFILE = $Profile
+Push-Location $RepoRoot
+try {
+    & cargo @cargoArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cargo build failed with exit code $LASTEXITCODE."
+    }
+} finally { Pop-Location }
+}
+
+function Get-ClientBin {
+$bin = Get-LocalBinaryPath $ClientBinaryName
+if (-not (Test-Path $bin)) {
+    $alternative = if ($Profile -eq "release") {
+        "Run without -SkipBuild for the one-time release build, or use -Profile debug."
+    } else {
+        "Run without -SkipBuild once before using -SkipBuild."
+    }
+    throw "$ClientBinaryName binary not found at $bin. $alternative"
+}
+return $bin
+}
+
+function Prepare-TuiResources([string]$TuiBin) {
+$resourcesDir = Join-Path (Split-Path -Parent $TuiBin) "resources"
+$bundledSource = Join-Path (Join-Path $RepoRoot "resources") "bundled"
+$bundledDestination = Join-Path $resourcesDir "bundled"
+$settingsSchema = Join-Path $resourcesDir "settings_schema.json"
+
+New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
+if (Test-Path $bundledDestination) {
+    Remove-Item -LiteralPath $bundledDestination -Recurse -Force
+}
+Copy-Item -LiteralPath $bundledSource -Destination $bundledDestination -Recurse -Force
+
+& $TuiBin dump-settings-schema $settingsSchema
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $settingsSchema)) {
+    throw "Failed to generate TUI settings schema at $settingsSchema."
+}
 }
 
 function Start-Proxy {
@@ -176,11 +240,10 @@ function Start-Proxy {
         return
     }
 
-    Build-Proxy
-
-    $ext = if ($env:OS -eq "Windows_NT") { ".exe" } else { "" }
-    $binDir = if ($Profile -eq "release") { "release" } else { "debug" }
-    $proxyBin = Join-Path (Join-Path (Join-Path $RepoRoot "target") $binDir) "warp-local-proxy$ext"
+    $proxyBin = Get-LocalBinaryPath "warp-local-proxy"
+    if (-not (Test-Path $proxyBin)) {
+        throw "Proxy binary not found at $proxyBin. Run without -SkipBuild first."
+    }
 
     $proxyArgs = @(
         "--bind", $Bind,
@@ -207,6 +270,7 @@ function Start-Proxy {
                           -PassThru
 
     $proc.Id | Set-Content $ProxyPidFile
+    $script:ProxyStartedByLauncher = $true
 
     # Wait for healthz
     $healthy = $false
@@ -232,11 +296,9 @@ function Start-Proxy {
 # where the user was previously signed in).
 
 function Ensure-LocalUser {
-    # state_dir = data_local_dir from directories::ProjectDirs::from("dev","warp","WarpOss")
-    # On Windows: %LOCALAPPDATA%\warp\WarpOss\data
-    $stateDir = Join-Path (Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA "warp") "WarpOss") "data") ""
-    # data_domain = "dev.warp.WarpOss" (qualifier.organization.application_name)
-    $dataDomain = "dev.warp.WarpOss"
+    $applicationName = if ($Tui) { "WarpTui" } else { "WarpOss" }
+    $stateDir = Join-Path (Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA "warp") $applicationName) "data") ""
+    $dataDomain = if ($Tui) { "dev.warp.WarpTui.tui" } else { "dev.warp.WarpOss" }
     $userFile = Join-Path $stateDir "$dataDomain-User"
 
     if (Test-Path $userFile) { return }
@@ -288,16 +350,30 @@ if ($StopProxy) {
 
 Ensure-LocalUser
 
-Start-Proxy
+if (-not $SkipBuild) {
+    Build-LocalBinaries
+}
 
-$warpBin = Get-WarpBin
+$warpBin = Get-ClientBin
+
+if ($Tui -and (-not $SkipBuild -or -not (Test-Path (Join-Path (Split-Path -Parent $warpBin) "resources\settings_schema.json")))) {
+    Write-Host "warp-local: preparing TUI resources..."
+    Prepare-TuiResources $warpBin
+}
+
+Start-Proxy
 
 try {
     Write-Host "warp-local: launching $warpBin $($WarpArgs -join ' ')"
 
-    # If the user picked a non-default bind address, propagate it.
-    if ($Bind -ne "127.0.0.1:8765") {
+    if ($Tui -or $Bind -ne "127.0.0.1:8765") {
         $env:WARP_SERVER_ROOT_URL = "http://$Bind"
+    }
+    if ($Tui) {
+        $env:WARP_WS_SERVER_URL = "ws://$Bind/graphql/v2"
+        if (-not $env:WARP_API_KEY) {
+            $env:WARP_API_KEY = "local-mode-token"
+        }
     }
 
     # Suppress noisy INFO logs from warp-oss — only show warnings and errors.
@@ -311,9 +387,9 @@ try {
 
     $env:RUST_LOG = $prevRustLog
 } finally {
-    if (-not $KeepProxy) {
+    if (-not $KeepProxy -and $ProxyStartedByLauncher) {
         Stop-ProxyProcess
-    } else {
+    } elseif ($KeepProxy) {
         Write-Host "warp-local: leaving proxy running (use -StopProxy to stop it later)"
     }
 }

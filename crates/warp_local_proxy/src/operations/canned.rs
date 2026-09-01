@@ -8,7 +8,7 @@
 //! Every inline-fragment-discriminated object includes `__typename` because
 //! cynic's `InlineFragments` enums dispatch on it.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::server::AppState;
 
@@ -436,6 +436,17 @@ pub fn get_conversation_usage() -> Value {
     })
 }
 
+pub fn tui_onboarding_markers() -> Value {
+    json!({
+        "tuiOnboardingMarkers": {
+            "__typename": "TuiOnboardingMarkersOutput",
+            "firstZeroStateShown": true,
+            "firstCreditGateShown": true,
+            "responseContext": response_context()
+        }
+    })
+}
+
 pub fn get_experiments() -> Value {
     json!({ "experiments": [] })
 }
@@ -464,5 +475,14 @@ mod tests {
     #[test]
     fn server_backed_ids_have_the_required_length() {
         assert_eq!(LOCAL_WORKSPACE_UID.len(), 22);
+    }
+
+    #[test]
+    fn tui_onboarding_markers_match_the_current_query_shape() {
+        let response = tui_onboarding_markers();
+        let markers = &response["tuiOnboardingMarkers"];
+        assert_eq!(markers["__typename"], "TuiOnboardingMarkersOutput");
+        assert_eq!(markers["firstZeroStateShown"], true);
+        assert_eq!(markers["firstCreditGateShown"], true);
     }
 }

@@ -14,20 +14,17 @@
 //! 5. Client sends NEW Request with ToolCallResults → goto 2
 //! 6. If LLM returns text → proxy emits AgentOutput → Finished
 
-use std::{
-    collections::{BTreeMap, HashSet},
-    convert::Infallible,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::{BTreeMap, HashSet};
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{
-    body::{Body, Bytes},
-    extract::State,
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
-};
-use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE;
 use prost::Message;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -51,14 +48,15 @@ fn current_timestamp() -> prost_types::Timestamp {
 
 fn task_description(query: Option<&str>) -> String {
     let query = query.unwrap_or("Local agent").trim();
-    let query = if query.is_empty() { "Local agent" } else { query };
+    let query = if query.is_empty() {
+        "Local agent"
+    } else {
+        query
+    };
     query.chars().take(80).collect()
 }
 
-fn stream_identity(
-    request: &warp_multi_agent_api::Request,
-    task_id: &str,
-) -> (String, String) {
+fn stream_identity(request: &warp_multi_agent_api::Request, task_id: &str) -> (String, String) {
     let conversation_id = request
         .metadata
         .as_ref()
@@ -83,7 +81,8 @@ fn system_prompt(parent_agent_id: Option<&str>) -> String {
              Multi-level orchestration is unavailable, so you cannot create another agent. \
              send_message_to_agent only contacts already-registered agents and never creates one. \
              For ongoing coordination, send replies to the parent address above and then use \
-             wait_for_events; replies arrive as agent messages, not through fetch_conversation. \
+             wait_for_events; replies arrive as agent messages. Your final text result is also \
+             delivered automatically to the parent when you have not already messaged it. \
              If asked to spawn a child, state that nested delegation is unavailable once, complete \
              any remaining work yourself, and finish."
         ));
@@ -673,20 +672,6 @@ fn openai_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
-                "name": "fetch_conversation",
-                "description": "Fetch conversation data.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "conversation_id": { "type": "string" }
-                    },
-                    "required": ["conversation_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "upload_file_artifact",
                 "description": "Upload a file as an artifact attached to the conversation.",
                 "parameters": {
@@ -793,7 +778,8 @@ fn openai_tools_for_request(request: &warp_multi_agent_api::Request) -> serde_js
                 .and_then(tool_type_for_openai_name)
                 .is_some_and(|tool_type| {
                     (supported.is_empty() || supported.contains(&tool_type))
-                        && !(is_child_agent && tool_type == warp_multi_agent_api::ToolType::RunAgents)
+                        && !(is_child_agent
+                            && tool_type == warp_multi_agent_api::ToolType::RunAgents)
                 })
         })
         .cloned()
@@ -823,7 +809,7 @@ fn extract_user_query(request: &warp_multi_agent_api::Request) -> Option<String>
                     match input_oneof {
                         Input::UserQuery(q) => return Some(q.query.clone()),
                         Input::CliAgentUserQuery(q) => {
-                            return q.user_query.as_ref().map(|uq| uq.query.clone())
+                            return q.user_query.as_ref().map(|uq| uq.query.clone());
                         }
                         _ => {}
                     }
@@ -843,11 +829,19 @@ fn is_summarize_request(request: &warp_multi_agent_api::Request) -> bool {
         .input
         .as_ref()
         .and_then(|i| i.r#type.as_ref())
-        .map(|t| matches!(t, warp_multi_agent_api::request::input::Type::SummarizeConversation(_)))
+        .map(|t| {
+            matches!(
+                t,
+                warp_multi_agent_api::request::input::Type::SummarizeConversation(_)
+            )
+        })
         .unwrap_or(false)
 }
 
-fn extract_tool_results(request: &warp_multi_agent_api::Request) -> Vec<(String, String)> {
+fn extract_tool_results(
+    request: &warp_multi_agent_api::Request,
+    state: &AppState,
+) -> Vec<(String, String)> {
     let mut results = Vec::new();
     let Some(input) = request.input.as_ref() else {
         return results;
@@ -861,7 +855,7 @@ fn extract_tool_results(request: &warp_multi_agent_api::Request) -> Vec<(String,
             if let Some(ref input_oneof) = ui.input {
                 use warp_multi_agent_api::request::input::user_inputs::user_input::Input;
                 if let Input::ToolCallResult(tcr) = input_oneof {
-                    let text = request_tool_call_result_to_text(tcr);
+                    let text = request_tool_call_result_to_text(tcr, state);
                     results.push((tcr.tool_call_id.clone(), text));
                 }
             }
@@ -874,8 +868,10 @@ fn extract_tool_results(request: &warp_multi_agent_api::Request) -> Vec<(String,
 fn extract_received_agent_messages(request: &warp_multi_agent_api::Request) -> Vec<String> {
     use warp_multi_agent_api::request::input::user_inputs::user_input::Input;
 
-    let Some(warp_multi_agent_api::request::input::Type::UserInputs(user_inputs)) =
-        request.input.as_ref().and_then(|input| input.r#type.as_ref())
+    let Some(warp_multi_agent_api::request::input::Type::UserInputs(user_inputs)) = request
+        .input
+        .as_ref()
+        .and_then(|input| input.r#type.as_ref())
     else {
         return Vec::new();
     };
@@ -910,11 +906,12 @@ fn extract_received_agent_messages(request: &warp_multi_agent_api::Request) -> V
 fn register_launched_agents(request: &warp_multi_agent_api::Request, state: &AppState) {
     use warp_multi_agent_api::request::input::tool_call_result::Result;
     use warp_multi_agent_api::request::input::user_inputs::user_input::Input;
-    use warp_multi_agent_api::run_agents_result::Outcome;
-    use warp_multi_agent_api::run_agents_result::agent_outcome;
+    use warp_multi_agent_api::run_agents_result::{Outcome, agent_outcome};
 
-    let Some(warp_multi_agent_api::request::input::Type::UserInputs(user_inputs)) =
-        request.input.as_ref().and_then(|input| input.r#type.as_ref())
+    let Some(warp_multi_agent_api::request::input::Type::UserInputs(user_inputs)) = request
+        .input
+        .as_ref()
+        .and_then(|input| input.r#type.as_ref())
     else {
         return;
     };
@@ -940,6 +937,7 @@ fn register_launched_agents(request: &warp_multi_agent_api::Request, state: &App
 /// Convert a request-level ToolCallResult to text for the LLM.
 fn request_tool_call_result_to_text(
     tcr: &warp_multi_agent_api::request::input::ToolCallResult,
+    state: &AppState,
 ) -> String {
     let Some(ref result) = tcr.result else {
         return "(no result)".to_string();
@@ -1076,10 +1074,12 @@ fn request_tool_call_result_to_text(
                         .map(|agent| {
                             use warp_multi_agent_api::run_agents_result::agent_outcome::Result;
                             match agent.result.as_ref() {
-                                Some(Result::Launched(child)) => format!(
-                                    "{}: launched with conversation_id={}",
-                                    agent.name, child.agent_id
-                                ),
+                                Some(Result::Launched(child)) => {
+                                    let address = state
+                                        .resolve_agent_address(&child.agent_id)
+                                        .unwrap_or_else(|| child.agent_id.clone());
+                                    format!("{}: launched with agent_address={address}", agent.name)
+                                }
                                 Some(Result::Failed(failure)) => {
                                     format!("{}: failed: {}", agent.name, failure.error)
                                 }
@@ -1089,7 +1089,9 @@ fn request_tool_call_result_to_text(
                         .collect::<Vec<_>>()
                         .join("\n");
                     format!(
-                        "Agents launched. Use the exact conversation_id values below for messaging and fetch_conversation:\n{agents}"
+                        "Agents launched. Use the exact agent_address values below with \
+                         send_message_to_agent. To test agent-to-agent messaging, pass the \
+                         destination agent_address to the sending agent:\n{agents}"
                     )
                 }
                 Some(Outcome::Denied(denied)) => {
@@ -1163,9 +1165,8 @@ fn json_string_array(value: &serde_json::Value) -> Vec<String> {
 fn json_to_write_mode(
     mode: Option<&str>,
 ) -> Option<warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::Mode> {
-    use warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::{
-        mode::Mode, Mode as WriteMode,
-    };
+    use warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::Mode as WriteMode;
+    use warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::mode::Mode;
 
     mode.map(|mode| WriteMode {
         mode: Some(match mode {
@@ -1249,12 +1250,14 @@ fn openai_tool_call_to_proto(
 
     use warp_multi_agent_api::message::tool_call::Tool;
     let tool = match fn_name {
-        "run_shell_command" => Tool::RunShellCommand(warp_multi_agent_api::message::tool_call::RunShellCommand {
-            command: args["command"].as_str().unwrap_or("").into(),
-            #[allow(deprecated)]
-            is_read_only: args["is_read_only"].as_bool().unwrap_or(true),
-            ..Default::default()
-        }),
+        "run_shell_command" => {
+            Tool::RunShellCommand(warp_multi_agent_api::message::tool_call::RunShellCommand {
+                command: args["command"].as_str().unwrap_or("").into(),
+                #[allow(deprecated)]
+                is_read_only: args["is_read_only"].as_bool().unwrap_or(true),
+                ..Default::default()
+            })
+        }
         "write_to_long_running_shell_command" => Tool::WriteToLongRunningShellCommand(
             warp_multi_agent_api::message::tool_call::WriteToLongRunningShellCommand {
                 input: args["input"].as_str().unwrap_or("").as_bytes().to_vec(),
@@ -1275,10 +1278,12 @@ fn openai_tool_call_to_proto(
                     )
                 })
             };
-            Tool::ReadShellCommandOutput(warp_multi_agent_api::message::tool_call::ReadShellCommandOutput {
-                command_id: args["command_id"].as_str().unwrap_or("").into(),
-                delay,
-            })
+            Tool::ReadShellCommandOutput(
+                warp_multi_agent_api::message::tool_call::ReadShellCommandOutput {
+                    command_id: args["command_id"].as_str().unwrap_or("").into(),
+                    delay,
+                },
+            )
         }
         "transfer_shell_command_control_to_user" => Tool::TransferShellCommandControlToUser(
             warp_multi_agent_api::message::tool_call::TransferShellCommandControlToUser {
@@ -1315,7 +1320,9 @@ fn openai_tool_call_to_proto(
                         .collect()
                 })
                 .unwrap_or_default();
-            Tool::ReadDocuments(warp_multi_agent_api::message::tool_call::ReadDocuments { documents })
+            Tool::ReadDocuments(warp_multi_agent_api::message::tool_call::ReadDocuments {
+                documents,
+            })
         }
         "apply_file_diffs" => {
             let diffs = args["diffs"]
@@ -1424,7 +1431,9 @@ fn openai_tool_call_to_proto(
                         .collect()
                 })
                 .unwrap_or_default();
-            Tool::CreateDocuments(warp_multi_agent_api::message::tool_call::CreateDocuments { new_documents })
+            Tool::CreateDocuments(warp_multi_agent_api::message::tool_call::CreateDocuments {
+                new_documents,
+            })
         }
         "grep" => {
             let queries = {
@@ -1463,11 +1472,13 @@ fn openai_tool_call_to_proto(
                 min_depth: args["min_depth"].as_i64().unwrap_or_default() as i32,
             })
         }
-        "search_codebase" => Tool::SearchCodebase(warp_multi_agent_api::message::tool_call::SearchCodebase {
-            query: args["query"].as_str().unwrap_or("").into(),
-            path_filters: json_string_array(&args["path_filters"]),
-            codebase_path: args["codebase_path"].as_str().unwrap_or("").into(),
-        }),
+        "search_codebase" => {
+            Tool::SearchCodebase(warp_multi_agent_api::message::tool_call::SearchCodebase {
+                query: args["query"].as_str().unwrap_or("").into(),
+                path_filters: json_string_array(&args["path_filters"]),
+                codebase_path: args["codebase_path"].as_str().unwrap_or("").into(),
+            })
+        }
         "insert_review_comments" => {
             let comments = args["comments"]
                 .as_array()
@@ -1513,18 +1524,26 @@ fn openai_tool_call_to_proto(
                         .collect()
                 })
                 .unwrap_or_default();
-            Tool::InsertReviewComments(warp_multi_agent_api::message::tool_call::InsertReviewComments {
-                repo_path: args["repo_path"].as_str().unwrap_or("").into(),
-                comments,
-                base_branch: args["base_branch"].as_str().unwrap_or("").into(),
+            Tool::InsertReviewComments(
+                warp_multi_agent_api::message::tool_call::InsertReviewComments {
+                    repo_path: args["repo_path"].as_str().unwrap_or("").into(),
+                    comments,
+                    base_branch: args["base_branch"].as_str().unwrap_or("").into(),
+                },
+            )
+        }
+        "open_code_review" => {
+            Tool::OpenCodeReview(warp_multi_agent_api::message::tool_call::OpenCodeReview {})
+        }
+        "suggest_plan" => {
+            Tool::SuggestPlan(warp_multi_agent_api::message::tool_call::SuggestPlan {
+                summary: args["summary"].as_str().unwrap_or("").into(),
+                proposed_tasks: vec![],
             })
         }
-        "open_code_review" => Tool::OpenCodeReview(warp_multi_agent_api::message::tool_call::OpenCodeReview {}),
-        "suggest_plan" => Tool::SuggestPlan(warp_multi_agent_api::message::tool_call::SuggestPlan {
-            summary: args["summary"].as_str().unwrap_or("").into(),
-            proposed_tasks: vec![],
-        }),
-        "suggest_create_plan" => Tool::SuggestCreatePlan(warp_multi_agent_api::message::tool_call::SuggestCreatePlan {}),
+        "suggest_create_plan" => {
+            Tool::SuggestCreatePlan(warp_multi_agent_api::message::tool_call::SuggestCreatePlan {})
+        }
         "ask_user_question" => {
             let questions = args["questions"]
                 .as_array()
@@ -1627,14 +1646,17 @@ fn openai_tool_call_to_proto(
                 server_id: args["server_id"].as_str().unwrap_or("").into(),
             })
         }
-        "read_mcp_resource" => Tool::ReadMcpResource(warp_multi_agent_api::message::tool_call::ReadMcpResource {
-            uri: args["uri"].as_str().unwrap_or("").into(),
-            server_id: args["server_id"].as_str().unwrap_or("").into(),
-        }),
-        "init_project" => Tool::InitProject(warp_multi_agent_api::message::tool_call::InitProject {}),
+        "read_mcp_resource" => {
+            Tool::ReadMcpResource(warp_multi_agent_api::message::tool_call::ReadMcpResource {
+                uri: args["uri"].as_str().unwrap_or("").into(),
+                server_id: args["server_id"].as_str().unwrap_or("").into(),
+            })
+        }
+        "init_project" => {
+            Tool::InitProject(warp_multi_agent_api::message::tool_call::InitProject {})
+        }
         "use_computer" => {
-            use warp_multi_agent_api::message::tool_call::use_computer::action;
-            use warp_multi_agent_api::message::tool_call::use_computer::Action;
+            use warp_multi_agent_api::message::tool_call::use_computer::{Action, action};
             let actions = args["actions"]
                 .as_array()
                 .map(|arr| {
@@ -1645,9 +1667,9 @@ fn openai_tool_call_to_proto(
                             let y = a["y"].as_i64().unwrap_or(0) as i32;
                             let coords = warp_multi_agent_api::Coordinates { x, y };
                             let t = match action_type {
-                                "mouse_move" => action::Type::MouseMove(action::MouseMove {
-                                    to: Some(coords),
-                                }),
+                                "mouse_move" => {
+                                    action::Type::MouseMove(action::MouseMove { to: Some(coords) })
+                                }
                                 "mouse_down" => action::Type::MouseDown(action::MouseDown {
                                     button: match a["button"].as_str().unwrap_or("left") {
                                         "right" => 1,
@@ -1679,7 +1701,9 @@ fn openai_tool_call_to_proto(
                                 "wait" => action::Type::Wait(action::Wait {
                                     duration: Some(prost_types::Duration {
                                         seconds: a["duration_ms"].as_i64().unwrap_or(1000) / 1000,
-                                        nanos: ((a["duration_ms"].as_i64().unwrap_or(1000) % 1000) * 1_000_000) as i32,
+                                        nanos: ((a["duration_ms"].as_i64().unwrap_or(1000) % 1000)
+                                            * 1_000_000)
+                                            as i32,
                                     }),
                                 }),
                                 _ => return None,
@@ -1721,11 +1745,9 @@ fn openai_tool_call_to_proto(
                     harness: None,
                     execution_mode: None,
                 }],
-                execution_mode: Some(
-                    warp_multi_agent_api::run_agents::ExecutionModeOneOf::Local(
-                        warp_multi_agent_api::run_agents::Local {},
-                    ),
-                ),
+                execution_mode: Some(warp_multi_agent_api::run_agents::ExecutionModeOneOf::Local(
+                    warp_multi_agent_api::run_agents::Local {},
+                )),
                 harness: Some(oz_harness()),
                 ..Default::default()
             })
@@ -1743,41 +1765,38 @@ fn openai_tool_call_to_proto(
                     harness: None,
                     execution_mode: None,
                 }],
-                execution_mode: Some(
-                    warp_multi_agent_api::run_agents::ExecutionModeOneOf::Local(
-                        warp_multi_agent_api::run_agents::Local {},
-                    ),
-                ),
+                execution_mode: Some(warp_multi_agent_api::run_agents::ExecutionModeOneOf::Local(
+                    warp_multi_agent_api::run_agents::Local {},
+                )),
                 harness: Some(oz_harness()),
                 ..Default::default()
             })
         }
-        "send_message_to_agent" => Tool::SendMessageToAgent(warp_multi_agent_api::SendMessageToAgent {
-            addresses: json_string_array(&args["addresses"]),
-            subject: args["subject"].as_str().unwrap_or("").into(),
-            message: args["message"].as_str().unwrap_or("").into(),
-        }),
-        "wait_for_events" => Tool::WaitForEvents(
-            warp_multi_agent_api::message::tool_call::WaitForEvents {
+        "send_message_to_agent" => {
+            Tool::SendMessageToAgent(warp_multi_agent_api::SendMessageToAgent {
+                addresses: json_string_array(&args["addresses"]),
+                subject: args["subject"].as_str().unwrap_or("").into(),
+                message: args["message"].as_str().unwrap_or("").into(),
+            })
+        }
+        "wait_for_events" => {
+            Tool::WaitForEvents(warp_multi_agent_api::message::tool_call::WaitForEvents {
                 idle_timeout_seconds: args["idle_timeout_seconds"]
                     .as_i64()
                     .unwrap_or(30)
                     .clamp(1, 300) as i32,
-            },
-        ),
+            })
+        }
         "fetch_conversation" => {
             let conversation_id = args["conversation_id"].as_str().unwrap_or("");
-            if let Some((path, required_version)) =
-                state.conversation_cache_target(conversation_id)
+            if let Some((path, required_version)) = state.conversation_cache_target(conversation_id)
             {
-                Tool::RunShellCommand(
-                    warp_multi_agent_api::message::tool_call::RunShellCommand {
-                        command: wait_for_conversation_command(&path, required_version),
-                        #[allow(deprecated)]
-                        is_read_only: true,
-                        ..Default::default()
-                    },
-                )
+                Tool::RunShellCommand(warp_multi_agent_api::message::tool_call::RunShellCommand {
+                    command: wait_for_conversation_command(&path, required_version),
+                    #[allow(deprecated)]
+                    is_read_only: true,
+                    ..Default::default()
+                })
             } else {
                 Tool::FetchConversation(
                     warp_multi_agent_api::message::tool_call::FetchConversation {
@@ -1786,12 +1805,14 @@ fn openai_tool_call_to_proto(
                 )
             }
         }
-        "upload_file_artifact" => Tool::UploadFileArtifact(warp_multi_agent_api::UploadFileArtifact {
-            file: Some(warp_multi_agent_api::FilePathReference {
-                file_path: args["file_path"].as_str().unwrap_or("").into(),
-            }),
-            description: args["description"].as_str().unwrap_or("").into(),
-        }),
+        "upload_file_artifact" => {
+            Tool::UploadFileArtifact(warp_multi_agent_api::UploadFileArtifact {
+                file: Some(warp_multi_agent_api::FilePathReference {
+                    file_path: args["file_path"].as_str().unwrap_or("").into(),
+                }),
+                description: args["description"].as_str().unwrap_or("").into(),
+            })
+        }
         "run_agents" => {
             let agent_run_configs = args["agents"]
                 .as_array()
@@ -1818,11 +1839,9 @@ fn openai_tool_call_to_proto(
                 summary: args["summary"].as_str().unwrap_or("").into(),
                 base_prompt: args["base_prompt"].as_str().unwrap_or("").into(),
                 agent_run_configs,
-                execution_mode: Some(
-                    warp_multi_agent_api::run_agents::ExecutionModeOneOf::Local(
-                        warp_multi_agent_api::run_agents::Local {},
-                    ),
-                ),
+                execution_mode: Some(warp_multi_agent_api::run_agents::ExecutionModeOneOf::Local(
+                    warp_multi_agent_api::run_agents::Local {},
+                )),
                 harness: Some(oz_harness()),
                 ..Default::default()
             })
@@ -1884,10 +1903,95 @@ fn resolve_backend(
     Ok((fallback.clone(), selected_model.to_string()))
 }
 
-pub async fn handle(
-    State(state): State<Arc<AppState>>,
-    body: Bytes,
-) -> impl IntoResponse {
+fn terminal_result_without_explicit_parent_message<'a>(
+    messages: &'a [serde_json::Value],
+    parent_agent_id: &str,
+) -> Option<&'a str> {
+    let last = messages.last()?;
+    if last.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let content = last
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .filter(|content| !content.trim().is_empty())?;
+    let current_turn_start = messages
+        .iter()
+        .rposition(|message| {
+            message.get("role").and_then(serde_json::Value::as_str) == Some("user")
+        })
+        .unwrap_or_default();
+    let explicitly_messaged_parent = messages[current_turn_start + 1..].iter().any(|message| {
+        message
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tool_calls| {
+                tool_calls.iter().any(|tool_call| {
+                    if tool_call
+                        .pointer("/function/name")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("send_message_to_agent")
+                    {
+                        return false;
+                    }
+                    tool_call
+                        .pointer("/function/arguments")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|arguments| {
+                            serde_json::from_str::<serde_json::Value>(arguments).ok()
+                        })
+                        .and_then(|arguments| {
+                            arguments
+                                .get("addresses")
+                                .and_then(serde_json::Value::as_array)
+                                .cloned()
+                        })
+                        .is_some_and(|addresses| {
+                            addresses
+                                .iter()
+                                .any(|address| address.as_str() == Some(parent_agent_id))
+                        })
+                })
+            })
+    });
+    (!explicitly_messaged_parent).then_some(content)
+}
+
+fn forward_terminal_child_result(
+    state: &AppState,
+    parent_agent_id: Option<&str>,
+    agent_name: Option<&str>,
+    task_id: &str,
+    messages: &[serde_json::Value],
+) {
+    let Some(parent_agent_id) = parent_agent_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let Some(result) = terminal_result_without_explicit_parent_message(messages, parent_agent_id)
+    else {
+        return;
+    };
+    let agent_name = agent_name
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Child agent");
+    if state
+        .send_agent_message(
+            parent_agent_id,
+            task_id,
+            &format!("{agent_name} result"),
+            result,
+        )
+        .is_none()
+    {
+        tracing::warn!(
+            parent_agent_id,
+            task_id,
+            "could not forward terminal child result"
+        );
+    }
+}
+
+pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
     let request = match warp_multi_agent_api::Request::decode(body.as_ref()) {
         Ok(r) => r,
         Err(e) => {
@@ -1902,7 +2006,7 @@ pub async fn handle(
 
     let user_query = extract_user_query(&request);
     register_launched_agents(&request, &state);
-    let tool_results = extract_tool_results(&request);
+    let tool_results = extract_tool_results(&request, &state);
     let received_agent_messages = extract_received_agent_messages(&request);
 
     // Debug: log the input type to diagnose tool result delivery
@@ -1957,6 +2061,16 @@ pub async fn handle(
     let task_id = existing_task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let (conversation_id, run_id) = stream_identity(&request, &task_id);
     let request_id = uuid::Uuid::new_v4().to_string();
+    let parent_agent_id = request
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.parent_agent_id.clone())
+        .filter(|id| !id.is_empty());
+    let agent_name = request
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.agent_name.clone())
+        .filter(|name| !name.is_empty());
     state.register_conversation_task(&conversation_id, &task_id);
     if let Some(metadata) = request.metadata.as_ref() {
         state.register_conversation_task(&metadata.conversation_id, &task_id);
@@ -2003,7 +2117,8 @@ pub async fn handle(
                 .join("\n")
             }
         ]);
-        let summary_messages: Vec<serde_json::Value> = serde_json::from_value(summary_prompt).unwrap_or_default();
+        let summary_messages: Vec<serde_json::Value> =
+            serde_json::from_value(summary_prompt).unwrap_or_default();
         let summary_result = call_backend_with_tools(
             &state,
             &backend_config,
@@ -2013,7 +2128,11 @@ pub async fn handle(
             &available_tools,
         )
         .await;
-        if let Ok(LlmResult { response: LlmResponse::Text(ref summary), .. }) = summary_result {
+        if let Ok(LlmResult {
+            response: LlmResponse::Text(ref summary),
+            ..
+        }) = summary_result
+        {
             // Replace conversation with system + summary
             openai_messages = vec![
                 openai_messages[0].clone(), // keep system prompt
@@ -2032,7 +2151,12 @@ pub async fn handle(
                     },
                 )),
             }));
-            emit_agent_output(&mut sse_body, &task_id, &request_id, &format!("Conversation compacted. Summary:\n{summary}"));
+            emit_agent_output(
+                &mut sse_body,
+                &task_id,
+                &request_id,
+                &format!("Conversation compacted. Summary:\n{summary}"),
+            );
             sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
                 r#type: Some(warp_multi_agent_api::response_event::Type::Finished(
                     warp_multi_agent_api::response_event::StreamFinished {
@@ -2096,7 +2220,8 @@ pub async fn handle(
                 }
                 warp_multi_agent_api::request::input::Type::CodeReview(cr) => {
                     // Extract diff hunks from the CodeReview input
-                    let mut review_text = String::from("Please review the following code changes:\n\n");
+                    let mut review_text =
+                        String::from("Please review the following code changes:\n\n");
                     if let Some(warp_multi_agent_api::request::input::code_review::Operation::InitialReviewComments(irc)) = &cr.operation {
                         if let Some(diff_set) = &irc.diff_set {
                             for hunk in &diff_set.hunks {
@@ -2137,13 +2262,18 @@ pub async fn handle(
     }
 
     // Auto-summarize if context is getting large (>75% of estimated window)
-    let estimated_tokens: usize = openai_messages.iter()
+    let estimated_tokens: usize = openai_messages
+        .iter()
         .map(|m| m.to_string().len() / 4) // rough estimate: 4 chars per token
         .sum();
     const AUTO_SUMMARIZE_THRESHOLD: usize = 96_000; // 75% of 128k
     if estimated_tokens > AUTO_SUMMARIZE_THRESHOLD {
-        tracing::info!(estimated_tokens, "auto-summarizing conversation (>75% context)");
-        let summary_text = openai_messages.iter()
+        tracing::info!(
+            estimated_tokens,
+            "auto-summarizing conversation (>75% context)"
+        );
+        let summary_text = openai_messages
+            .iter()
             .filter(|m| m["role"] != "system")
             .map(|m| {
                 let role = m["role"].as_str().unwrap_or("?");
@@ -2156,16 +2286,18 @@ pub async fn handle(
             json!({ "role": "system", "content": "Summarize this conversation concisely. Keep key facts, file paths, decisions, and tool results." }),
             json!({ "role": "user", "content": summary_text }),
         ];
-        if let Ok(LlmResult { response: LlmResponse::Text(ref summary), .. }) =
-            call_backend_with_tools(
-                &state,
-                &backend_config,
-                &summary_msgs,
-                false,
-                &backend_model,
-                &available_tools,
-            )
-            .await
+        if let Ok(LlmResult {
+            response: LlmResponse::Text(ref summary),
+            ..
+        }) = call_backend_with_tools(
+            &state,
+            &backend_config,
+            &summary_msgs,
+            false,
+            &backend_model,
+            &available_tools,
+        )
+        .await
         {
             openai_messages = vec![
                 openai_messages[0].clone(),
@@ -2185,7 +2317,8 @@ pub async fn handle(
         let mut i = 0;
         while i < patched.len() {
             if let Some(tcs) = patched[i].get("tool_calls").and_then(|v| v.as_array()) {
-                let needed: std::collections::HashSet<String> = tcs.iter()
+                let needed: std::collections::HashSet<String> = tcs
+                    .iter()
                     .filter_map(|t| t["id"].as_str().map(String::from))
                     .collect();
                 let mut found = std::collections::HashSet::new();
@@ -2198,11 +2331,14 @@ pub async fn handle(
                 }
                 let missing: Vec<String> = needed.difference(&found).cloned().collect();
                 for (offset, id) in missing.iter().enumerate() {
-                    patched.insert(j + offset, json!({
+                    patched.insert(
+                        j + offset,
+                        json!({
                         "role": "tool",
                         "tool_call_id": id,
                         "content": "(cancelled by user)"
-                    }));
+                        }),
+                    );
                 }
             }
             i += 1;
@@ -2319,6 +2455,8 @@ pub async fn handle(
             let state = state.clone();
             let task_id = task_id.clone();
             let request_id = request_id.clone();
+            let parent_agent_id = parent_agent_id.clone();
+            let agent_name = agent_name.clone();
             tokio::spawn(async move {
                 let mut text_rx = text_rx;
                 let mut openai_messages = openai_messages;
@@ -2360,6 +2498,13 @@ pub async fn handle(
 
                 openai_messages.push(json!({ "role": "assistant", "content": accumulated }));
                 state.save_conversation(&task_id, &openai_messages);
+                forward_terminal_child_result(
+                    &state,
+                    parent_agent_id.as_deref(),
+                    agent_name.as_deref(),
+                    &task_id,
+                    &openai_messages,
+                );
 
                 if !client_closed {
                     let context_usage = estimate_context_usage_from_messages(&openai_messages);
@@ -2551,12 +2696,11 @@ fn finished_event(context_usage: f32) -> warp_multi_agent_api::ResponseEvent {
 
 fn emit_agent_output(sse_body: &mut String, task_id: &str, request_id: &str, text: &str) {
     let msg_id = uuid::Uuid::new_v4().to_string();
-    sse_body.push_str(&sse_line(&agent_output_placeholder_event(task_id, request_id, &msg_id)));
+    sse_body.push_str(&sse_line(&agent_output_placeholder_event(
+        task_id, request_id, &msg_id,
+    )));
     sse_body.push_str(&sse_line(&agent_output_append_event(
-        task_id,
-        request_id,
-        &msg_id,
-        text,
+        task_id, request_id, &msg_id, text,
     )));
 }
 
@@ -2635,7 +2779,10 @@ enum BackendStreamDecision {
 }
 
 fn estimate_context_usage_from_messages(messages: &[serde_json::Value]) -> f32 {
-    let estimated_tokens: usize = messages.iter().map(|message| message.to_string().len() / 4).sum();
+    let estimated_tokens: usize = messages
+        .iter()
+        .map(|message| message.to_string().len() / 4)
+        .sum();
     (estimated_tokens as f32 / 128_000.0).min(1.0)
 }
 
@@ -2681,7 +2828,10 @@ async fn handle_backend_stream_line(
     }
 
     let chunk: serde_json::Value = serde_json::from_str(data)?;
-    let Some(choice) = chunk["choices"].as_array().and_then(|choices| choices.first()) else {
+    let Some(choice) = chunk["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+    else {
         return Ok(true);
     };
     let delta = &choice["delta"];
@@ -2699,7 +2849,9 @@ async fn handle_backend_stream_line(
         if !reasoning.is_empty() && !*saw_tool_calls {
             if !*in_reasoning {
                 *in_reasoning = true;
-                let _ = text_tx.send("<details><summary>💭 Thinking...</summary>\n\n".to_string()).await;
+                let _ = text_tx
+                    .send("<details><summary>💭 Thinking...</summary>\n\n".to_string())
+                    .await;
             }
             if text_tx.send(reasoning.to_string()).await.is_err() {
                 return Ok(false);
@@ -2745,7 +2897,11 @@ async fn call_backend_streaming(
 
     // Newer models (gpt-5.x, o-series) require max_completion_tokens;
     // older models (gpt-4o, DeepSeek, etc.) use max_tokens.
-    let max_tokens_key = if model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+    let max_tokens_key = if model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+    {
         "max_completion_tokens"
     } else {
         "max_tokens"
@@ -2852,11 +3008,14 @@ async fn call_backend_streaming(
 
     match decision_rx.await {
         Ok(Ok(BackendStreamDecision::Text)) => Ok(StreamingLlmResult::TextStream(text_rx)),
-        Ok(Ok(BackendStreamDecision::ToolCalls(tool_calls))) => {
-            Ok(StreamingLlmResult::ToolCalls(tool_calls, estimated_context_usage))
-        }
+        Ok(Ok(BackendStreamDecision::ToolCalls(tool_calls))) => Ok(StreamingLlmResult::ToolCalls(
+            tool_calls,
+            estimated_context_usage,
+        )),
         Ok(Err(err)) => Err(err),
-        Err(_) => Err(anyhow::anyhow!("backend stream ended before mode was determined")),
+        Err(_) => Err(anyhow::anyhow!(
+            "backend stream ended before mode was determined"
+        )),
     }
 }
 
@@ -2870,7 +3029,11 @@ async fn call_backend_with_tools(
 ) -> Result<LlmResult, anyhow::Error> {
     let url = config.chat_completions_url_for_model(model);
 
-    let max_tokens_key = if model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+    let max_tokens_key = if model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+    {
         "max_completion_tokens"
     } else {
         "max_tokens"
@@ -2907,15 +3070,23 @@ async fn call_backend_with_tools(
     let message = &choice["message"];
 
     // Estimate context window usage from token counts
-    let prompt_tokens = response_json["usage"]["prompt_tokens"].as_f64().unwrap_or(0.0);
-    let total_tokens = response_json["usage"]["total_tokens"].as_f64().unwrap_or(0.0);
+    let prompt_tokens = response_json["usage"]["prompt_tokens"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let total_tokens = response_json["usage"]["total_tokens"]
+        .as_f64()
+        .unwrap_or(0.0);
     // Common context windows: 128k for most models, use total_tokens/128000 as estimate
     let context_limit = 128_000.0_f64;
     let context_usage = (total_tokens / context_limit).min(1.0) as f32;
 
     if let Some(tool_calls) = message["tool_calls"].as_array() {
         if !tool_calls.is_empty() {
-            tracing::info!(count = tool_calls.len(), prompt_tokens, "LLM requested tool calls");
+            tracing::info!(
+                count = tool_calls.len(),
+                prompt_tokens,
+                "LLM requested tool calls"
+            );
             return Ok(LlmResult {
                 response: LlmResponse::ToolCalls(()),
                 _context_usage: context_usage,
@@ -2951,13 +3122,17 @@ mod streaming_tests {
     #[test]
     fn generated_messages_use_current_timestamps_and_prompt_titles() {
         assert!(current_timestamp().seconds > 1_700_000_000);
-        assert_eq!(task_description(Some("  Investigate the proxy  ")), "Investigate the proxy");
+        assert_eq!(
+            task_description(Some("  Investigate the proxy  ")),
+            "Investigate the proxy"
+        );
         assert_eq!(task_description(Some("")), "Local agent");
         assert_eq!(task_description(Some(&"x".repeat(100))).len(), 80);
         let child_prompt = system_prompt(Some("parent-run-id"));
         assert!(child_prompt.contains("Multi-level orchestration is unavailable"));
         assert!(child_prompt.contains("never creates one"));
         assert!(child_prompt.contains("parent-run-id"));
+        assert!(child_prompt.contains("delivered automatically"));
     }
 
     #[test]
@@ -2975,13 +3150,15 @@ mod streaming_tests {
     }
 
     #[test]
-    fn run_agents_result_preserves_child_conversation_id() {
+    fn run_agents_result_exposes_stable_child_address() {
         use warp_multi_agent_api::request;
-        use warp_multi_agent_api::run_agents_result::agent_outcome;
         use warp_multi_agent_api::run_agents_result::{
-            AgentOutcome, Launched, LaunchedAgent, Outcome,
+            AgentOutcome, Launched, LaunchedAgent, Outcome, agent_outcome,
         };
 
+        let state = AppState::new(fallback_config(), vec![]);
+        state.register_launched_agent("child", "child-conversation-id");
+        state.register_agent_task("child", "child-run-id");
         let result = request::input::ToolCallResult {
             tool_call_id: "run-agents-1".into(),
             result: Some(request::input::tool_call_result::Result::RunAgentsResult(
@@ -3000,16 +3177,16 @@ mod streaming_tests {
             )),
         };
 
-        let text = request_tool_call_result_to_text(&result);
-        assert!(text.contains("child-conversation-id"));
-        assert!(text.contains("conversation_id"));
+        let text = request_tool_call_result_to_text(&result, &state);
+        assert!(text.contains("child-run-id"));
+        assert!(text.contains("agent_address"));
+        assert!(!text.contains("fetch_conversation"));
     }
 
     #[test]
     fn any_file_read_result_preserves_text_content() {
         use warp_multi_agent_api::any_file_content::Content;
-        use warp_multi_agent_api::read_files_result;
-        use warp_multi_agent_api::request;
+        use warp_multi_agent_api::{read_files_result, request};
 
         let result = request::input::ToolCallResult {
             tool_call_id: "read-child-cache".into(),
@@ -3033,7 +3210,8 @@ mod streaming_tests {
             )),
         };
 
-        assert!(request_tool_call_result_to_text(&result).contains("E2E_CHILD_OK"));
+        let state = AppState::new(fallback_config(), vec![]);
+        assert!(request_tool_call_result_to_text(&result, &state).contains("E2E_CHILD_OK"));
     }
 
     #[test]
@@ -3052,9 +3230,14 @@ mod streaming_tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|tool| tool.pointer("/function/name").and_then(|name| name.as_str()))
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|name| name.as_str())
+            })
             .collect::<Vec<_>>();
         assert!(names.contains(&"run_agents"));
+        assert!(names.contains(&"send_message_to_agent"));
+        assert!(!names.contains(&"fetch_conversation"));
         assert!(!names.contains(&"subagent"));
         assert!(!names.contains(&"start_agent"));
     }
@@ -3073,7 +3256,10 @@ mod streaming_tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|tool| tool.pointer("/function/name").and_then(|name| name.as_str()))
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|name| name.as_str())
+            })
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["run_agents"]);
     }
@@ -3092,7 +3278,10 @@ mod streaming_tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|tool| tool.pointer("/function/name").and_then(|name| name.as_str()))
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|name| name.as_str())
+            })
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["wait_for_events"]);
     }
@@ -3118,7 +3307,10 @@ mod streaming_tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|tool| tool.pointer("/function/name").and_then(|name| name.as_str()))
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|name| name.as_str())
+            })
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["run_shell_command"]);
     }
@@ -3195,6 +3387,58 @@ mod streaming_tests {
     }
 
     #[test]
+    fn terminal_child_results_are_forwarded_only_without_an_explicit_message() {
+        let implicit = vec![
+            json!({"role": "user", "content": "Compute 2 + 2"}),
+            json!({"role": "assistant", "content": "4"}),
+        ];
+        assert_eq!(
+            terminal_result_without_explicit_parent_message(&implicit, "parent"),
+            Some("4")
+        );
+
+        let explicit = vec![
+            json!({"role": "user", "content": "Report back"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "function": {
+                        "name": "send_message_to_agent",
+                        "arguments": "{\"addresses\":[\"parent\"]}"
+                    }
+                }]
+            }),
+            json!({"role": "tool", "content": "sent"}),
+            json!({"role": "assistant", "content": "Done"}),
+        ];
+        assert_eq!(
+            terminal_result_without_explicit_parent_message(&explicit, "parent"),
+            None
+        );
+
+        let sibling_only = vec![
+            json!({"role": "user", "content": "Message sibling"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "function": {
+                        "name": "send_message_to_agent",
+                        "arguments": "{\"addresses\":[\"sibling\"]}"
+                    }
+                }]
+            }),
+            json!({"role": "tool", "content": "sent"}),
+            json!({"role": "assistant", "content": "Sibling notified"}),
+        ];
+        assert_eq!(
+            terminal_result_without_explicit_parent_message(&sibling_only, "parent"),
+            Some("Sibling notified")
+        );
+    }
+
+    #[test]
     fn custom_model_config_key_resolves_to_provider_slug_and_endpoint() {
         use warp_multi_agent_api::request::settings::custom_model_providers::{
             CustomEndpointSchema, CustomModel, CustomModelProvider,
@@ -3225,8 +3469,7 @@ mod streaming_tests {
             ..Default::default()
         };
 
-        let (config, model) =
-            resolve_backend(&request, "custom-key", &fallback_config()).unwrap();
+        let (config, model) = resolve_backend(&request, "custom-key", &fallback_config()).unwrap();
         assert_eq!(model, "provider-model");
         assert_eq!(config.backend_base_url, "https://custom.example/v1");
         assert_eq!(config.backend_api_key.as_deref(), Some("test-key"));
@@ -3273,8 +3516,14 @@ mod streaming_tests {
         let tool_calls = accumulator.into_tool_calls();
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(tool_calls[0]["function"]["name"], "run_shell_command");
-        assert_eq!(tool_calls[0]["function"]["arguments"], "{\"command\":\"echo hi\"}");
+        assert_eq!(
+            tool_calls[0]["function"]["arguments"],
+            "{\"command\":\"echo hi\"}"
+        );
         assert_eq!(tool_calls[1]["function"]["name"], "grep");
-        assert_eq!(tool_calls[1]["function"]["arguments"], "{\"queries\":[\"foo\"]}");
+        assert_eq!(
+            tool_calls[1]["function"]["arguments"],
+            "{\"queries\":[\"foo\"]}"
+        );
     }
 }

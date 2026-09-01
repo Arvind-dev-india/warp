@@ -8,7 +8,10 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::Json;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -67,10 +70,7 @@ pub async fn handle(
 
     if matches!(
         key.as_str(),
-        "user"
-            | "workspacesmetadataforuser"
-            | "featuremodelchoices"
-            | "freeavailablemodels"
+        "user" | "workspacesmetadataforuser" | "featuremodelchoices" | "freeavailablemodels"
     ) {
         state.refresh_models().await;
     }
@@ -89,6 +89,7 @@ pub async fn handle(
         "referralinfo" => Some(canned::get_referral_info()),
         "usergithubinfo" => Some(canned::user_github_info()),
         "conversationusage" => Some(canned::get_conversation_usage()),
+        "tuionboardingmarkers" => Some(canned::tui_onboarding_markers()),
         // Triggered by the "Sign in to use AI" button in Settings.
         "mintcustomtoken" => Some(canned::mint_custom_token()),
 

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Build warp_local_proxy and warp-oss for Windows.
+    Build warp_local_proxy, warp-oss, and warp-tui-oss for Windows.
     Automatically installs required dependencies (Rust, protoc, Git LFS files).
 
 .EXAMPLE
@@ -13,6 +13,12 @@
     # Build only warp-oss
     .\scripts\build-local.ps1 -WarpOnly
 
+    # Build proxy, warp-oss, and warp-tui-oss
+    .\scripts\build-local.ps1 -Tui
+
+    # Build only the interactive Warp Agent CLI
+    .\scripts\build-local.ps1 -TuiOnly -Profile debug
+
     # Skip dependency checks (faster rebuild)
     .\scripts\build-local.ps1 -SkipDeps
 #>
@@ -23,11 +29,35 @@ param(
     [string]$Profile = "release",
     [switch]$ProxyOnly,
     [switch]$WarpOnly,
+    [switch]$Tui,
+    [switch]$TuiOnly,
     [switch]$SkipDeps
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+
+if ($TuiOnly -and ($ProxyOnly -or $WarpOnly -or $Tui)) {
+    throw "-TuiOnly cannot be combined with -ProxyOnly, -WarpOnly, or -Tui."
+}
+
+function Prepare-LocalTuiResources([string]$TuiBin) {
+    $resourcesDir = Join-Path (Split-Path -Parent $TuiBin) "resources"
+    $bundledSource = Join-Path (Join-Path $RepoRoot "resources") "bundled"
+    $bundledDestination = Join-Path $resourcesDir "bundled"
+    $settingsSchema = Join-Path $resourcesDir "settings_schema.json"
+
+    New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
+    if (Test-Path $bundledDestination) {
+        Remove-Item -LiteralPath $bundledDestination -Recurse -Force
+    }
+    Copy-Item -LiteralPath $bundledSource -Destination $bundledDestination -Recurse -Force
+
+    & $TuiBin dump-settings-schema $settingsSchema
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $settingsSchema)) {
+        throw "Failed to generate TUI settings schema at $settingsSchema."
+    }
+}
 
 # --- Dependency checks ---
 if (-not $SkipDeps) {
@@ -104,7 +134,7 @@ try {
     # to the correct target subdirectory (release vs debug).
     $env:CARGO_FULL_PROFILE = $Profile
 
-    if (-not $WarpOnly) {
+    if (-not $TuiOnly -and -not $WarpOnly) {
         Write-Host "=== Building warp_local_proxy ($Profile) ===" -ForegroundColor Cyan
         $proxyArgs = @("build", "-p", "warp_local_proxy")
         if ($releaseFlag) { $proxyArgs += $releaseFlag }
@@ -116,7 +146,7 @@ try {
         Write-Host "  -> $bin" -ForegroundColor Green
     }
 
-    if (-not $ProxyOnly) {
+    if (-not $TuiOnly -and -not $ProxyOnly) {
         Write-Host ""
         Write-Host "=== Building warp-oss ($Profile) ===" -ForegroundColor Cyan
         $warpArgs = @("build", "--bin", "warp-oss")
@@ -152,6 +182,34 @@ try {
                 Write-Host "  Copied OpenConsole.exe to $archDir" -ForegroundColor Yellow
             }
         }
+    }
+
+    if ($Tui -or $TuiOnly) {
+        Write-Host ""
+        Write-Host "=== Building warp-tui-oss ($Profile) ===" -ForegroundColor Cyan
+        $tuiArgs = @(
+            "build",
+            "-p", "warp_tui",
+            "--bin", "warp-tui-oss",
+            "--features", "standalone"
+        )
+        if ($releaseFlag) { $tuiArgs += $releaseFlag }
+        $previousBuildJobs = $env:CARGO_BUILD_JOBS
+        if (-not $env:CARGO_BUILD_JOBS) {
+            $env:CARGO_BUILD_JOBS = "2"
+        }
+        try {
+            & cargo @tuiArgs
+            if ($LASTEXITCODE -ne 0) { throw "warp-tui-oss build failed" }
+        } finally {
+            $env:CARGO_BUILD_JOBS = $previousBuildJobs
+        }
+
+        $ext = if ($env:OS -eq "Windows_NT") { ".exe" } else { "" }
+        $tuiBin = Join-Path (Join-Path (Join-Path $RepoRoot "target") $Profile) "warp-tui-oss$ext"
+        Write-Host "  -> $tuiBin" -ForegroundColor Green
+        Write-Host "=== Preparing warp-tui-oss resources ===" -ForegroundColor Cyan
+        Prepare-LocalTuiResources $tuiBin
     }
 
     Write-Host ""

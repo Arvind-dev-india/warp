@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# warp-local — single-command wrapper that runs warp_local_proxy and warp-oss
+# warp-local — single-command wrapper that runs warp_local_proxy and Warp
 # together. The user runs this and gets a fully local Warp client backed by
 # whatever OpenAI-compatible model endpoint they configure (default:
 # http://localhost:3113/v1 with model gpt-5-mini).
@@ -9,6 +9,9 @@
 #
 #     # default — start proxy + warp-oss with gpt-5-mini at localhost:3113/v1
 #     ./scripts/warp-local
+#
+#     # interactive Warp Agent CLI
+#     ./scripts/warp-local --tui --profile debug
 #
 #     # point at Ollama
 #     ./scripts/warp-local --backend http://localhost:11434/v1 \
@@ -65,6 +68,9 @@ MODEL="${WARP_LOCAL_PROXY_DEFAULT_MODEL:-$MODEL_DEFAULT}"
 
 KEEP_PROXY=0
 STOP_PROXY_ONLY=0
+SKIP_BUILD=0
+TUI=0
+PROXY_STARTED_BY_LAUNCHER=0
 PROFILE="$PROFILE_DEFAULT"
 WARP_ARGS=()
 
@@ -72,7 +78,7 @@ WARP_ARGS=()
 
 usage() {
     cat <<'EOF'
-warp-local — single-command wrapper that runs warp_local_proxy and warp-oss
+warp-local — single-command wrapper that runs warp_local_proxy and Warp
 together. The user runs this and gets a fully local Warp client backed by
 whatever OpenAI-compatible model endpoint they configure (default:
 http://localhost:3113/v1 with model gpt-5-mini).
@@ -81,6 +87,9 @@ Examples:
 
     # default — start proxy + warp-oss with gpt-5-mini at localhost:3113/v1
     ./scripts/warp-local
+
+    # start the interactive Warp Agent CLI
+    ./scripts/warp-local --tui --profile debug
 
     # point at Ollama
     ./scripts/warp-local --backend http://localhost:11434/v1 \
@@ -106,8 +115,10 @@ Options:
   --api-key KEY           API key for the backend (optional)
   --azure-api-version V   Azure-only api-version query param
   --model ID              Default model id (default: $MODEL_DEFAULT)
-  --profile {release|debug}  Build profile for warp-oss (default: $PROFILE_DEFAULT)
-  --keep-proxy            Don't stop the proxy when warp-oss exits
+  --profile {release|debug}  Build profile (default: $PROFILE_DEFAULT)
+  --tui                   Run the interactive Warp Agent CLI
+  --skip-build            Reuse the selected profile's existing binaries
+  --keep-proxy            Don't stop a proxy started by this launcher
   --stop-proxy            Just stop a previously-launched proxy and exit
   -h, --help              Show this help
   --                      End of script options; remaining args go to warp-oss
@@ -125,6 +136,8 @@ while [[ $# -gt 0 ]]; do
         --azure-api-version) AZURE_API_VERSION="$2"; shift 2 ;;
         --model)           MODEL="$2"; shift 2 ;;
         --profile)         PROFILE="$2"; shift 2 ;;
+        --tui)             TUI=1; shift ;;
+        --skip-build)      SKIP_BUILD=1; shift ;;
         --keep-proxy)      KEEP_PROXY=1; shift ;;
         --stop-proxy)      STOP_PROXY_ONLY=1; shift ;;
         -h|--help)         usage; exit 0 ;;
@@ -175,6 +188,9 @@ stop_proxy_pid() {
 }
 
 build_proxy() {
+    if [[ "$SKIP_BUILD" -eq 1 ]]; then
+        return
+    fi
     if [[ "$PROFILE" == "release" ]]; then
         if [[ -x "$REPO_ROOT/target/release/warp-local-proxy" ]]; then
             return
@@ -190,19 +206,41 @@ build_proxy() {
     fi
 }
 
-ensure_warp_built() {
-    local bin="$REPO_ROOT/target/$PROFILE/warp-oss"
+ensure_client_built() {
+    local binary_name="warp-oss"
+    if [[ "$TUI" -eq 1 ]]; then
+        binary_name="warp-tui-oss"
+    fi
+    local bin="$REPO_ROOT/target/$PROFILE/$binary_name"
     if [[ -x "$bin" ]]; then
         echo "$bin"
         return
     fi
-    echo "warp-local: warp-oss not found at $bin, building (profile=$PROFILE)..." >&2
-    if [[ "$PROFILE" == "release" ]]; then
-        (cd "$REPO_ROOT" && cargo build --release --bin warp-oss)
-    else
-        (cd "$REPO_ROOT" && cargo build --bin warp-oss)
+    if [[ "$SKIP_BUILD" -eq 1 ]]; then
+        echo "warp-local: $binary_name not found at $bin; run without --skip-build first" >&2
+        exit 1
     fi
+    echo "warp-local: $binary_name not found at $bin, building (profile=$PROFILE)..." >&2
+    local cargo_args=(build)
+    if [[ "$PROFILE" == "release" ]]; then
+        cargo_args+=(--release)
+    fi
+    if [[ "$TUI" -eq 1 ]]; then
+        cargo_args+=(-p warp_tui --bin warp-tui-oss --features standalone)
+    else
+        cargo_args+=(-p warp --bin warp-oss)
+    fi
+    (cd "$REPO_ROOT" && CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" cargo "${cargo_args[@]}")
     echo "$bin"
+}
+
+prepare_tui_resources() {
+    local tui_bin="$1"
+    local resources_dir
+    resources_dir="$(dirname "$tui_bin")/resources"
+    echo "warp-local: preparing TUI resources..."
+    NO_LICENSES=1 SETTINGS_SCHEMA_EXECUTABLE="$tui_bin" \
+        "$REPO_ROOT/script/prepare_bundled_resources" "$resources_dir" oss
 }
 
 start_proxy() {
@@ -231,6 +269,7 @@ start_proxy() {
     : > "$PROXY_LOG"
     nohup "$proxy_bin" "${proxy_args[@]}" >> "$PROXY_LOG" 2>&1 &
     echo $! > "$PROXY_PIDFILE"
+    PROXY_STARTED_BY_LAUNCHER=1
 
     # Wait for healthz.
     for _ in $(seq 1 50); do
@@ -254,12 +293,16 @@ fi
 
 start_proxy
 
-WARP_BIN="$(ensure_warp_built)"
+WARP_BIN="$(ensure_client_built)"
+
+if [[ "$TUI" -eq 1 ]] && { [[ "$SKIP_BUILD" -eq 0 ]] || [[ ! -s "$(dirname "$WARP_BIN")/resources/settings_schema.json" ]]; }; then
+    prepare_tui_resources "$WARP_BIN"
+fi
 
 cleanup() {
-    if [[ "$KEEP_PROXY" -eq 0 ]]; then
+    if [[ "$KEEP_PROXY" -eq 0 && "$PROXY_STARTED_BY_LAUNCHER" -eq 1 ]]; then
         stop_proxy_pid
-    else
+    elif [[ "$KEEP_PROXY" -eq 1 ]]; then
         echo "warp-local: leaving proxy running (use --stop-proxy to stop it later)"
     fi
 }
@@ -268,8 +311,12 @@ trap cleanup EXIT
 echo "warp-local: launching $WARP_BIN ${WARP_ARGS[*]:-}"
 # Channel::Oss already defaults to localhost:8765, but if the user picked a
 # different bind address, propagate it via env so the override path catches it.
-if [[ "$PROXY_BIND" != "$PROXY_BIND_DEFAULT" ]]; then
+if [[ "$TUI" -eq 1 || "$PROXY_BIND" != "$PROXY_BIND_DEFAULT" ]]; then
     export WARP_SERVER_ROOT_URL="http://$PROXY_BIND"
+fi
+if [[ "$TUI" -eq 1 ]]; then
+    export WARP_WS_SERVER_URL="ws://$PROXY_BIND/graphql/v2"
+    export WARP_API_KEY="${WARP_API_KEY:-local-mode-token}"
 fi
 
 # Don't `exec` — that would replace the bash process and skip the cleanup

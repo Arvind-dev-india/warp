@@ -16,7 +16,17 @@ fn main() -> Result<()> {
         ChannelConfig {
             app_id: AppId::new("dev", "warp", "WarpTui"),
             logfile_name: "warp-tui.log".into(),
-            server_config: WarpServerConfig::production(),
+            server_config: WarpServerConfig {
+                server_root_url: std::env::var("WARP_SERVER_ROOT_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:8765".to_string())
+                    .into(),
+                rtc_server_url: std::env::var("WARP_WS_SERVER_URL")
+                    .unwrap_or_else(|_| "ws://127.0.0.1:8765/graphql/v2".to_string())
+                    .into(),
+                session_sharing_server_url: None,
+                firebase_auth_api_key: "local-mode-no-firebase".into(),
+                iap_config: None,
+            },
             oz_config: OzConfig::production(),
             telemetry_config: None,
             crash_reporting_config: None,

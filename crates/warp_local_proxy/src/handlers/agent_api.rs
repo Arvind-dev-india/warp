@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
+use axum::Json;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{self as stream, StreamExt};
@@ -100,6 +100,37 @@ impl AgentApiState {
                 .children(ancestor_run_id)
                 .iter()
                 .any(|child| child == run_id)
+    }
+
+    pub(crate) fn store_message(
+        &self,
+        recipient_run_id: String,
+        sender_run_id: String,
+        subject: String,
+        body: String,
+    ) -> String {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let message = StoredMessage {
+            message_id: message_id.clone(),
+            sender_run_id,
+            subject,
+            body,
+            sent_at: now_rfc3339(),
+            delivered_at: None,
+            read_at: None,
+            recipients: vec![recipient_run_id.clone()],
+        };
+        self.messages
+            .write()
+            .expect("agent messages lock poisoned")
+            .insert(message_id.clone(), message);
+        self.emit(
+            recipient_run_id,
+            "new_message".to_string(),
+            Some(message_id.clone()),
+            None,
+        );
+        message_id
     }
 }
 
@@ -332,28 +363,11 @@ pub async fn send_messages(
     let mut message_ids = Vec::with_capacity(recipients.len());
     for (address, recipient_run_id) in recipients {
         state.mark_agent_message_sent(&address);
-        let message_id = uuid::Uuid::new_v4().to_string();
-        let message = StoredMessage {
-            message_id: message_id.clone(),
-            sender_run_id: request.sender_run_id.clone(),
-            subject: request.subject.clone(),
-            body: request.body.clone(),
-            sent_at: now_rfc3339(),
-            delivered_at: None,
-            read_at: None,
-            recipients: vec![recipient_run_id.clone()],
-        };
-        state
-            .agent_api
-            .messages
-            .write()
-            .expect("agent messages lock poisoned")
-            .insert(message_id.clone(), message);
-        state.agent_api.emit(
+        let message_id = state.agent_api.store_message(
             recipient_run_id,
-            "new_message".to_string(),
-            Some(message_id.clone()),
-            None,
+            request.sender_run_id.clone(),
+            request.subject.clone(),
+            request.body.clone(),
         );
         message_ids.push(message_id);
     }

@@ -4,15 +4,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use axum::{
-    extract::ws::{WebSocket, WebSocketUpgrade},
-    response::IntoResponse,
-    routing::{any, get, post},
-    Router,
-};
+use axum::Router;
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use axum::response::IntoResponse;
+use axum::routing::{any, get, post};
 use tower_http::trace::TraceLayer;
 
-use crate::{config::Config, handlers, upstream::openai};
+use crate::config::Config;
+use crate::handlers;
+use crate::upstream::openai;
 
 /// Default fallback model id used when the proxy can't reach the backend's
 /// `/v1/models` endpoint at startup. Keeps the model picker non-empty.
@@ -212,10 +212,10 @@ impl AppState {
         }
         let is_known_id = self
             .agent_tasks
-                .read()
-                .expect("agent task lock poisoned")
-                .values()
-                .any(|task_id| task_id == address)
+            .read()
+            .expect("agent task lock poisoned")
+            .values()
+            .any(|task_id| task_id == address)
             || self
                 .launched_agents
                 .read()
@@ -246,6 +246,23 @@ impl AppState {
             .expect("conversation versions lock poisoned")
             .insert(conversation_id.to_string(), version);
         version
+    }
+
+    pub fn send_agent_message(
+        &self,
+        address: &str,
+        sender_run_id: &str,
+        subject: &str,
+        body: &str,
+    ) -> Option<String> {
+        let recipient_run_id = self.resolve_agent_address(address)?;
+        self.mark_agent_message_sent(address);
+        Some(self.agent_api.store_message(
+            recipient_run_id,
+            sender_run_id.to_string(),
+            subject.to_string(),
+            body.to_string(),
+        ))
     }
 
     pub fn conversation_cache_path(&self, conversation_id: &str) -> Option<std::path::PathBuf> {
@@ -438,10 +455,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/agent/events/{run_id}",
             post(handlers::agent_api::report_event),
         )
-        .route(
-            "/api/v1/agent/runs",
-            get(handlers::agent_api::list_runs),
-        )
+        .route("/api/v1/agent/runs", get(handlers::agent_api::list_runs))
         .route(
             "/api/v1/agent/runs/{run_id}",
             get(handlers::agent_api::get_run),
@@ -508,7 +522,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .build()
         .expect("reqwest client should build");
 
-    let models_url_display = config.models_url().unwrap_or_else(|| "(azure: default model only)".into());
+    let models_url_display = config
+        .models_url()
+        .unwrap_or_else(|| "(azure: default model only)".into());
     tracing::info!(url = %models_url_display, "fetching backend model list");
     let models = openai::fetch_models(&probe_http, &config).await;
     if models.is_empty() {
@@ -620,12 +636,7 @@ mod tests {
                 .join(format!("{conversation_id}.json")),
         ))
         .unwrap();
-        std::fs::remove_file(
-            state
-                .conversation_cache_dir
-                .join(format!("{task_id}.json")),
-        )
-        .unwrap();
+        std::fs::remove_file(state.conversation_cache_dir.join(format!("{task_id}.json"))).unwrap();
     }
 
     #[test]
@@ -634,9 +645,7 @@ mod tests {
         state.register_conversation_task("../../outside", "safe-task");
         state.register_conversation_task("safe-conversation", "../outside");
         assert!(state.conversation_cache_path("../../outside").is_none());
-        assert!(state
-            .conversation_cache_path("safe-conversation")
-            .is_none());
+        assert!(state.conversation_cache_path("safe-conversation").is_none());
     }
 
     #[test]
@@ -709,12 +718,7 @@ mod tests {
                 .join(format!("{conversation_id}.json")),
         ))
         .unwrap();
-        std::fs::remove_file(
-            state
-                .conversation_cache_dir
-                .join(format!("{task_id}.json")),
-        )
-        .unwrap();
+        std::fs::remove_file(state.conversation_cache_dir.join(format!("{task_id}.json"))).unwrap();
     }
 
     #[test]
@@ -727,9 +731,7 @@ mod tests {
             &task_id,
             &[serde_json::json!({"role": "assistant", "content": "first"})],
         );
-        let (alias, initial_required) = state
-            .conversation_cache_target(&conversation_id)
-            .unwrap();
+        let (alias, initial_required) = state.conversation_cache_target(&conversation_id).unwrap();
         assert_eq!(initial_required, 0);
         assert_eq!(
             std::fs::read_to_string(alias_version_path(&alias)).unwrap(),
@@ -749,11 +751,6 @@ mod tests {
 
         std::fs::remove_file(&alias).unwrap();
         std::fs::remove_file(alias_version_path(&alias)).unwrap();
-        std::fs::remove_file(
-            state
-                .conversation_cache_dir
-                .join(format!("{task_id}.json")),
-        )
-        .unwrap();
+        std::fs::remove_file(state.conversation_cache_dir.join(format!("{task_id}.json"))).unwrap();
     }
 }
