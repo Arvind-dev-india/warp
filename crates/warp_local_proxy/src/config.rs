@@ -6,6 +6,16 @@ use std::net::SocketAddr;
 
 use clap::{Parser, ValueEnum};
 
+pub const DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
+pub const DEEPSEEK_V4_FLASH_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
+
+pub fn model_context_window_tokens(model: &str) -> u32 {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "deepseek-v4-flash" => DEEPSEEK_V4_FLASH_CONTEXT_WINDOW_TOKENS,
+        _ => DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
+    }
+}
+
 /// How the proxy authenticates to the backend AI server. Each style affects
 /// both the auth header shape and (for Azure) the URL composition.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -171,6 +181,22 @@ mod tests {
     }
 
     #[test]
+    fn model_context_windows_use_known_capabilities_with_a_safe_fallback() {
+        assert_eq!(
+            model_context_window_tokens("DeepSeek-V4-Flash"),
+            DEEPSEEK_V4_FLASH_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            model_context_window_tokens("deepseek-v4-flash"),
+            DEEPSEEK_V4_FLASH_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            model_context_window_tokens("unknown-model"),
+            DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS
+        );
+    }
+
+    #[test]
     fn trailing_slash_is_normalised() {
         let c = cfg("http://localhost:3113/v1/", AuthStyle::Bearer, None);
         assert_eq!(
@@ -235,7 +261,10 @@ mod tests {
     #[test]
     fn models_url_mirrors_chat_url() {
         let c = cfg("http://localhost:3113/v1", AuthStyle::Bearer, None);
-        assert_eq!(c.models_url(), Some("http://localhost:3113/v1/models".into()));
+        assert_eq!(
+            c.models_url(),
+            Some("http://localhost:3113/v1/models".into())
+        );
     }
 
     #[test]

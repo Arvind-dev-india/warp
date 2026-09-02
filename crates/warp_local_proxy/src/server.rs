@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use axum::Router;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
+use axum::Router;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
@@ -32,6 +32,7 @@ pub struct AppState {
     launched_agents: Arc<RwLock<HashMap<String, String>>>,
     known_agent_addresses: Arc<RwLock<HashSet<String>>>,
     required_conversation_versions: Arc<RwLock<HashMap<String, u64>>>,
+    conversation_context_tokens: Arc<RwLock<HashMap<String, u32>>>,
     next_message_version: Arc<AtomicU64>,
     pub agent_api: Arc<handlers::agent_api::AgentApiState>,
     /// Directory for persisted conversation cache (one JSON file per task_id).
@@ -53,6 +54,7 @@ impl AppState {
             launched_agents: Arc::new(RwLock::new(HashMap::new())),
             known_agent_addresses: Arc::new(RwLock::new(HashSet::new())),
             required_conversation_versions: Arc::new(RwLock::new(HashMap::new())),
+            conversation_context_tokens: Arc::new(RwLock::new(HashMap::new())),
             next_message_version: Arc::new(AtomicU64::new(1)),
             agent_api: Arc::new(handlers::agent_api::AgentApiState::new()),
             conversation_cache_dir: {
@@ -270,6 +272,47 @@ impl AppState {
             .map(|(path, _)| path)
     }
 
+    pub fn record_conversation_context_tokens(&self, task_id: &str, tokens: u32) {
+        if !is_safe_cache_key(task_id) {
+            tracing::warn!(task_id, "rejecting unsafe context token cache key");
+            return;
+        }
+        self.conversation_context_tokens
+            .write()
+            .expect("conversation context token lock poisoned")
+            .insert(task_id.to_string(), tokens);
+        let path = self
+            .conversation_cache_dir
+            .join(format!("{task_id}.context_tokens"));
+        if let Err(error) = std::fs::write(path, tokens.to_string()) {
+            tracing::warn!(task_id, %error, "failed to persist conversation context tokens");
+        }
+    }
+
+    pub fn conversation_context_tokens(&self, task_id: &str) -> Option<u32> {
+        if !is_safe_cache_key(task_id) {
+            return None;
+        }
+        if let Some(tokens) = self
+            .conversation_context_tokens
+            .read()
+            .expect("conversation context token lock poisoned")
+            .get(task_id)
+            .copied()
+        {
+            return Some(tokens);
+        }
+        let path = self
+            .conversation_cache_dir
+            .join(format!("{task_id}.context_tokens"));
+        let tokens = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+        self.conversation_context_tokens
+            .write()
+            .expect("conversation context token lock poisoned")
+            .insert(task_id.to_string(), tokens);
+        Some(tokens)
+    }
+
     pub fn conversation_cache_target(
         &self,
         conversation_id: &str,
@@ -368,6 +411,7 @@ fn conversation_is_terminal(messages: &[serde_json::Value]) -> bool {
         return false;
     };
     last.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+        && last.get("compacted").and_then(serde_json::Value::as_bool) != Some(true)
         && last
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -722,6 +766,30 @@ mod tests {
     }
 
     #[test]
+    fn compacted_summary_is_not_published_as_a_terminal_child_result() {
+        let state = AppState::new(config("configured-chat-model"), vec![]);
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        state.register_conversation_task(&conversation_id, &task_id);
+
+        state.save_conversation(
+            &task_id,
+            &[
+                serde_json::json!({"role": "system", "content": "system"}),
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": "[Compacted conversation summary]\nsummary",
+                    "compacted": true
+                }),
+            ],
+        );
+
+        let alias = state.conversation_cache_path(&conversation_id).unwrap();
+        assert!(!alias.exists());
+        std::fs::remove_file(state.conversation_cache_dir.join(format!("{task_id}.json"))).unwrap();
+    }
+
+    #[test]
     fn followup_message_requires_a_new_alias_version() {
         let state = AppState::new(config("configured-chat-model"), vec![]);
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -752,5 +820,23 @@ mod tests {
         std::fs::remove_file(&alias).unwrap();
         std::fs::remove_file(alias_version_path(&alias)).unwrap();
         std::fs::remove_file(state.conversation_cache_dir.join(format!("{task_id}.json"))).unwrap();
+    }
+
+    #[test]
+    fn context_token_count_is_persisted_across_state_instances() {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let state = AppState::new(config("configured-chat-model"), vec![]);
+        state.record_conversation_context_tokens(&task_id, 96_000);
+        assert_eq!(state.conversation_context_tokens(&task_id), Some(96_000));
+
+        let restored = AppState::new(config("configured-chat-model"), vec![]);
+        assert_eq!(restored.conversation_context_tokens(&task_id), Some(96_000));
+
+        std::fs::remove_file(
+            restored
+                .conversation_cache_dir
+                .join(format!("{task_id}.context_tokens")),
+        )
+        .unwrap();
     }
 }

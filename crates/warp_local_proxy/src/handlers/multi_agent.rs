@@ -14,7 +14,7 @@
 //! 5. Client sends NEW Request with ToolCallResults → goto 2
 //! 6. If LLM returns text → proxy emits AgentOutput → Finished
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,9 +28,10 @@ use base64::Engine as _;
 use prost::Message;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::config::{AuthStyle, Config};
+use crate::config::{model_context_window_tokens, AuthStyle, Config};
 use crate::server::AppState;
 use crate::upstream::openai::apply_backend_auth;
 
@@ -836,6 +837,375 @@ fn is_summarize_request(request: &warp_multi_agent_api::Request) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn summarize_request_prompt(request: &warp_multi_agent_api::Request) -> Option<&str> {
+    let warp_multi_agent_api::request::input::Type::SummarizeConversation(summarize) =
+        request.input.as_ref()?.r#type.as_ref()?
+    else {
+        return None;
+    };
+    (!summarize.prompt.trim().is_empty()).then_some(summarize.prompt.as_str())
+}
+
+fn additional_request_message(request: &warp_multi_agent_api::Request) -> Option<String> {
+    let input = request.input.as_ref()?.r#type.as_ref()?;
+    match input {
+        warp_multi_agent_api::request::input::Type::ResumeConversation(_) => {
+            Some("(Conversation resumed)".to_string())
+        }
+        warp_multi_agent_api::request::input::Type::CodeReview(code_review) => {
+            let mut text = String::from("Please review the following code changes:\n\n");
+            if let Some(
+                warp_multi_agent_api::request::input::code_review::Operation::InitialReviewComments(
+                    initial,
+                ),
+            ) = &code_review.operation
+            {
+                if let Some(diff_set) = &initial.diff_set {
+                    for hunk in &diff_set.hunks {
+                        text.push_str(&format!(
+                            "=== {} (lines +{} -{}) ===\n{}\n\n",
+                            hunk.file_path, hunk.lines_added, hunk.lines_removed, hunk.diff_content
+                        ));
+                    }
+                }
+                if !initial.review_comments.is_empty() {
+                    text.push_str("Existing review comments:\n");
+                    for comment in &initial.review_comments {
+                        text.push_str(&format!("- {}\n", comment.comment));
+                    }
+                }
+            }
+            Some(text)
+        }
+        warp_multi_agent_api::request::input::Type::AutoCodeDiffQuery(query) => {
+            Some(format!("Auto code diff: {}", query.query))
+        }
+        warp_multi_agent_api::request::input::Type::InvokeSkill(_) => {
+            Some("Invoke skill.".to_string())
+        }
+        warp_multi_agent_api::request::input::Type::CreateNewProject(project) => {
+            Some(format!("Create new project: {}", project.query))
+        }
+        warp_multi_agent_api::request::input::Type::InitProjectRules(_) => {
+            Some("Initialize project rules.".to_string())
+        }
+        warp_multi_agent_api::request::input::Type::FetchReviewComments(comments) => {
+            Some(format!("Fetch review comments for: {}", comments.repo_path))
+        }
+        _ => None,
+    }
+}
+
+fn current_turn_messages(
+    request: &warp_multi_agent_api::Request,
+    user_query: Option<&str>,
+    tool_results: &[(String, String)],
+    received_agent_messages: &[String],
+) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    for (tool_call_id, result_text) in tool_results {
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": result_text
+        }));
+    }
+    if let Some(query) = user_query.filter(|query| !query.is_empty()) {
+        messages.push(json!({ "role": "user", "content": query }));
+    }
+    for message in received_agent_messages {
+        messages.push(json!({ "role": "user", "content": message }));
+    }
+    if messages.is_empty() && !is_summarize_request(request) {
+        if let Some(message) = additional_request_message(request) {
+            messages.push(json!({ "role": "user", "content": message }));
+        }
+    }
+    messages
+}
+
+fn split_history_for_compaction(
+    history: &[serde_json::Value],
+    current_turn: Vec<serde_json::Value>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut history = history.to_vec();
+    let mut current_turn = current_turn;
+    let has_tool_results = current_turn.iter().any(|message| message["role"] == "tool");
+    if has_tool_results {
+        if let Some(tool_call_index) = history.iter().rposition(|message| {
+            message
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|calls| !calls.is_empty())
+        }) {
+            let mut pending_tool_call = history.split_off(tool_call_index);
+            pending_tool_call.append(&mut current_turn);
+            current_turn = pending_tool_call;
+        }
+    }
+    (history, current_turn)
+}
+
+fn split_trailing_pending_tool_call(
+    history: &[serde_json::Value],
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut history = history.to_vec();
+    let Some(last) = history.last() else {
+        return (history, Vec::new());
+    };
+    let has_pending_tool_call = last
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
+    if has_pending_tool_call {
+        let pending = history.split_off(history.len() - 1);
+        (history, pending)
+    } else {
+        (history, Vec::new())
+    }
+}
+
+fn patch_orphaned_tool_calls(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut patched = messages.to_vec();
+    let mut index = 0;
+    while index < patched.len() {
+        if let Some(tool_calls) = patched[index]
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        {
+            let needed = tool_calls
+                .iter()
+                .filter_map(|tool_call| tool_call["id"].as_str().map(String::from))
+                .collect::<HashSet<_>>();
+            let mut found = HashSet::new();
+            let mut result_index = index + 1;
+            while result_index < patched.len() && patched[result_index]["role"] == "tool" {
+                if let Some(id) = patched[result_index]["tool_call_id"].as_str() {
+                    found.insert(id.to_string());
+                }
+                result_index += 1;
+            }
+            for (offset, id) in needed.difference(&found).enumerate() {
+                patched.insert(
+                    result_index + offset,
+                    json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": "(cancelled by user)"
+                    }),
+                );
+            }
+        }
+        index += 1;
+    }
+    for index in 0..patched.len() {
+        if patched[index]["role"] != "tool" {
+            continue;
+        }
+        let tool_call_id = patched[index]["tool_call_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let group_start = (0..index)
+            .rev()
+            .find(|candidate| patched[*candidate]["role"] != "tool");
+        let has_adjacent_call = group_start.is_some_and(|assistant_index| {
+            patched[assistant_index]
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|calls| {
+                    calls
+                        .iter()
+                        .any(|call| call["id"].as_str() == Some(tool_call_id.as_str()))
+                })
+        });
+        if !has_adjacent_call {
+            let content = patched[index]["content"].as_str().unwrap_or_default();
+            patched[index] = json!({
+                "role": "user",
+                "content": format!("[Tool result {tool_call_id}]\n{content}")
+            });
+        }
+    }
+    patched
+}
+
+fn persisted_assistant_content(display_text: &str) -> String {
+    const REASONING_START: &str = "<details><summary>💭 Thinking...</summary>\n\n";
+    const REASONING_END: &str = "</details>\n\n";
+    if display_text.starts_with(REASONING_START) {
+        if let Some((_, answer)) = display_text.split_once(REASONING_END) {
+            if answer.trim().is_empty() {
+                return "(Previous response ended during reasoning without a final answer.)"
+                    .to_string();
+            }
+            return answer.to_string();
+        }
+    }
+    display_text.to_string()
+}
+
+fn summary_source(messages: &[serde_json::Value]) -> String {
+    messages
+        .iter()
+        .filter(|message| message["role"] != "system")
+        .map(|message| {
+            let role = message["role"].as_str().unwrap_or("unknown");
+            let content = message["content"].as_str().unwrap_or_default();
+            let tool_calls = message
+                .get("tool_calls")
+                .filter(|calls| !calls.is_null())
+                .map(|calls| format!("\nTool calls: {calls}"))
+                .unwrap_or_default();
+            format!("[{role}]\n{content}{tool_calls}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn split_summary_source(source: &str, max_bytes: usize) -> Vec<String> {
+    if source.is_empty() {
+        return Vec::new();
+    }
+    let max_bytes = max_bytes.max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for character in source.chars() {
+        if !current.is_empty() && current.len() + character.len_utf8() > max_bytes {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn should_auto_compact(
+    previous_context_tokens: u32,
+    current_turn_tokens: u32,
+    context_window_tokens: u32,
+) -> bool {
+    previous_context_tokens.saturating_add(current_turn_tokens)
+        > context_window_tokens.saturating_mul(3) / 4
+}
+
+#[derive(Debug)]
+struct CompactionResult {
+    messages: Vec<serde_json::Value>,
+    summary: String,
+    request_usage: Option<BackendTokenUsage>,
+}
+
+async fn compact_history(
+    state: &AppState,
+    backend_config: &Config,
+    backend_model: &str,
+    available_tools: &serde_json::Value,
+    history: &[serde_json::Value],
+    context_window_tokens: u32,
+    additional_instructions: Option<&str>,
+) -> anyhow::Result<CompactionResult> {
+    let system_message = history
+        .iter()
+        .find(|message| message["role"] == "system")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("conversation has no system prompt"))?;
+    let source = summary_source(history);
+    if source.trim().is_empty() {
+        anyhow::bail!("conversation has no history to compact");
+    }
+
+    let max_summary_output_tokens = (context_window_tokens / 8).clamp(1, 16_384);
+    let prompt_overhead_tokens = (context_window_tokens / 32)
+        .clamp(1, 2_048)
+        .min(context_window_tokens / 4);
+    let max_chunk_bytes = context_window_tokens
+        .saturating_sub(max_summary_output_tokens)
+        .saturating_sub(prompt_overhead_tokens)
+        .max(1) as usize
+        * 2;
+    let mut chunks = split_summary_source(&source, max_chunk_bytes);
+    if chunks.len() > 16 {
+        anyhow::bail!("conversation requires too many compaction chunks");
+    }
+    let mut aggregate_usage: Option<BackendTokenUsage> = None;
+    let mut requests_sent = 0;
+    for pass in 0..4 {
+        let mut summaries = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            requests_sent += 1;
+            if requests_sent > 32 {
+                anyhow::bail!("conversation compaction exceeded the request limit");
+            }
+            let mut instructions = "Summarize this conversation segment concisely. Preserve user \
+                                    goals, decisions, file paths, commands, errors, tool results, \
+                                    unresolved tasks, and exact identifiers needed for follow-up \
+                                    work. Output only the summary."
+                .to_string();
+            if let Some(additional_instructions) = additional_instructions {
+                instructions.push_str("\n\nAdditional summary instructions:\n");
+                instructions.push_str(additional_instructions);
+            }
+            let messages = vec![
+                json!({ "role": "system", "content": instructions }),
+                json!({ "role": "user", "content": chunk }),
+            ];
+            let result = call_backend_with_tools(
+                state,
+                backend_config,
+                &messages,
+                false,
+                backend_model,
+                available_tools,
+                max_summary_output_tokens,
+            )
+            .await?;
+            let LlmResponse::Text(summary) = result.response else {
+                anyhow::bail!("summarizer returned tool calls instead of text");
+            };
+            if summary.trim().is_empty() {
+                anyhow::bail!("summarizer returned an empty summary");
+            }
+            aggregate_usage = match (aggregate_usage, result.usage) {
+                (Some(total), Some(usage)) => Some(total.merge(usage)),
+                (None, Some(usage)) => Some(usage),
+                (total, None) => total,
+            };
+            summaries.push(summary);
+        }
+        if summaries.len() == 1 {
+            let summary = summaries.pop().unwrap();
+            return Ok(CompactionResult {
+                messages: vec![
+                    system_message,
+                    json!({
+                        "role": "assistant",
+                        "content": format!("[Compacted conversation summary]\n{summary}"),
+                        "compacted": true
+                    }),
+                ],
+                summary,
+                request_usage: aggregate_usage,
+            });
+        }
+        let combined = summaries
+            .into_iter()
+            .enumerate()
+            .map(|(index, summary)| format!("[Segment {}]\n{summary}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        chunks = split_summary_source(&combined, max_chunk_bytes);
+        tracing::debug!(
+            pass = pass + 1,
+            chunks = chunks.len(),
+            "continuing hierarchical conversation compaction"
+        );
+    }
+    anyhow::bail!("conversation compaction did not converge")
 }
 
 fn extract_tool_results(
@@ -2035,6 +2405,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
                     .unwrap();
             }
         };
+    let context_window_tokens = effective_context_window_tokens(&request, &backend_model);
 
     // Detect if this is a continuation by checking for existing tasks or tool results
     let existing_task_id = request
@@ -2052,6 +2423,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
         existing_task = existing_task_id.as_deref().unwrap_or("(none)"),
         model = %selected_model,
         backend_model = %backend_model,
+        context_window_tokens,
         "multi-agent request"
     );
 
@@ -2100,251 +2472,150 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
         }));
     }
 
-    // Handle SummarizeConversation: ask the LLM to summarize, replace cache
+    let current_turn = current_turn_messages(
+        &request,
+        user_query.as_deref(),
+        &tool_results,
+        &received_agent_messages,
+    );
+
     if is_summarize_request(&request) {
-        tracing::info!("summarize request — compacting conversation");
-        let summary_prompt = json!([
-            { "role": "system", "content": "Summarize the following conversation into a concise recap. Preserve key facts, decisions, file paths, and tool results. Output only the summary." },
-            { "role": "user", "content": openai_messages.iter()
-                .filter(|m| m["role"] != "system")
-                .map(|m| {
-                    let role = m["role"].as_str().unwrap_or("?");
-                    let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let tc = m.get("tool_calls").map(|t| format!("[tool_calls: {}]", t));
-                    format!("[{role}] {}{}", content, tc.unwrap_or_default())
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-            }
-        ]);
-        let summary_messages: Vec<serde_json::Value> =
-            serde_json::from_value(summary_prompt).unwrap_or_default();
-        let summary_result = call_backend_with_tools(
+        tracing::info!("compacting conversation after explicit summarize request");
+        let (history_to_compact, pending_tool_call) =
+            split_trailing_pending_tool_call(&openai_messages);
+        let compaction_started = Instant::now();
+        let result = compact_history(
             &state,
             &backend_config,
-            &summary_messages,
-            false,
             &backend_model,
             &available_tools,
+            &history_to_compact,
+            context_window_tokens,
+            summarize_request_prompt(&request),
         )
         .await;
-        if let Ok(LlmResult {
-            response: LlmResponse::Text(ref summary),
-            ..
-        }) = summary_result
-        {
-            // Replace conversation with system + summary
-            openai_messages = vec![
-                openai_messages[0].clone(), // keep system prompt
-                json!({ "role": "assistant", "content": format!("[Conversation summary]\n{summary}") }),
-            ];
-            state.save_conversation(&task_id, &openai_messages);
+        match result {
+            Ok(result) => {
+                openai_messages = result.messages;
+                openai_messages.extend(pending_tool_call);
+                state.save_conversation(&task_id, &openai_messages);
+                let context_tokens_used = estimated_token_count(&openai_messages);
+                state.record_conversation_context_tokens(&task_id, context_tokens_used);
+                let usage = CompletionUsage {
+                    context_window_usage: (context_tokens_used as f32
+                        / context_window_tokens.max(1) as f32)
+                        .clamp(0.0, 1.0),
+                    context_tokens_used,
+                    tokens: result.request_usage,
+                    summarized: true,
+                };
 
-            // Emit a Summarization message so the UI shows it
-            let mut sse_body = String::new();
-            sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
-                r#type: Some(warp_multi_agent_api::response_event::Type::Init(
-                    warp_multi_agent_api::response_event::StreamInit {
-                        conversation_id: conversation_id.clone(),
-                        request_id: request_id.clone(),
-                        run_id: run_id.clone(),
-                    },
-                )),
-            }));
-            emit_agent_output(
-                &mut sse_body,
-                &task_id,
-                &request_id,
-                &format!("Conversation compacted. Summary:\n{summary}"),
-            );
-            sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
-                r#type: Some(warp_multi_agent_api::response_event::Type::Finished(
-                    warp_multi_agent_api::response_event::StreamFinished {
-                        reason: Some(
-                            warp_multi_agent_api::response_event::stream_finished::Reason::Done(
-                                warp_multi_agent_api::response_event::stream_finished::Done {},
-                            ),
-                        ),
-                        conversation_usage_metadata: Some(
-                            warp_multi_agent_api::response_event::stream_finished::ConversationUsageMetadata {
-                                context_window_usage: 0.05, // minimal after compaction
-                                summarized: true,
-                                ..Default::default()
-                            },
-                        ),
-                        ..Default::default()
-                    },
-                )),
-            }));
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/event-stream")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from(sse_body))
-                .unwrap();
-        }
-    }
-
-    // Add new user query (if present)
-    if let Some(ref q) = user_query {
-        if !q.is_empty() {
-            openai_messages.push(json!({ "role": "user", "content": q }));
-        }
-    }
-
-    // Add tool results from current request input
-    for (tool_call_id, result_text) in &tool_results {
-        openai_messages.push(json!({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": result_text
-        }));
-    }
-    for message in &received_agent_messages {
-        openai_messages.push(json!({
-            "role": "user",
-            "content": message
-        }));
-    }
-
-    // Handle other input types as user messages
-    if user_query.is_none()
-        && tool_results.is_empty()
-        && received_agent_messages.is_empty()
-        && !is_summarize_request(&request)
-    {
-        if let Some(input) = request.input.as_ref().and_then(|i| i.r#type.as_ref()) {
-            let extra_input = match input {
-                warp_multi_agent_api::request::input::Type::ResumeConversation(_) => {
-                    Some("(Conversation resumed)".to_string())
-                }
-                warp_multi_agent_api::request::input::Type::CodeReview(cr) => {
-                    // Extract diff hunks from the CodeReview input
-                    let mut review_text =
-                        String::from("Please review the following code changes:\n\n");
-                    if let Some(warp_multi_agent_api::request::input::code_review::Operation::InitialReviewComments(irc)) = &cr.operation {
-                        if let Some(diff_set) = &irc.diff_set {
-                            for hunk in &diff_set.hunks {
-                                review_text.push_str(&format!("=== {} (lines +{} -{}) ===\n{}\n\n",
-                                    hunk.file_path, hunk.lines_added, hunk.lines_removed, hunk.diff_content));
-                            }
-                        }
-                        if !irc.review_comments.is_empty() {
-                            review_text.push_str("Existing review comments:\n");
-                            for c in &irc.review_comments {
-                                review_text.push_str(&format!("- {}\n", c.comment));
-                            }
-                        }
-                    }
-                    Some(review_text)
-                }
-                warp_multi_agent_api::request::input::Type::AutoCodeDiffQuery(q) => {
-                    Some(format!("Auto code diff: {}", q.query))
-                }
-                warp_multi_agent_api::request::input::Type::InvokeSkill(_s) => {
-                    Some("Invoke skill.".to_string())
-                }
-                warp_multi_agent_api::request::input::Type::CreateNewProject(p) => {
-                    Some(format!("Create new project: {}", p.query))
-                }
-                warp_multi_agent_api::request::input::Type::InitProjectRules(_) => {
-                    Some("Initialize project rules.".to_string())
-                }
-                warp_multi_agent_api::request::input::Type::FetchReviewComments(fr) => {
-                    Some(format!("Fetch review comments for: {}", fr.repo_path))
-                }
-                _ => None,
-            };
-            if let Some(msg) = extra_input {
-                openai_messages.push(json!({ "role": "user", "content": msg }));
+                let mut sse_body = String::new();
+                sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
+                    r#type: Some(warp_multi_agent_api::response_event::Type::Init(
+                        warp_multi_agent_api::response_event::StreamInit {
+                            conversation_id: conversation_id.clone(),
+                            request_id: request_id.clone(),
+                            run_id: run_id.clone(),
+                        },
+                    )),
+                }));
+                emit_conversation_summary(
+                    &mut sse_body,
+                    &task_id,
+                    &request_id,
+                    &result.summary,
+                    compaction_started.elapsed(),
+                );
+                sse_body.push_str(&sse_line(&finished_event(usage, &backend_model)));
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .body(Body::from(sse_body))
+                    .unwrap();
+            }
+            Err(error) => {
+                tracing::warn!("explicit conversation compaction failed");
+                return compaction_failure_response(
+                    &conversation_id,
+                    &run_id,
+                    &request_id,
+                    &task_id,
+                    &error,
+                );
             }
         }
     }
 
-    // Auto-summarize if context is getting large (>75% of estimated window)
-    let estimated_tokens: usize = openai_messages
+    let (history_to_compact, current_turn) =
+        split_history_for_compaction(&openai_messages, current_turn);
+    let retry_history = history_to_compact.clone();
+    let retry_current_turn = current_turn.clone();
+    let estimated_history_tokens = estimated_token_count(&history_to_compact);
+    let previous_context_tokens = state
+        .conversation_context_tokens(&task_id)
+        .map(|tokens| tokens.max(estimated_history_tokens))
+        .unwrap_or(estimated_history_tokens);
+    let current_turn_tokens = estimated_token_count(&current_turn);
+    let projected_context_tokens = previous_context_tokens.saturating_add(current_turn_tokens);
+    let auto_summarize_threshold = context_window_tokens.saturating_mul(3) / 4;
+    let can_compact = history_to_compact
         .iter()
-        .map(|m| m.to_string().len() / 4) // rough estimate: 4 chars per token
-        .sum();
-    const AUTO_SUMMARIZE_THRESHOLD: usize = 96_000; // 75% of 128k
-    if estimated_tokens > AUTO_SUMMARIZE_THRESHOLD {
+        .any(|message| message["role"] != "system");
+    let mut compacted_this_turn = false;
+    let mut compaction_request_usage = None;
+    let mut compaction_summary = None;
+    if can_compact
+        && should_auto_compact(
+            previous_context_tokens,
+            current_turn_tokens,
+            context_window_tokens,
+        )
+    {
         tracing::info!(
-            estimated_tokens,
-            "auto-summarizing conversation (>75% context)"
+            previous_context_tokens,
+            projected_context_tokens,
+            auto_summarize_threshold,
+            "automatically compacting conversation"
         );
-        let summary_text = openai_messages
-            .iter()
-            .filter(|m| m["role"] != "system")
-            .map(|m| {
-                let role = m["role"].as_str().unwrap_or("?");
-                let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                format!("[{role}] {}", &content[..content.len().min(500)])
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let summary_msgs = vec![
-            json!({ "role": "system", "content": "Summarize this conversation concisely. Keep key facts, file paths, decisions, and tool results." }),
-            json!({ "role": "user", "content": summary_text }),
-        ];
-        if let Ok(LlmResult {
-            response: LlmResponse::Text(ref summary),
-            ..
-        }) = call_backend_with_tools(
+        let compaction_started = Instant::now();
+        match compact_history(
             &state,
             &backend_config,
-            &summary_msgs,
-            false,
             &backend_model,
             &available_tools,
+            &history_to_compact,
+            context_window_tokens,
+            None,
         )
         .await
         {
-            openai_messages = vec![
-                openai_messages[0].clone(),
-                json!({ "role": "assistant", "content": format!("[Auto-compacted summary]\n{summary}") }),
-            ];
-            state.save_conversation(&task_id, &openai_messages);
+            Ok(result) => {
+                compaction_summary = Some((result.summary.clone(), compaction_started.elapsed()));
+                openai_messages = result.messages;
+                compacted_this_turn = true;
+                compaction_request_usage = result.request_usage;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "automatic conversation compaction failed; continuing with original context"
+                );
+                openai_messages = history_to_compact;
+            }
         }
+    } else {
+        openai_messages = history_to_compact;
+    }
+    openai_messages.extend(current_turn);
+    if compacted_this_turn {
+        state.save_conversation(&task_id, &openai_messages);
+        state.record_conversation_context_tokens(&task_id, estimated_token_count(&openai_messages));
     }
 
-    // Patch orphaned tool_calls for the LLM call only (not persisted).
-    // If a user typed a message before a tool result arrived, the cache has
-    // [assistant(tool_call), user(msg)] with no tool result. OpenAI rejects
-    // this. We create a patched copy with placeholders for the LLM, but keep
-    // the real cache clean so the actual tool result can arrive later.
-    let llm_messages = {
-        let mut patched = openai_messages.clone();
-        let mut i = 0;
-        while i < patched.len() {
-            if let Some(tcs) = patched[i].get("tool_calls").and_then(|v| v.as_array()) {
-                let needed: std::collections::HashSet<String> = tcs
-                    .iter()
-                    .filter_map(|t| t["id"].as_str().map(String::from))
-                    .collect();
-                let mut found = std::collections::HashSet::new();
-                let mut j = i + 1;
-                while j < patched.len() && patched[j]["role"] == "tool" {
-                    if let Some(id) = patched[j]["tool_call_id"].as_str() {
-                        found.insert(id.to_string());
-                    }
-                    j += 1;
-                }
-                let missing: Vec<String> = needed.difference(&found).cloned().collect();
-                for (offset, id) in missing.iter().enumerate() {
-                    patched.insert(
-                        j + offset,
-                        json!({
-                        "role": "tool",
-                        "tool_call_id": id,
-                        "content": "(cancelled by user)"
-                        }),
-                    );
-                }
-            }
-            i += 1;
-        }
-        patched
-    };
+    // Patch orphaned tool calls for the backend request only. The persisted cache
+    // remains unchanged so a real result can still arrive on a later turn.
+    let mut llm_messages = patch_orphaned_tool_calls(&openai_messages);
 
     // Count tool call rounds for the max-rounds limit
     const MAX_TOOL_ROUNDS: u32 = 200;
@@ -2353,7 +2624,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
         .filter(|m| m.get("tool_calls").is_some())
         .count() as u32;
 
-    let send_tools = prior_tool_rounds < MAX_TOOL_ROUNDS;
+    let mut send_tools = prior_tool_rounds < MAX_TOOL_ROUNDS;
     if !send_tools {
         tracing::warn!(
             prior_rounds = prior_tool_rounds,
@@ -2362,7 +2633,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
         );
     }
 
-    let llm_result = call_backend_streaming(
+    let mut llm_result = call_backend_streaming(
         &state,
         &backend_config,
         &llm_messages,
@@ -2371,6 +2642,68 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
         &available_tools,
     )
     .await;
+    let backend_rejected_context = match &llm_result {
+        Err(error) => is_context_window_error(error),
+        Ok(StreamingLlmResult::TextStream { .. } | StreamingLlmResult::ToolCalls(..)) => false,
+    };
+    if !compacted_this_turn && can_compact && backend_rejected_context {
+        tracing::warn!("backend rejected context; compacting and retrying once");
+        let compaction_started = Instant::now();
+        match compact_history(
+            &state,
+            &backend_config,
+            &backend_model,
+            &available_tools,
+            &retry_history,
+            context_window_tokens,
+            None,
+        )
+        .await
+        {
+            Ok(result) => {
+                compaction_summary = Some((result.summary.clone(), compaction_started.elapsed()));
+                openai_messages = result.messages;
+                openai_messages.extend(retry_current_turn);
+                compacted_this_turn = true;
+                compaction_request_usage = result.request_usage;
+                state.save_conversation(&task_id, &openai_messages);
+                state.record_conversation_context_tokens(
+                    &task_id,
+                    estimated_token_count(&openai_messages),
+                );
+                llm_messages = patch_orphaned_tool_calls(&openai_messages);
+                send_tools = llm_messages
+                    .iter()
+                    .filter(|message| message.get("tool_calls").is_some())
+                    .count()
+                    < MAX_TOOL_ROUNDS as usize;
+                llm_result = call_backend_streaming(
+                    &state,
+                    &backend_config,
+                    &llm_messages,
+                    send_tools,
+                    &backend_model,
+                    &available_tools,
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!("context recovery compaction failed");
+                state.save_conversation(&task_id, &openai_messages);
+                state.record_conversation_context_tokens(
+                    &task_id,
+                    estimated_token_count(&openai_messages),
+                );
+                return compaction_failure_response(
+                    &conversation_id,
+                    &run_id,
+                    &request_id,
+                    &task_id,
+                    &error,
+                );
+            }
+        }
+    }
 
     let mut sse_body = String::new();
 
@@ -2384,6 +2717,9 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
             },
         )),
     }));
+    if let Some((summary, duration)) = compaction_summary.as_ref() {
+        emit_conversation_summary(&mut sse_body, &task_id, &request_id, summary, *duration);
+    }
 
     // CreateTask + echo user query (first turn only)
     if !is_continuation {
@@ -2441,7 +2777,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
     }
 
     let context_usage = match llm_result {
-        Ok(StreamingLlmResult::TextStream(text_rx)) => {
+        Ok(StreamingLlmResult::TextStream { text_rx, usage_rx }) => {
             let (output_tx, output_rx) = mpsc::channel(32);
             let _ = output_tx.send(Ok(Bytes::from(sse_body))).await;
 
@@ -2457,6 +2793,8 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
             let request_id = request_id.clone();
             let parent_agent_id = parent_agent_id.clone();
             let agent_name = agent_name.clone();
+            let backend_model = backend_model.clone();
+            let compaction_request_usage = compaction_request_usage;
             tokio::spawn(async move {
                 let mut text_rx = text_rx;
                 let mut openai_messages = openai_messages;
@@ -2496,7 +2834,11 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
                     }
                 }
 
-                openai_messages.push(json!({ "role": "assistant", "content": accumulated }));
+                let persisted_content = persisted_assistant_content(&accumulated);
+                openai_messages.push(json!({
+                    "role": "assistant",
+                    "content": persisted_content
+                }));
                 state.save_conversation(&task_id, &openai_messages);
                 forward_terminal_child_result(
                     &state,
@@ -2506,9 +2848,26 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
                     &openai_messages,
                 );
 
+                let token_usage = usage_rx.await.unwrap_or_default();
+                let mut usage =
+                    completion_usage(token_usage, &openai_messages, context_window_tokens);
+                usage = include_additional_request_usage(usage, compaction_request_usage);
+                usage.summarized = compacted_this_turn;
+                state.record_conversation_context_tokens(&task_id, usage.context_tokens_used);
+                if let Some(tokens) = usage.tokens {
+                    tracing::info!(
+                        model = %backend_model,
+                        input_tokens = tokens.input,
+                        output_tokens = tokens.output,
+                        cached_input_tokens = tokens.input_cache_read,
+                        total_tokens = tokens.total(),
+                        context_window_tokens,
+                        context_window_usage = usage.context_window_usage,
+                        "backend token usage"
+                    );
+                }
                 if !client_closed {
-                    let context_usage = estimate_context_usage_from_messages(&openai_messages);
-                    let _ = send_sse_event(&output_tx, finished_event(context_usage)).await;
+                    let _ = send_sse_event(&output_tx, finished_event(usage, &backend_model)).await;
                 }
             });
 
@@ -2519,7 +2878,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
                 .body(Body::from_stream(ReceiverStream::new(output_rx)))
                 .unwrap();
         }
-        Ok(StreamingLlmResult::ToolCalls(tool_calls, context_usage)) => {
+        Ok(StreamingLlmResult::ToolCalls(tool_calls, token_usage)) => {
             // Save ALL tool_calls in a SINGLE assistant message.
             // OpenAI requires all tool_calls from one response to be in one message.
             let tc_entries: Vec<serde_json::Value> = tool_calls
@@ -2572,20 +2931,48 @@ pub async fn handle(State(state): State<Arc<AppState>>, body: Bytes) -> impl Int
                     }));
                 }
             }
-            context_usage
+            let mut usage = completion_usage(token_usage, &openai_messages, context_window_tokens);
+            usage = include_additional_request_usage(usage, compaction_request_usage);
+            usage.summarized = compacted_this_turn;
+            state.record_conversation_context_tokens(&task_id, usage.context_tokens_used);
+            usage
         }
         Err(e) => {
-            tracing::error!("Backend call failed: {e}");
+            tracing::error!("backend call failed");
+            if is_context_window_error(&e) {
+                state.save_conversation(&task_id, &openai_messages);
+                state.record_conversation_context_tokens(
+                    &task_id,
+                    estimated_token_count(&openai_messages),
+                );
+                emit_agent_output(
+                    &mut sse_body,
+                    &task_id,
+                    &request_id,
+                    "Input exceeded the model context window after compaction.",
+                );
+                sse_body.push_str(&sse_line(&context_window_exceeded_event()));
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .body(Body::from(sse_body))
+                    .unwrap();
+            }
             openai_messages.push(json!({ "role": "assistant", "content": format!("Error: {e}") }));
             emit_agent_output(&mut sse_body, &task_id, &request_id, &format!("Error: {e}"));
-            estimate_context_usage_from_messages(&openai_messages)
+            let mut usage = completion_usage(None, &openai_messages, context_window_tokens);
+            usage = include_additional_request_usage(usage, compaction_request_usage);
+            usage.summarized = compacted_this_turn;
+            state.record_conversation_context_tokens(&task_id, usage.context_tokens_used);
+            usage
         }
     };
 
     // Persist conversation to disk
     state.save_conversation(&task_id, &openai_messages);
 
-    sse_body.push_str(&sse_line(&finished_event(context_usage)));
+    sse_body.push_str(&sse_line(&finished_event(context_usage, &backend_model)));
 
     Response::builder()
         .status(StatusCode::OK)
@@ -2673,7 +3060,39 @@ fn agent_output_append_event(
     }
 }
 
-fn finished_event(context_usage: f32) -> warp_multi_agent_api::ResponseEvent {
+#[allow(deprecated)]
+fn finished_event(usage: CompletionUsage, model: &str) -> warp_multi_agent_api::ResponseEvent {
+    let token_usage = usage
+        .tokens
+        .map(|tokens| {
+            vec![
+                warp_multi_agent_api::response_event::stream_finished::TokenUsage {
+                    model_id: model.to_string(),
+                    total_input: tokens.input,
+                    output: tokens.output,
+                    input_cache_read: tokens.input_cache_read,
+                    input_cache_write: tokens.input_cache_write,
+                    cost_in_cents: 0.0,
+                },
+            ]
+        })
+        .unwrap_or_default();
+    let byok_token_usage = usage
+        .tokens
+        .map(|tokens| {
+            HashMap::from([(
+                model.to_string(),
+                warp_multi_agent_api::response_event::stream_finished::ModelTokenUsage {
+                    model_id: model.to_string(),
+                    total_tokens: tokens.total(),
+                    token_usage_by_category: HashMap::from([(
+                        "primary_agent".to_string(),
+                        tokens.total(),
+                    )]),
+                },
+            )])
+        })
+        .unwrap_or_default();
     warp_multi_agent_api::ResponseEvent {
         r#type: Some(warp_multi_agent_api::response_event::Type::Finished(
             warp_multi_agent_api::response_event::StreamFinished {
@@ -2684,10 +3103,14 @@ fn finished_event(context_usage: f32) -> warp_multi_agent_api::ResponseEvent {
                 ),
                 conversation_usage_metadata: Some(
                     warp_multi_agent_api::response_event::stream_finished::ConversationUsageMetadata {
-                        context_window_usage: context_usage,
+                        context_window_usage: usage.context_window_usage,
+                        total_input_tokens: usage.tokens.map(|tokens| tokens.input).unwrap_or_default(),
+                        byok_token_usage,
+                        summarized: usage.summarized,
                         ..Default::default()
                     },
                 ),
+                token_usage,
                 ..Default::default()
             },
         )),
@@ -2704,6 +3127,114 @@ fn emit_agent_output(sse_body: &mut String, task_id: &str, request_id: &str, tex
     )));
 }
 
+fn emit_conversation_summary(
+    sse_body: &mut String,
+    task_id: &str,
+    request_id: &str,
+    summary: &str,
+    duration: std::time::Duration,
+) {
+    let token_count = (summary.len() / 4).min(i32::MAX as usize) as i32;
+    sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
+        r#type: Some(warp_multi_agent_api::response_event::Type::ClientActions(
+            warp_multi_agent_api::response_event::ClientActions {
+                actions: vec![warp_multi_agent_api::ClientAction {
+                    action: Some(
+                        warp_multi_agent_api::client_action::Action::AddMessagesToTask(
+                            warp_multi_agent_api::client_action::AddMessagesToTask {
+                                task_id: task_id.to_string(),
+                                messages: vec![warp_multi_agent_api::Message {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    task_id: task_id.to_string(),
+                                    request_id: request_id.to_string(),
+                                    timestamp: Some(current_timestamp()),
+                                    message: Some(
+                                        warp_multi_agent_api::message::Message::Summarization(
+                                            warp_multi_agent_api::message::Summarization {
+                                                finished_duration: Some(prost_types::Duration {
+                                                    seconds: duration.as_secs() as i64,
+                                                    nanos: duration.subsec_nanos() as i32,
+                                                }),
+                                                summary_type: Some(
+                                                    warp_multi_agent_api::message::summarization::SummaryType::ConversationSummary(
+                                                        warp_multi_agent_api::message::summarization::ConversationSummary {
+                                                            summary: summary.to_string(),
+                                                            token_count,
+                                                        },
+                                                    ),
+                                                ),
+                                            },
+                                        ),
+                                    ),
+                                    ..Default::default()
+                                }],
+                            },
+                        ),
+                    ),
+                }],
+            },
+        )),
+    }));
+}
+
+fn compaction_failure_response(
+    conversation_id: &str,
+    run_id: &str,
+    request_id: &str,
+    task_id: &str,
+    error: &anyhow::Error,
+) -> Response<Body> {
+    let mut sse_body = String::new();
+    sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
+        r#type: Some(warp_multi_agent_api::response_event::Type::Init(
+            warp_multi_agent_api::response_event::StreamInit {
+                conversation_id: conversation_id.to_string(),
+                request_id: request_id.to_string(),
+                run_id: run_id.to_string(),
+            },
+        )),
+    }));
+    emit_agent_output(
+        &mut sse_body,
+        task_id,
+        request_id,
+        &format!("Conversation compaction failed: {error:#}"),
+    );
+    sse_body.push_str(&sse_line(&warp_multi_agent_api::ResponseEvent {
+        r#type: Some(warp_multi_agent_api::response_event::Type::Finished(
+            warp_multi_agent_api::response_event::StreamFinished {
+                reason: Some(
+                    warp_multi_agent_api::response_event::stream_finished::Reason::Other(
+                        Default::default(),
+                    ),
+                ),
+                ..Default::default()
+            },
+        )),
+    }));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(sse_body))
+        .unwrap()
+}
+
+fn context_window_exceeded_event() -> warp_multi_agent_api::ResponseEvent {
+    warp_multi_agent_api::ResponseEvent {
+        r#type: Some(warp_multi_agent_api::response_event::Type::Finished(
+            warp_multi_agent_api::response_event::StreamFinished {
+                reason: Some(
+                    warp_multi_agent_api::response_event::stream_finished::Reason::ContextWindowExceeded(
+                        Default::default(),
+                    ),
+                ),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
 // ── LLM backend ──────────────────────────────────────────────────────
 
 enum LlmResponse {
@@ -2711,15 +3242,89 @@ enum LlmResponse {
     ToolCalls(()),
 }
 
+#[derive(Debug)]
+struct BackendHttpError {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for BackendHttpError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Backend returned {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for BackendHttpError {}
+
+fn is_context_window_error(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<BackendHttpError>() else {
+        return false;
+    };
+    let body = error.body.to_ascii_lowercase();
+    matches!(
+        error.status,
+        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE
+    ) && [
+        "context_length_exceeded",
+        "maximum context length",
+        "context window",
+        "too many tokens",
+        "token limit",
+    ]
+    .iter()
+    .any(|pattern| body.contains(pattern))
+}
+
 struct LlmResult {
     response: LlmResponse,
-    /// Fraction of context window used (0.0–1.0), from usage data.
-    _context_usage: f32,
+    usage: Option<BackendTokenUsage>,
 }
 
 enum StreamingLlmResult {
-    TextStream(mpsc::Receiver<String>),
-    ToolCalls(Vec<serde_json::Value>, f32),
+    TextStream {
+        text_rx: mpsc::Receiver<String>,
+        usage_rx: oneshot::Receiver<Option<BackendTokenUsage>>,
+    },
+    ToolCalls(Vec<serde_json::Value>, Option<BackendTokenUsage>),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BackendTokenUsage {
+    input: u32,
+    output: u32,
+    input_cache_read: u32,
+    input_cache_write: u32,
+    reported_total: u32,
+}
+
+impl BackendTokenUsage {
+    fn total(self) -> u32 {
+        if self.reported_total > 0 {
+            self.reported_total
+        } else {
+            self.input.saturating_add(self.output)
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        Self {
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            input_cache_read: self.input_cache_read.saturating_add(other.input_cache_read),
+            input_cache_write: self
+                .input_cache_write
+                .saturating_add(other.input_cache_write),
+            reported_total: self.total().saturating_add(other.total()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CompletionUsage {
+    context_window_usage: f32,
+    context_tokens_used: u32,
+    tokens: Option<BackendTokenUsage>,
+    summarized: bool,
 }
 
 #[derive(Default)]
@@ -2733,6 +3338,15 @@ struct PartialToolCall {
 #[derive(Default)]
 struct StreamToolCallAccumulator {
     tool_calls: BTreeMap<usize, PartialToolCall>,
+}
+
+#[derive(Default)]
+struct BackendStreamState {
+    pending_text: Vec<String>,
+    tool_calls: StreamToolCallAccumulator,
+    token_usage: Option<BackendTokenUsage>,
+    saw_tool_calls: bool,
+    in_reasoning: bool,
 }
 
 impl StreamToolCallAccumulator {
@@ -2775,15 +3389,108 @@ impl StreamToolCallAccumulator {
 
 enum BackendStreamDecision {
     Text,
-    ToolCalls(Vec<serde_json::Value>),
+    ToolCalls(Vec<serde_json::Value>, Option<BackendTokenUsage>),
 }
 
-fn estimate_context_usage_from_messages(messages: &[serde_json::Value]) -> f32 {
-    let estimated_tokens: usize = messages
+fn effective_context_window_tokens(request: &warp_multi_agent_api::Request, model: &str) -> u32 {
+    let model_limit = model_context_window_tokens(model);
+    request
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.model_config.as_ref())
+        .map(|model_config| model_config.base_model_context_window_limit)
+        .filter(|limit| *limit > 0)
+        .map(|limit| limit.min(model_limit))
+        .unwrap_or(model_limit)
+}
+
+fn estimate_context_usage_from_messages(
+    messages: &[serde_json::Value],
+    context_window_tokens: u32,
+) -> f32 {
+    (estimated_token_count(messages) as f32 / context_window_tokens.max(1) as f32).min(1.0)
+}
+
+fn estimated_token_count(messages: &[serde_json::Value]) -> u32 {
+    messages
         .iter()
         .map(|message| message.to_string().len() / 4)
-        .sum();
-    (estimated_tokens as f32 / 128_000.0).min(1.0)
+        .sum::<usize>()
+        .min(u32::MAX as usize) as u32
+}
+
+fn json_u32(value: Option<&serde_json::Value>) -> u32 {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+        .min(u64::from(u32::MAX)) as u32
+}
+
+fn backend_token_usage(chunk: &serde_json::Value) -> Option<BackendTokenUsage> {
+    let usage = chunk.get("usage")?.as_object()?;
+    let input = json_u32(
+        usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens")),
+    );
+    let output = json_u32(
+        usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens")),
+    );
+    let input_details = usage
+        .get("prompt_tokens_details")
+        .or_else(|| usage.get("input_tokens_details"));
+    let input_cache_read = json_u32(
+        input_details
+            .and_then(serde_json::Value::as_object)
+            .and_then(|details| details.get("cached_tokens")),
+    );
+    let input_cache_write = json_u32(
+        input_details
+            .and_then(serde_json::Value::as_object)
+            .and_then(|details| details.get("cache_creation_tokens")),
+    );
+    let reported_total = json_u32(usage.get("total_tokens"));
+    let tokens = BackendTokenUsage {
+        input,
+        output,
+        input_cache_read,
+        input_cache_write,
+        reported_total,
+    };
+    (tokens.total() > 0).then_some(tokens)
+}
+
+fn completion_usage(
+    tokens: Option<BackendTokenUsage>,
+    messages: &[serde_json::Value],
+    context_window_tokens: u32,
+) -> CompletionUsage {
+    let context_tokens_used =
+        tokens.map_or_else(|| estimated_token_count(messages), BackendTokenUsage::total);
+    let context_window_usage = tokens.map_or_else(
+        || estimate_context_usage_from_messages(messages, context_window_tokens),
+        |tokens| (tokens.total() as f32 / context_window_tokens.max(1) as f32).clamp(0.0, 1.0),
+    );
+    CompletionUsage {
+        context_window_usage,
+        context_tokens_used,
+        tokens,
+        summarized: false,
+    }
+}
+
+fn include_additional_request_usage(
+    mut usage: CompletionUsage,
+    additional: Option<BackendTokenUsage>,
+) -> CompletionUsage {
+    usage.tokens = match (usage.tokens, additional) {
+        (Some(current), Some(additional)) => Some(current.merge(additional)),
+        (None, Some(additional)) => Some(additional),
+        (current, None) => current,
+    };
+    usage
 }
 
 fn drain_sse_line(buffer: &mut Vec<u8>) -> Option<String> {
@@ -2843,10 +3550,7 @@ async fn handle_backend_stream_line(
     line: &str,
     text_tx: &mpsc::Sender<String>,
     decision_tx: &mut Option<oneshot::Sender<Result<BackendStreamDecision, anyhow::Error>>>,
-    pending_text: &mut Vec<String>,
-    tool_calls: &mut StreamToolCallAccumulator,
-    saw_tool_calls: &mut bool,
-    in_reasoning: &mut bool,
+    stream_state: &mut BackendStreamState,
 ) -> Result<bool, anyhow::Error> {
     let Some(data) = line.strip_prefix("data:") else {
         return Ok(true);
@@ -2861,6 +3565,9 @@ async fn handle_backend_stream_line(
     }
 
     let chunk: serde_json::Value = serde_json::from_str(data)?;
+    if let Some(usage) = backend_token_usage(&chunk) {
+        stream_state.token_usage = Some(usage);
+    }
     let Some(choice) = chunk["choices"]
         .as_array()
         .and_then(|choices| choices.first())
@@ -2876,9 +3583,9 @@ async fn handle_backend_stream_line(
             );
             return Ok(true);
         }
-        *saw_tool_calls = true;
-        pending_text.clear();
-        tool_calls.push_chunk(tool_call_chunks);
+        stream_state.saw_tool_calls = true;
+        stream_state.pending_text.clear();
+        stream_state.tool_calls.push_chunk(tool_call_chunks);
         return Ok(true);
     }
 
@@ -2886,21 +3593,28 @@ async fn handle_backend_stream_line(
     // before the final answer in "content". Stream them to the UI wrapped
     // in a blockquote so the user can distinguish reasoning from the answer.
     if let Some(reasoning) = delta["reasoning_content"].as_str() {
-        if !reasoning.is_empty() && !*saw_tool_calls {
-            if !*in_reasoning {
-                *in_reasoning = true;
+        if !reasoning.is_empty() && !stream_state.saw_tool_calls {
+            if !stream_state.in_reasoning {
+                stream_state.in_reasoning = true;
                 if !queue_text_chunk(
                     "<details><summary>💭 Thinking...</summary>\n\n".to_string(),
                     text_tx,
                     decision_tx,
-                    pending_text,
+                    &mut stream_state.pending_text,
                 )
                 .await
                 {
                     return Ok(false);
                 }
             }
-            if !queue_text_chunk(reasoning.to_string(), text_tx, decision_tx, pending_text).await {
+            if !queue_text_chunk(
+                reasoning.to_string(),
+                text_tx,
+                decision_tx,
+                &mut stream_state.pending_text,
+            )
+            .await
+            {
                 return Ok(false);
             }
             return Ok(true);
@@ -2912,25 +3626,31 @@ async fn handle_backend_stream_line(
         if content.is_empty() {
             return Ok(true);
         }
-        if *saw_tool_calls {
+        if stream_state.saw_tool_calls {
             // Content after tool_calls is unusual; skip it
             return Ok(true);
         }
-        if *in_reasoning {
-            *in_reasoning = false;
+        if stream_state.in_reasoning {
+            stream_state.in_reasoning = false;
             if !queue_text_chunk(
                 "\n\n</details>\n\n".to_string(),
                 text_tx,
                 decision_tx,
-                pending_text,
+                &mut stream_state.pending_text,
             )
             .await
             {
                 return Ok(false);
             }
         }
-        if !queue_text_chunk(content.to_string(), text_tx, decision_tx, pending_text).await
-            || !commit_text_stream(text_tx, decision_tx, pending_text).await
+        if !queue_text_chunk(
+            content.to_string(),
+            text_tx,
+            decision_tx,
+            &mut stream_state.pending_text,
+        )
+        .await
+            || !commit_text_stream(text_tx, decision_tx, &mut stream_state.pending_text).await
         {
             return Ok(false);
         }
@@ -2968,6 +3688,9 @@ async fn call_backend_streaming(
         "stream": true
     });
 
+    if matches!(config.backend_auth_style, AuthStyle::AzureApiKey) {
+        payload["stream_options"] = json!({ "include_usage": true });
+    }
     if send_tools {
         payload["tools"] = tools.clone();
     }
@@ -2984,23 +3707,18 @@ async fn call_backend_streaming(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Backend returned {status}: {body}");
+        return Err(BackendHttpError { status, body }.into());
     }
 
-    let estimated_context_usage = estimate_context_usage_from_messages(messages);
-    // Large buffer so text can be buffered while we wait for the stream to
-    // finish before committing the Text-vs-ToolCalls decision.
     let (text_tx, text_rx) = mpsc::channel(4096);
     let (decision_tx, decision_rx) = oneshot::channel();
+    let (usage_tx, usage_rx) = oneshot::channel();
 
     tokio::spawn(async move {
         let mut resp = resp;
         let mut decision_tx = Some(decision_tx);
         let mut buffer = Vec::new();
-        let mut pending_text = Vec::new();
-        let mut tool_calls = StreamToolCallAccumulator::default();
-        let mut saw_tool_calls = false;
-        let mut in_reasoning = false;
+        let mut stream_state = BackendStreamState::default();
 
         let read_result: Result<(), anyhow::Error> = async {
             while let Some(chunk) = resp.chunk().await? {
@@ -3010,10 +3728,7 @@ async fn call_backend_streaming(
                         &line,
                         &text_tx,
                         &mut decision_tx,
-                        &mut pending_text,
-                        &mut tool_calls,
-                        &mut saw_tool_calls,
-                        &mut in_reasoning,
+                        &mut stream_state,
                     )
                     .await?
                     {
@@ -3027,10 +3742,7 @@ async fn call_backend_streaming(
                     &String::from_utf8_lossy(&buffer),
                     &text_tx,
                     &mut decision_tx,
-                    &mut pending_text,
-                    &mut tool_calls,
-                    &mut saw_tool_calls,
-                    &mut in_reasoning,
+                    &mut stream_state,
                 )
                 .await?
             {
@@ -3043,31 +3755,39 @@ async fn call_backend_streaming(
 
         match read_result {
             Ok(()) => {
-                if saw_tool_calls {
+                if stream_state.saw_tool_calls {
                     if let Some(tx) = decision_tx.take() {
                         let _ = tx.send(Ok(BackendStreamDecision::ToolCalls(
-                            tool_calls.into_tool_calls(),
+                            stream_state.tool_calls.into_tool_calls(),
+                            stream_state.token_usage,
                         )));
                     }
                 } else {
-                    if in_reasoning
+                    if stream_state.in_reasoning
                         && !queue_text_chunk(
                             "\n\n</details>\n\n".to_string(),
                             &text_tx,
                             &decision_tx,
-                            &mut pending_text,
+                            &mut stream_state.pending_text,
                         )
                         .await
                     {
                         return;
                     }
-                    let _ = commit_text_stream(&text_tx, &mut decision_tx, &mut pending_text).await;
+                    let _ = commit_text_stream(
+                        &text_tx,
+                        &mut decision_tx,
+                        &mut stream_state.pending_text,
+                    )
+                    .await;
+                    let _ = usage_tx.send(stream_state.token_usage);
                 }
             }
             Err(err) => {
                 if let Some(tx) = decision_tx.take() {
                     let _ = tx.send(Err(err));
                 } else {
+                    let _ = usage_tx.send(stream_state.token_usage);
                     tracing::error!(error = %err, "backend stream failed after text streaming started");
                 }
             }
@@ -3075,11 +3795,12 @@ async fn call_backend_streaming(
     });
 
     match decision_rx.await {
-        Ok(Ok(BackendStreamDecision::Text)) => Ok(StreamingLlmResult::TextStream(text_rx)),
-        Ok(Ok(BackendStreamDecision::ToolCalls(tool_calls))) => Ok(StreamingLlmResult::ToolCalls(
-            tool_calls,
-            estimated_context_usage,
-        )),
+        Ok(Ok(BackendStreamDecision::Text)) => {
+            Ok(StreamingLlmResult::TextStream { text_rx, usage_rx })
+        }
+        Ok(Ok(BackendStreamDecision::ToolCalls(tool_calls, token_usage))) => {
+            Ok(StreamingLlmResult::ToolCalls(tool_calls, token_usage))
+        }
         Ok(Err(err)) => Err(err),
         Err(_) => Err(anyhow::anyhow!(
             "backend stream ended before mode was determined"
@@ -3094,6 +3815,7 @@ async fn call_backend_with_tools(
     send_tools: bool,
     model: &str,
     tools: &serde_json::Value,
+    max_tokens: u32,
 ) -> Result<LlmResult, anyhow::Error> {
     let url = config.chat_completions_url_for_model(model);
 
@@ -3110,7 +3832,7 @@ async fn call_backend_with_tools(
     let mut payload = json!({
         "model": model,
         "messages": messages,
-        max_tokens_key: 16384,
+        max_tokens_key: max_tokens,
         "stream": false
     });
 
@@ -3122,6 +3844,7 @@ async fn call_backend_with_tools(
         .http
         .post(&url)
         .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(90))
         .json(&payload);
     req = apply_backend_auth(req, config);
 
@@ -3130,23 +3853,17 @@ async fn call_backend_with_tools(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Backend returned {status}: {body}");
+        return Err(BackendHttpError { status, body }.into());
     }
 
     let response_json: serde_json::Value = resp.json().await?;
     let choice = &response_json["choices"][0];
     let message = &choice["message"];
 
-    // Estimate context window usage from token counts
+    let token_usage = backend_token_usage(&response_json);
     let prompt_tokens = response_json["usage"]["prompt_tokens"]
         .as_f64()
         .unwrap_or(0.0);
-    let total_tokens = response_json["usage"]["total_tokens"]
-        .as_f64()
-        .unwrap_or(0.0);
-    // Common context windows: 128k for most models, use total_tokens/128000 as estimate
-    let context_limit = 128_000.0_f64;
-    let context_usage = (total_tokens / context_limit).min(1.0) as f32;
 
     if let Some(tool_calls) = message["tool_calls"].as_array() {
         if !tool_calls.is_empty() {
@@ -3157,24 +3874,39 @@ async fn call_backend_with_tools(
             );
             return Ok(LlmResult {
                 response: LlmResponse::ToolCalls(()),
-                _context_usage: context_usage,
+                usage: token_usage,
             });
         }
     }
 
     let text = message["content"]
         .as_str()
-        .unwrap_or("(no response)")
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("backend returned no summary content"))?
         .to_string();
     Ok(LlmResult {
         response: LlmResponse::Text(text),
-        _context_usage: context_usage,
+        usage: token_usage,
     })
 }
 
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+
+    fn decode_sse_events(body: &[u8]) -> Vec<warp_multi_agent_api::ResponseEvent> {
+        String::from_utf8_lossy(body)
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|encoded| {
+                let bytes = URL_SAFE
+                    .decode(encoded.trim_matches('"'))
+                    .expect("valid base64 response event");
+                warp_multi_agent_api::ResponseEvent::decode(bytes.as_slice())
+                    .expect("valid protobuf response event")
+            })
+            .collect()
+    }
 
     fn fallback_config() -> Config {
         Config {
@@ -3215,6 +3947,625 @@ mod streaming_tests {
         let (conversation_id, run_id) = stream_identity(&request, "task-1");
         assert_eq!(conversation_id, "conversation-1");
         assert_eq!(run_id, "task-1");
+    }
+
+    #[test]
+    fn context_window_uses_model_capability_and_profile_override() {
+        let request = warp_multi_agent_api::Request::default();
+        assert_eq!(
+            effective_context_window_tokens(&request, "DeepSeek-V4-Flash"),
+            128_000
+        );
+        assert_eq!(
+            effective_context_window_tokens(&request, "unknown-model"),
+            128_000
+        );
+
+        let request = warp_multi_agent_api::Request {
+            settings: Some(warp_multi_agent_api::request::Settings {
+                model_config: Some(warp_multi_agent_api::request::settings::ModelConfig {
+                    base_model_context_window_limit: 64_000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_context_window_tokens(&request, "DeepSeek-V4-Flash"),
+            64_000
+        );
+    }
+
+    #[test]
+    fn automatic_compaction_uses_previous_usage_plus_current_turn() {
+        assert!(!should_auto_compact(95_000, 1_000, 128_000));
+        assert!(should_auto_compact(95_000, 1_001, 128_000));
+    }
+
+    #[test]
+    fn compaction_preserves_the_current_user_query() {
+        let history = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "old question"}),
+            json!({"role": "assistant", "content": "old answer"}),
+        ];
+        let current_turn = vec![json!({"role": "user", "content": "current question"})];
+
+        let (history, current_turn) = split_history_for_compaction(&history, current_turn);
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(current_turn.len(), 1);
+        assert_eq!(current_turn[0]["content"], "current question");
+    }
+
+    #[test]
+    fn compaction_preserves_pending_tool_call_with_its_result() {
+        let history = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "run it"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "call-1", "function": {"name": "grep"}}]
+            }),
+        ];
+        let current_turn = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "result"
+        })];
+
+        let (history, current_turn) = split_history_for_compaction(&history, current_turn);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(current_turn.len(), 2);
+        assert_eq!(current_turn[0]["role"], "assistant");
+        assert_eq!(current_turn[1]["tool_call_id"], "call-1");
+    }
+
+    #[test]
+    fn tool_results_precede_a_simultaneous_user_query() {
+        let request = warp_multi_agent_api::Request::default();
+        let tool_results = vec![("call-1".to_string(), "result".to_string())];
+
+        let messages = current_turn_messages(&request, Some("next question"), &tool_results, &[]);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call-1");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "next question");
+    }
+
+    #[test]
+    fn explicit_compaction_preserves_a_trailing_tool_call() {
+        let history = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "run it"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "call-1", "function": {"name": "grep"}}]
+            }),
+        ];
+
+        let (history, pending) = split_trailing_pending_tool_call(&history);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["tool_calls"][0]["id"], "call-1");
+    }
+
+    #[test]
+    fn orphaned_tool_results_become_regular_context_messages() {
+        let messages = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "missing-call",
+                "content": "important result"
+            }),
+        ];
+
+        let patched = patch_orphaned_tool_calls(&messages);
+
+        assert_eq!(patched[1]["role"], "user");
+        assert_eq!(
+            patched[1]["content"],
+            "[Tool result missing-call]\nimportant result"
+        );
+    }
+
+    #[test]
+    fn reasoning_markup_is_not_replayed_in_future_context() {
+        let display = concat!(
+            "<details><summary>💭 Thinking...</summary>\n\n",
+            "private reasoning",
+            "\n\n</details>\n\n",
+            "final answer"
+        );
+
+        assert_eq!(persisted_assistant_content(display), "final answer");
+        assert_eq!(
+            persisted_assistant_content(
+                "<details><summary>💭 Thinking...</summary>\n\nunfinished\n\n</details>\n\n"
+            ),
+            "(Previous response ended during reasoning without a final answer.)"
+        );
+    }
+
+    #[test]
+    fn summary_chunking_preserves_unicode_content() {
+        let source = "αβγδεζηθ";
+
+        let chunks = split_summary_source(source, 6);
+
+        assert_eq!(chunks, vec!["αβγ", "δεζ", "ηθ"]);
+        assert_eq!(chunks.concat(), source);
+    }
+
+    #[tokio::test]
+    async fn oversized_history_is_compacted_hierarchically() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn summarize(State(calls): State<Arc<AtomicUsize>>) -> axum::Json<serde_json::Value> {
+            calls.fetch_add(1, Ordering::Relaxed);
+            axum::Json(json!({
+                "choices": [{"message": {"content": "summary"}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12
+                }
+            }))
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route("/v1/chat/completions", axum::routing::post(summarize))
+            .with_state(calls.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut config = fallback_config();
+        config.backend_base_url = format!("http://{address}/v1");
+        config.backend_auth_style = AuthStyle::None;
+        let state = AppState::new(config.clone(), vec![]);
+        let history = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "x".repeat(150)}),
+            json!({"role": "assistant", "content": "old answer"}),
+        ];
+
+        let result = compact_history(
+            &state,
+            &config,
+            "mock-model",
+            &json!([]),
+            &history,
+            32,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(
+            result.messages[1]["content"],
+            "[Compacted conversation summary]\nsummary"
+        );
+        assert!(calls.load(Ordering::Relaxed) > 1);
+        let usage = result.request_usage.unwrap();
+        assert!(usage.input > 10);
+        assert!(usage.output > 2);
+        assert!(usage.reported_total > usage.input);
+    }
+
+    #[tokio::test]
+    async fn compaction_rejects_a_missing_summary() {
+        async fn empty_summary() -> axum::Json<serde_json::Value> {
+            axum::Json(json!({
+                "choices": [{"message": {"content": null}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "total_tokens": 10
+                }
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route("/v1/chat/completions", axum::routing::post(empty_summary)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut config = fallback_config();
+        config.backend_base_url = format!("http://{address}/v1");
+        config.backend_auth_style = AuthStyle::None;
+        let state = AppState::new(config.clone(), vec![]);
+        let history = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "important history"}),
+        ];
+
+        let error = compact_history(
+            &state,
+            &config,
+            "mock-model",
+            &json!([]),
+            &history,
+            128_000,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "backend returned no summary content");
+    }
+
+    #[tokio::test]
+    async fn context_rejection_compacts_history_and_retries_current_query() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        struct BackendState {
+            calls: AtomicUsize,
+            requests: Mutex<Vec<serde_json::Value>>,
+        }
+
+        async fn backend(
+            State(state): State<Arc<BackendState>>,
+            axum::Json(request): axum::Json<serde_json::Value>,
+        ) -> Response<Body> {
+            let call = state.calls.fetch_add(1, Ordering::Relaxed);
+            state.requests.lock().unwrap().push(request);
+            match call {
+                0 => (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error": {
+                            "code": "context_length_exceeded",
+                            "message": "maximum context length exceeded"
+                        }
+                    })),
+                )
+                    .into_response(),
+                1 => axum::Json(json!({
+                    "choices": [{"message": {"content": "old history summary"}}],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 10,
+                        "total_tokens": 110
+                    }
+                }))
+                .into_response(),
+                _ => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"recovered answer\"}}]}\n\n",
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":200,",
+                        "\"completion_tokens\":20,\"total_tokens\":220}}\n\n",
+                        "data: [DONE]\n\n"
+                    )))
+                    .unwrap(),
+            }
+        }
+
+        let backend_state = Arc::new(BackendState {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route("/v1/chat/completions", axum::routing::post(backend))
+            .with_state(backend_state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut config = fallback_config();
+        config.backend_base_url = format!("http://{address}/v1");
+        config.backend_auth_style = AuthStyle::None;
+        config.default_model = "mock-model".to_string();
+        let state = Arc::new(AppState::new(config, vec!["mock-model".to_string()]));
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        state.register_conversation_task(&conversation_id, &task_id);
+        state.save_conversation(
+            &task_id,
+            &[
+                json!({"role": "system", "content": "system"}),
+                json!({"role": "user", "content": "old question"}),
+                json!({"role": "assistant", "content": "old answer"}),
+            ],
+        );
+        state.record_conversation_context_tokens(&task_id, 50_000);
+        let request = warp_multi_agent_api::Request {
+            task_context: Some(warp_multi_agent_api::request::TaskContext {
+                tasks: vec![warp_multi_agent_api::Task {
+                    id: task_id.clone(),
+                    ..Default::default()
+                }],
+            }),
+            input: Some(warp_multi_agent_api::request::Input {
+                r#type: Some(warp_multi_agent_api::request::input::Type::UserInputs(
+                    warp_multi_agent_api::request::input::UserInputs {
+                        inputs: vec![warp_multi_agent_api::request::input::user_inputs::UserInput {
+                            input: Some(
+                                warp_multi_agent_api::request::input::user_inputs::user_input::Input::UserQuery(
+                                    warp_multi_agent_api::request::input::UserQuery {
+                                        query: "current question".to_string(),
+                                        ..Default::default()
+                                    },
+                                ),
+                            ),
+                        }],
+                    },
+                )),
+                ..Default::default()
+            }),
+            settings: Some(warp_multi_agent_api::request::Settings {
+                model_config: Some(warp_multi_agent_api::request::settings::ModelConfig {
+                    base: "mock-model".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            metadata: Some(warp_multi_agent_api::request::Metadata {
+                conversation_id: conversation_id.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let response = handle(State(state.clone()), Bytes::from(request.encode_to_vec()))
+            .await
+            .into_response();
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let messages = state.load_conversation(&task_id);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages[1]["content"],
+            "[Compacted conversation summary]\nold history summary"
+        );
+        assert_eq!(messages[2]["content"], "current question");
+        assert_eq!(messages[3]["content"], "recovered answer");
+        assert_eq!(backend_state.calls.load(Ordering::Relaxed), 3);
+        let retry = backend_state.requests.lock().unwrap()[2].clone();
+        assert_eq!(retry["messages"][2]["content"], "current question");
+        let events = decode_sse_events(&response_body);
+        assert!(events.iter().any(|event| {
+            let Some(warp_multi_agent_api::response_event::Type::ClientActions(actions)) =
+                &event.r#type
+            else {
+                return false;
+            };
+            actions.actions.iter().any(|action| {
+                let Some(warp_multi_agent_api::client_action::Action::AddMessagesToTask(
+                    add_messages,
+                )) = &action.action
+                else {
+                    return false;
+                };
+                add_messages.messages.iter().any(|message| {
+                    matches!(
+                        message.message,
+                        Some(warp_multi_agent_api::message::Message::Summarization(_))
+                    )
+                })
+            })
+        }));
+
+        for suffix in ["json", "json.version", "context_tokens"] {
+            let _ = std::fs::remove_file(
+                state
+                    .conversation_cache_dir
+                    .join(format!("{task_id}.{suffix}")),
+            );
+            let _ = std::fs::remove_file(
+                state
+                    .conversation_cache_dir
+                    .join(format!("{conversation_id}.{suffix}")),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_failure_keeps_original_turn_context() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        struct BackendState {
+            calls: AtomicUsize,
+            requests: Mutex<Vec<serde_json::Value>>,
+        }
+
+        async fn backend(
+            State(state): State<Arc<BackendState>>,
+            axum::Json(request): axum::Json<serde_json::Value>,
+        ) -> Response<Body> {
+            let call = state.calls.fetch_add(1, Ordering::Relaxed);
+            state.requests.lock().unwrap().push(request);
+            if call == 0 {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({"error": {"message": "temporary failure"}})),
+                )
+                    .into_response();
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"normal answer\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )))
+                .unwrap()
+        }
+
+        let backend_state = Arc::new(BackendState {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route("/v1/chat/completions", axum::routing::post(backend))
+            .with_state(backend_state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut config = fallback_config();
+        config.backend_base_url = format!("http://{address}/v1");
+        config.backend_auth_style = AuthStyle::None;
+        config.default_model = "mock-model".to_string();
+        let state = Arc::new(AppState::new(config, vec!["mock-model".to_string()]));
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        state.register_conversation_task(&conversation_id, &task_id);
+        state.save_conversation(
+            &task_id,
+            &[
+                json!({"role": "system", "content": "system"}),
+                json!({"role": "user", "content": "old question"}),
+                json!({"role": "assistant", "content": "old answer"}),
+            ],
+        );
+        state.record_conversation_context_tokens(&task_id, 100_000);
+        let request = warp_multi_agent_api::Request {
+            task_context: Some(warp_multi_agent_api::request::TaskContext {
+                tasks: vec![warp_multi_agent_api::Task {
+                    id: task_id.clone(),
+                    ..Default::default()
+                }],
+            }),
+            input: Some(warp_multi_agent_api::request::Input {
+                r#type: Some(warp_multi_agent_api::request::input::Type::UserInputs(
+                    warp_multi_agent_api::request::input::UserInputs {
+                        inputs: vec![warp_multi_agent_api::request::input::user_inputs::UserInput {
+                            input: Some(
+                                warp_multi_agent_api::request::input::user_inputs::user_input::Input::UserQuery(
+                                    warp_multi_agent_api::request::input::UserQuery {
+                                        query: "current question".to_string(),
+                                        ..Default::default()
+                                    },
+                                ),
+                            ),
+                        }],
+                    },
+                )),
+                ..Default::default()
+            }),
+            settings: Some(warp_multi_agent_api::request::Settings {
+                model_config: Some(warp_multi_agent_api::request::settings::ModelConfig {
+                    base: "mock-model".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            metadata: Some(warp_multi_agent_api::request::Metadata {
+                conversation_id: conversation_id.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let response = handle(State(state.clone()), Bytes::from(request.encode_to_vec()))
+            .await
+            .into_response();
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let messages = state.load_conversation(&task_id);
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1]["content"], "old question");
+        assert_eq!(messages[2]["content"], "old answer");
+        assert_eq!(messages[3]["content"], "current question");
+        assert_eq!(messages[4]["content"], "normal answer");
+        assert_eq!(backend_state.calls.load(Ordering::Relaxed), 2);
+        let request = backend_state.requests.lock().unwrap()[1].clone();
+        assert_eq!(request["messages"][3]["content"], "current question");
+
+        for suffix in ["json", "json.version", "context_tokens"] {
+            let _ = std::fs::remove_file(
+                state
+                    .conversation_cache_dir
+                    .join(format!("{task_id}.{suffix}")),
+            );
+            let _ = std::fs::remove_file(
+                state
+                    .conversation_cache_dir
+                    .join(format!("{conversation_id}.{suffix}")),
+            );
+        }
+    }
+
+    #[test]
+    fn context_window_errors_are_classified_for_recovery() {
+        let error = anyhow::Error::new(BackendHttpError {
+            status: StatusCode::BAD_REQUEST,
+            body: r#"{"error":{"code":"context_length_exceeded"}}"#.to_string(),
+        });
+        assert!(is_context_window_error(&error));
+
+        let error = anyhow::Error::new(BackendHttpError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: "token limit".to_string(),
+        });
+        assert!(!is_context_window_error(&error));
+
+        let error = anyhow::Error::new(BackendHttpError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: "maximum context length exceeded".to_string(),
+        });
+        assert!(is_context_window_error(&error));
+    }
+
+    #[test]
+    fn finished_event_reports_foundry_input_and_output_tokens() {
+        let tokens = BackendTokenUsage {
+            input: 64_000,
+            output: 100,
+            input_cache_read: 40_000,
+            input_cache_write: 0,
+            reported_total: 64_100,
+        };
+        let usage = completion_usage(Some(tokens), &[], 128_000);
+        assert!((usage.context_window_usage - 0.50078124).abs() < f32::EPSILON);
+
+        let event = finished_event(usage, "DeepSeek-V4-Flash");
+        let Some(warp_multi_agent_api::response_event::Type::Finished(finished)) = event.r#type
+        else {
+            panic!("expected stream finished event");
+        };
+        assert_eq!(finished.token_usage.len(), 1);
+        assert_eq!(finished.token_usage[0].total_input, 64_000);
+        assert_eq!(finished.token_usage[0].output, 100);
+        assert_eq!(finished.token_usage[0].input_cache_read, 40_000);
+        let metadata = finished.conversation_usage_metadata.unwrap();
+        assert_eq!(metadata.total_input_tokens, 64_000);
+        assert_eq!(
+            metadata.byok_token_usage["DeepSeek-V4-Flash"].total_tokens,
+            64_100
+        );
     }
 
     #[test]
@@ -3558,19 +4909,13 @@ mod streaming_tests {
         let (text_tx, mut text_rx) = mpsc::channel(4);
         let (decision_tx, decision_rx) = oneshot::channel();
         let mut decision_tx = Some(decision_tx);
-        let mut pending_text = Vec::new();
-        let mut tool_calls = StreamToolCallAccumulator::default();
-        let mut saw_tool_calls = false;
-        let mut in_reasoning = false;
+        let mut stream_state = BackendStreamState::default();
 
         let keep_reading = handle_backend_stream_line(
             r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#,
             &text_tx,
             &mut decision_tx,
-            &mut pending_text,
-            &mut tool_calls,
-            &mut saw_tool_calls,
-            &mut in_reasoning,
+            &mut stream_state,
         )
         .await
         .unwrap();
@@ -3588,19 +4933,13 @@ mod streaming_tests {
         let (text_tx, mut text_rx) = mpsc::channel(8);
         let (decision_tx, mut decision_rx) = oneshot::channel();
         let mut decision_tx = Some(decision_tx);
-        let mut pending_text = Vec::new();
-        let mut tool_calls = StreamToolCallAccumulator::default();
-        let mut saw_tool_calls = false;
-        let mut in_reasoning = false;
+        let mut stream_state = BackendStreamState::default();
 
         handle_backend_stream_line(
             r#"data: {"choices":[{"delta":{"reasoning_content":"Thinking"}}]}"#,
             &text_tx,
             &mut decision_tx,
-            &mut pending_text,
-            &mut tool_calls,
-            &mut saw_tool_calls,
-            &mut in_reasoning,
+            &mut stream_state,
         )
         .await
         .unwrap();
@@ -3614,10 +4953,7 @@ mod streaming_tests {
             r#"data: {"choices":[{"delta":{"content":"Answer"}}]}"#,
             &text_tx,
             &mut decision_tx,
-            &mut pending_text,
-            &mut tool_calls,
-            &mut saw_tool_calls,
-            &mut in_reasoning,
+            &mut stream_state,
         )
         .await
         .unwrap();
@@ -3650,6 +4986,8 @@ mod streaming_tests {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 tx.send(Ok(Bytes::from_static(
                     br#"data: {"choices":[{"delta":{"content":"STREAM_SECOND"}}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":900000,"completion_tokens":100,"total_tokens":900100,"prompt_tokens_details":{"cached_tokens":400000}}}
 
 data: [DONE]
 
@@ -3698,10 +5036,25 @@ data: [DONE]
         .expect("first content chunk should commit text mode before upstream completion")
         .unwrap();
 
-        let StreamingLlmResult::TextStream(mut text_rx) = result else {
+        let StreamingLlmResult::TextStream {
+            mut text_rx,
+            usage_rx,
+        } = result
+        else {
             panic!("expected text stream");
         };
         assert_eq!(text_rx.recv().await.as_deref(), Some("STREAM_FIRST"));
+        assert_eq!(text_rx.recv().await.as_deref(), Some("STREAM_SECOND"));
+        assert_eq!(
+            usage_rx.await.unwrap(),
+            Some(BackendTokenUsage {
+                input: 900_000,
+                output: 100,
+                input_cache_read: 400_000,
+                input_cache_write: 0,
+                reported_total: 900_100,
+            })
+        );
     }
 
     #[test]

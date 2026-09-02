@@ -8,8 +8,9 @@
 //! Every inline-fragment-discriminated object includes `__typename` because
 //! cynic's `InlineFragments` enums dispatch on it.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
+use crate::config::model_context_window_tokens;
 use crate::server::AppState;
 
 const LOCAL_USER_UID: &str = "local-user-uid";
@@ -17,6 +18,7 @@ const LOCAL_WORKSPACE_UID: &str = "local-workspace-id-001";
 
 /// Wraps a single model id into the cynic-expected `LlmInfo` shape.
 fn llm_info(id: &str, display_name: &str) -> Value {
+    let context_window_tokens = model_context_window_tokens(id);
     json!({
         "displayName": display_name,
         "baseModelName": display_name,
@@ -38,8 +40,8 @@ fn llm_info(id: &str, display_name: &str) -> Value {
         "contextWindow": {
             "isConfigurable": false,
             "min": 1024,
-            "max": 200000,
-            "default": 128000
+            "max": context_window_tokens,
+            "default": context_window_tokens
         }
     })
 }
@@ -484,5 +486,17 @@ mod tests {
         assert_eq!(markers["__typename"], "TuiOnboardingMarkersOutput");
         assert_eq!(markers["firstZeroStateShown"], true);
         assert_eq!(markers["firstCreditGateShown"], true);
+    }
+
+    #[test]
+    fn model_metadata_uses_model_specific_context_windows() {
+        assert_eq!(
+            llm_info("DeepSeek-V4-Flash", "DeepSeek-V4-Flash").pointer("/contextWindow/max"),
+            Some(&serde_json::json!(128_000))
+        );
+        assert_eq!(
+            llm_info("unknown-model", "unknown-model").pointer("/contextWindow/default"),
+            Some(&serde_json::json!(128_000))
+        );
     }
 }
