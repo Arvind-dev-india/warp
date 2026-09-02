@@ -21,10 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE;
+use base64::Engine as _;
 use prost::Message;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -906,7 +906,7 @@ fn extract_received_agent_messages(request: &warp_multi_agent_api::Request) -> V
 fn register_launched_agents(request: &warp_multi_agent_api::Request, state: &AppState) {
     use warp_multi_agent_api::request::input::tool_call_result::Result;
     use warp_multi_agent_api::request::input::user_inputs::user_input::Input;
-    use warp_multi_agent_api::run_agents_result::{Outcome, agent_outcome};
+    use warp_multi_agent_api::run_agents_result::{agent_outcome, Outcome};
 
     let Some(warp_multi_agent_api::request::input::Type::UserInputs(user_inputs)) = request
         .input
@@ -1165,8 +1165,8 @@ fn json_string_array(value: &serde_json::Value) -> Vec<String> {
 fn json_to_write_mode(
     mode: Option<&str>,
 ) -> Option<warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::Mode> {
-    use warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::Mode as WriteMode;
     use warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::mode::Mode;
+    use warp_multi_agent_api::message::tool_call::write_to_long_running_shell_command::Mode as WriteMode;
 
     mode.map(|mode| WriteMode {
         mode: Some(match mode {
@@ -1656,7 +1656,7 @@ fn openai_tool_call_to_proto(
             Tool::InitProject(warp_multi_agent_api::message::tool_call::InitProject {})
         }
         "use_computer" => {
-            use warp_multi_agent_api::message::tool_call::use_computer::{Action, action};
+            use warp_multi_agent_api::message::tool_call::use_computer::{action, Action};
             let actions = args["actions"]
                 .as_array()
                 .map(|arr| {
@@ -2807,10 +2807,43 @@ async fn send_sse_event(
         .map_err(|_| ())
 }
 
+async fn queue_text_chunk(
+    chunk: String,
+    text_tx: &mpsc::Sender<String>,
+    decision_tx: &Option<oneshot::Sender<Result<BackendStreamDecision, anyhow::Error>>>,
+    pending_text: &mut Vec<String>,
+) -> bool {
+    if decision_tx.is_some() {
+        pending_text.push(chunk);
+        true
+    } else {
+        text_tx.send(chunk).await.is_ok()
+    }
+}
+
+async fn commit_text_stream(
+    text_tx: &mpsc::Sender<String>,
+    decision_tx: &mut Option<oneshot::Sender<Result<BackendStreamDecision, anyhow::Error>>>,
+    pending_text: &mut Vec<String>,
+) -> bool {
+    if let Some(tx) = decision_tx.take() {
+        if tx.send(Ok(BackendStreamDecision::Text)).is_err() {
+            return false;
+        }
+    }
+    for chunk in pending_text.drain(..) {
+        if text_tx.send(chunk).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 async fn handle_backend_stream_line(
     line: &str,
     text_tx: &mpsc::Sender<String>,
-    _decision_tx: &mut Option<oneshot::Sender<Result<BackendStreamDecision, anyhow::Error>>>,
+    decision_tx: &mut Option<oneshot::Sender<Result<BackendStreamDecision, anyhow::Error>>>,
+    pending_text: &mut Vec<String>,
     tool_calls: &mut StreamToolCallAccumulator,
     saw_tool_calls: &mut bool,
     in_reasoning: &mut bool,
@@ -2837,7 +2870,14 @@ async fn handle_backend_stream_line(
     let delta = &choice["delta"];
 
     if let Some(tool_call_chunks) = delta["tool_calls"].as_array() {
+        if decision_tx.is_none() {
+            tracing::warn!(
+                "backend emitted tool calls after text streaming started; ignoring them"
+            );
+            return Ok(true);
+        }
         *saw_tool_calls = true;
+        pending_text.clear();
         tool_calls.push_chunk(tool_call_chunks);
         return Ok(true);
     }
@@ -2849,11 +2889,18 @@ async fn handle_backend_stream_line(
         if !reasoning.is_empty() && !*saw_tool_calls {
             if !*in_reasoning {
                 *in_reasoning = true;
-                let _ = text_tx
-                    .send("<details><summary>💭 Thinking...</summary>\n\n".to_string())
-                    .await;
+                if !queue_text_chunk(
+                    "<details><summary>💭 Thinking...</summary>\n\n".to_string(),
+                    text_tx,
+                    decision_tx,
+                    pending_text,
+                )
+                .await
+                {
+                    return Ok(false);
+                }
             }
-            if text_tx.send(reasoning.to_string()).await.is_err() {
+            if !queue_text_chunk(reasoning.to_string(), text_tx, decision_tx, pending_text).await {
                 return Ok(false);
             }
             return Ok(true);
@@ -2869,15 +2916,22 @@ async fn handle_backend_stream_line(
             // Content after tool_calls is unusual; skip it
             return Ok(true);
         }
-        // Close the reasoning block when the actual content starts
         if *in_reasoning {
             *in_reasoning = false;
-            let _ = text_tx.send("\n\n</details>\n\n".to_string()).await;
+            if !queue_text_chunk(
+                "\n\n</details>\n\n".to_string(),
+                text_tx,
+                decision_tx,
+                pending_text,
+            )
+            .await
+            {
+                return Ok(false);
+            }
         }
-        // Buffer text but DON'T commit the decision yet — tool calls
-        // may follow. The decision is made at stream end based on
-        // whether saw_tool_calls is set.
-        if text_tx.send(content.to_string()).await.is_err() {
+        if !queue_text_chunk(content.to_string(), text_tx, decision_tx, pending_text).await
+            || !commit_text_stream(text_tx, decision_tx, pending_text).await
+        {
             return Ok(false);
         }
     }
@@ -2943,6 +2997,7 @@ async fn call_backend_streaming(
         let mut resp = resp;
         let mut decision_tx = Some(decision_tx);
         let mut buffer = Vec::new();
+        let mut pending_text = Vec::new();
         let mut tool_calls = StreamToolCallAccumulator::default();
         let mut saw_tool_calls = false;
         let mut in_reasoning = false;
@@ -2955,6 +3010,7 @@ async fn call_backend_streaming(
                         &line,
                         &text_tx,
                         &mut decision_tx,
+                        &mut pending_text,
                         &mut tool_calls,
                         &mut saw_tool_calls,
                         &mut in_reasoning,
@@ -2971,6 +3027,7 @@ async fn call_backend_streaming(
                     &String::from_utf8_lossy(&buffer),
                     &text_tx,
                     &mut decision_tx,
+                    &mut pending_text,
                     &mut tool_calls,
                     &mut saw_tool_calls,
                     &mut in_reasoning,
@@ -2992,8 +3049,19 @@ async fn call_backend_streaming(
                             tool_calls.into_tool_calls(),
                         )));
                     }
-                } else if let Some(tx) = decision_tx.take() {
-                    let _ = tx.send(Ok(BackendStreamDecision::Text));
+                } else {
+                    if in_reasoning
+                        && !queue_text_chunk(
+                            "\n\n</details>\n\n".to_string(),
+                            &text_tx,
+                            &decision_tx,
+                            &mut pending_text,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    let _ = commit_text_stream(&text_tx, &mut decision_tx, &mut pending_text).await;
                 }
             }
             Err(err) => {
@@ -3153,7 +3221,7 @@ mod streaming_tests {
     fn run_agents_result_exposes_stable_child_address() {
         use warp_multi_agent_api::request;
         use warp_multi_agent_api::run_agents_result::{
-            AgentOutcome, Launched, LaunchedAgent, Outcome, agent_outcome,
+            agent_outcome, AgentOutcome, Launched, LaunchedAgent, Outcome,
         };
 
         let state = AppState::new(fallback_config(), vec![]);
@@ -3483,6 +3551,157 @@ mod streaming_tests {
         assert!(drain_sse_line(&mut buffer).is_none());
         buffer.extend_from_slice(b" line\n");
         assert_eq!(drain_sse_line(&mut buffer).as_deref(), Some("partial line"));
+    }
+
+    #[tokio::test]
+    async fn text_stream_is_committed_on_the_first_content_chunk() {
+        let (text_tx, mut text_rx) = mpsc::channel(4);
+        let (decision_tx, decision_rx) = oneshot::channel();
+        let mut decision_tx = Some(decision_tx);
+        let mut pending_text = Vec::new();
+        let mut tool_calls = StreamToolCallAccumulator::default();
+        let mut saw_tool_calls = false;
+        let mut in_reasoning = false;
+
+        let keep_reading = handle_backend_stream_line(
+            r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#,
+            &text_tx,
+            &mut decision_tx,
+            &mut pending_text,
+            &mut tool_calls,
+            &mut saw_tool_calls,
+            &mut in_reasoning,
+        )
+        .await
+        .unwrap();
+
+        assert!(keep_reading);
+        assert!(matches!(
+            decision_rx.await.unwrap().unwrap(),
+            BackendStreamDecision::Text
+        ));
+        assert_eq!(text_rx.recv().await.as_deref(), Some("Hello"));
+    }
+
+    #[tokio::test]
+    async fn reasoning_waits_for_content_before_committing_text_stream() {
+        let (text_tx, mut text_rx) = mpsc::channel(8);
+        let (decision_tx, mut decision_rx) = oneshot::channel();
+        let mut decision_tx = Some(decision_tx);
+        let mut pending_text = Vec::new();
+        let mut tool_calls = StreamToolCallAccumulator::default();
+        let mut saw_tool_calls = false;
+        let mut in_reasoning = false;
+
+        handle_backend_stream_line(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"Thinking"}}]}"#,
+            &text_tx,
+            &mut decision_tx,
+            &mut pending_text,
+            &mut tool_calls,
+            &mut saw_tool_calls,
+            &mut in_reasoning,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decision_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(text_rx.try_recv().is_err());
+
+        handle_backend_stream_line(
+            r#"data: {"choices":[{"delta":{"content":"Answer"}}]}"#,
+            &text_tx,
+            &mut decision_tx,
+            &mut pending_text,
+            &mut tool_calls,
+            &mut saw_tool_calls,
+            &mut in_reasoning,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            decision_rx.await.unwrap().unwrap(),
+            BackendStreamDecision::Text
+        ));
+        assert_eq!(
+            text_rx.recv().await.as_deref(),
+            Some("<details><summary>💭 Thinking...</summary>\n\n")
+        );
+        assert_eq!(text_rx.recv().await.as_deref(), Some("Thinking"));
+        assert_eq!(text_rx.recv().await.as_deref(), Some("\n\n</details>\n\n"));
+        assert_eq!(text_rx.recv().await.as_deref(), Some("Answer"));
+    }
+
+    #[tokio::test]
+    async fn backend_stream_returns_before_upstream_completion() {
+        async fn delayed_chat_completion() -> Response<Body> {
+            let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+            tokio::spawn(async move {
+                tx.send(Ok(Bytes::from_static(
+                    br#"data: {"choices":[{"delta":{"content":"STREAM_FIRST"}}]}
+
+"#,
+                )))
+                .await
+                .unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                tx.send(Ok(Bytes::from_static(
+                    br#"data: {"choices":[{"delta":{"content":"STREAM_SECOND"}}]}
+
+data: [DONE]
+
+"#,
+                )))
+                .await
+                .unwrap();
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(ReceiverStream::new(rx)))
+                .unwrap()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(delayed_chat_completion),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut config = fallback_config();
+        config.backend_base_url = format!("http://{address}/v1");
+        config.backend_auth_style = AuthStyle::None;
+        let state = AppState::new(config.clone(), vec![]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            call_backend_streaming(
+                &state,
+                &config,
+                &[json!({"role": "user", "content": "stream"})],
+                false,
+                "mock-model",
+                &json!([]),
+            ),
+        )
+        .await
+        .expect("first content chunk should commit text mode before upstream completion")
+        .unwrap();
+
+        let StreamingLlmResult::TextStream(mut text_rx) = result else {
+            panic!("expected text stream");
+        };
+        assert_eq!(text_rx.recv().await.as_deref(), Some("STREAM_FIRST"));
     }
 
     #[test]
